@@ -27,9 +27,9 @@ function do_test(n1, n2, tol, float_type)
     x = @view z[1:n1]
     y = @view z[n1+1:end]
 
-    Alu = lu(A)
+    #Alu = lu(A)
 
-    sc = mpi_schur_complement(Alu, B, C, D, similar(B), similar(D), similar(x),
+    sc = mpi_schur_complement(A, B, C, D, similar(B), similar(D), similar(x),
                               similar(x), similar(y))
 
     function test_once()
@@ -53,14 +53,14 @@ function do_test(n1, n2, tol, float_type)
     test_once()
 
     # Check changing the matrix is OK
-    M .= rand(rng, n, n)
-    Alu = lu(A)
-    update_schur_complement!(sc, Alu, B, C, D)
-    b .= rand(rng, n)
+    M .= get_rand(n, n)
+    #Alu = lu(A)
+    update_schur_complement!(sc, A, B, C, D)
+    b .= get_rand(n)
     test_once()
 
     # Check passing another new RHS is OK
-    b .= rand(rng, n)
+    b .= get_rand(n)
     test_once()
 end
 
