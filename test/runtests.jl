@@ -27,8 +27,6 @@ function do_test(n1, n2, tol, float_type)
     x = @view z[1:n1]
     y = @view z[n1+1:end]
 
-    Alu = lu(A)
-
     sc = mpi_schur_complement(A, B, C, D, similar(B), similar(D), similar(x),
                               similar(x), similar(y))
 
@@ -60,8 +58,7 @@ function do_test(n1, n2, tol, float_type)
 
     # Check changing the matrix is OK
     M .= rand(rng, n, n)
-    Alu = lu(A)
-    update_schur_complement!(sc, Alu, B, C, D)
+    update_schur_complement!(sc, A, B, C, D)
     b .= rand(rng, n)
     test_once()
 

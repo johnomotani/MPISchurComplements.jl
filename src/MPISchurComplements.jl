@@ -92,14 +92,18 @@ function mpi_schur_complement(A, B::AbstractMatrix, C::AbstractMatrix,
     return sc_factorization
 end
 
-function update_schur_complement!(sc::MPISchurComplement, A_factorization, B, C, D)
-    @boundscheck size(sc.A_factorization) == size(A_factorization) || error(BoundsError, " Size of A_factorization does not match size of original A_factorization")
+function update_schur_complement!(sc::MPISchurComplement, A, B, C, D)
+    @boundscheck size(sc.A_factorization) == size(A) || error(BoundsError, " Size of A_factorization does not match size of original A_factorization")
     @boundscheck size(sc.Ainv_dot_B) == size(B) || error(BoundsError, " Size of B does not match size of original Ainv_dot_B")
     @boundscheck size(sc.C) == size(C) || error(BoundsError, " Size of C does not match size of original C")
     @boundscheck size(sc.schur_complement) == size(D) || error(BoundsError, " Size of D does not match size of original schur_complement")
 
+    A_factorization = lu(A)
+    A_factorization128 = lu(Float128.(A))
     sc.A_factorization = A_factorization
-    ldiv!(sc.Ainv_dot_B, A_factorization, B)
+    Ainv_dot_B128 = Float128.(sc.Ainv_dot_B)
+    ldiv!(Ainv_dot_B128, A_factorization, B)
+    sc.Ainv_dot_B .= Ainv_dot_B128
     sc.C = C
     mul!(sc.schur_complement, C, sc.Ainv_dot_B)
     @. sc.schur_complement = D - sc.schur_complement
