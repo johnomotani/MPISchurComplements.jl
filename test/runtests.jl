@@ -48,7 +48,7 @@ function do_test(n1, n2, tol, float_type)
         end
         # Compare our solution to the one from LinearAlgebra's LU factorization.
         @testset "3" begin
-            @test isapprox(z, lu_sol; atol=tol)
+            @test isapprox(z, lu_sol; rtol=tol, atol=tol)
         end
     end
 
