@@ -1,17 +1,22 @@
 using LinearAlgebra
+using Quadmath
 using StableRNGs
 using Test
 
 using MPISchurComplements
 
-function do_test(n1, n2, tol=1.0e-14)
+function do_test(n1, n2, tol, float_type)
     rng = StableRNG(2001)
+
+    function get_rand(args...)
+        return float_type.(rand(rng, Float128, args...))
+    end
 
     n = n1 + n2
 
-    M = rand(rng, n, n)
-    b = rand(rng, n)
-    z = zeros(n)
+    M = get_rand(n, n)
+    b = get_rand(n)
+    z = zeros(float_type, n)
 
     A = @view M[1:n1, 1:n1]
     B = @view M[1:n1, n1+1:end]
@@ -60,12 +65,16 @@ function do_test(n1, n2, tol=1.0e-14)
 end
 
 @testset "MPISchurComplements" begin
-    @testset "($n1,$n2), tol=$tol" for (n1,n2,tol) ∈ (
+    @testset "$float_type ($n1,$n2), tol=$tol" for (n1,n2,tol) ∈ (
             (3, 2, 1.0e-14),
-            (100, 32, 1.0e-11),
+            (100, 32, 1.0e-13),
             (1000, 17, 1.0e-10),
-            (1000, 129, 1.0e-10),
-           )
-        do_test(n1, n2, tol)
+            (1000, 129, 1.0e-11),
+           ),
+           float_type ∈ (
+                         Float64,
+                         Float128,
+                        )
+        do_test(n1, n2, tol, float_type)
     end
 end
