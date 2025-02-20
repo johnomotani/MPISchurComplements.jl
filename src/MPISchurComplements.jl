@@ -78,16 +78,14 @@ function mpi_schur_complement(A, B::AbstractMatrix, C::AbstractMatrix,
 
     A_factorization = lu(A)
     A_factorization128 = lu(Float128.(A))
-    Ainv_dot_B = Float128.(Ainv_dot_B)
-    ldiv!(Ainv_dot_B, A_factorization128, Float128.(B))
-    schur_buffer128 = similar(schur_complement, Float128)
-    mul!(schur_buffer128, C, Float128.(Ainv_dot_B))
-    @. schur_complement = D - Float64.(schur_buffer128)
-    #schur_complement .= schur_buffer128
-    #schur_complement_factorization128 = lu(schur_buffer128)
-    schur_complement_factorization64 = lu(schur_complement) # LU(Float64.(schur_complement_factorization128.factors), schur_complement_factorization128.ipiv, schur_complement_factorization128.info)
-    sc_factorization = MPISchurComplement(A_factorization, Float64.(Ainv_dot_B), C,
-                                          Float64.(schur_complement),
+    Ainv_dot_B128 = Float128.(Ainv_dot_B)
+    ldiv!(Ainv_dot_B128, A_factorization128, B)
+    Ainv_dot_B .= Ainv_dot_B128
+    mul!(schur_complement, C, Ainv_dot_B)
+    @. schur_complement = D - schur_complement
+    schur_complement_factorization64 = lu(schur_complement)
+    sc_factorization = MPISchurComplement(A_factorization, Ainv_dot_B, C,
+                                          schur_complement,
                                           schur_complement_factorization64, Ainv_dot_u,
                                           top_vec_buffer, bottom_vec_buffer)
 
