@@ -24,6 +24,7 @@ export MPISchurComplement, mpi_schur_complement, update_schur_complement!, ldiv!
 
 using LinearAlgebra
 import LinearAlgebra: ldiv!
+using Quadmath
 
 mutable struct MPISchurComplement{TA,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv}
     A_factorization::TA
@@ -61,28 +62,33 @@ They do not need to be initialized.
 `bottom_vec_buffer` is a buffer whose length is the number of rows of `D`.  It does not
 need to be initialized.
 """
-function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMatrix,
+function mpi_schur_complement(A, B::AbstractMatrix, C::AbstractMatrix,
                               D::AbstractMatrix, Ainv_dot_B::AbstractMatrix,
                               schur_complement::AbstractMatrix,
                               Ainv_dot_u::AbstractVector, top_vec_buffer::AbstractVector,
                               bottom_vec_buffer::AbstractVector)
-    @boundscheck size(A_factorization, 1) == size(B, 1) || error(BoundsError, " Rows in A_factorization do not match rows in B")
-    @boundscheck size(A_factorization, 2) == size(C, 2) || error(BoundsError, " Columns in A_factorization do not match columns in C")
+    @boundscheck size(A, 1) == size(B, 1) || error(BoundsError, " Rows in A_factorization do not match rows in B")
+    @boundscheck size(A, 2) == size(C, 2) || error(BoundsError, " Columns in A_factorization do not match columns in C")
     @boundscheck size(D, 1) == size(C, 1) || error(BoundsError, " Rows in C do not match rows in C")
     @boundscheck size(D, 2) == size(B, 2) || error(BoundsError, " Columns in D do not match columns in B")
     @boundscheck size(D) == size(schur_complement) || error(BoundsError, " Size of D does not match size of schur_complement")
-    @boundscheck size(A_factorization, 1) == size(Ainv_dot_u, 1) || error(BoundsError, " Rows in A_factorization do not match rows in Ainv_dot_u")
-    @boundscheck size(A_factorization, 1) == size(top_vec_buffer, 1) || error(BoundsError, " Rows in A_factorization do not match rows in top_vec_buffer")
+    @boundscheck size(A, 1) == size(Ainv_dot_u, 1) || error(BoundsError, " Rows in A_factorization do not match rows in Ainv_dot_u")
+    @boundscheck size(A, 1) == size(top_vec_buffer, 1) || error(BoundsError, " Rows in A_factorization do not match rows in top_vec_buffer")
     @boundscheck size(D, 1) == size(bottom_vec_buffer, 1) || error(BoundsError, " Rows in D do not match rows in bottom_vec_buffer")
 
-    ldiv!(Ainv_dot_B, A_factorization, B)
-    mul!(schur_complement, C, Ainv_dot_B)
-    @. schur_complement = D - schur_complement
-    schur_complement_factorization = lu(schur_complement)
-    sc_factorization = MPISchurComplement(A_factorization, Ainv_dot_B, C,
-                                          schur_complement,
-                                          schur_complement_factorization, Ainv_dot_u,
-                                          top_vec_buffer, bottom_vec_buffer)
+    A_factorization = lu(A)
+    A_factorization128 = lu(Float128.(A))
+    Ainv_dot_B = Float128.(Ainv_dot_B)
+    ldiv!(Ainv_dot_B, A_factorization128, Float128.(B))
+    schur_buffer128 = similar(schur_complement, Float128)
+    mul!(schur_buffer128, Float128.(C), Float128.(Ainv_dot_B))
+    @. schur_buffer128 = Float128.(D) - schur_buffer128
+    schur_complement_factorization128 = lu(schur_buffer128)
+    schur_complement_factorization64 = LU(Float64.(schur_complement_factorization128.factors), schur_complement_factorization128.ipiv, schur_complement_factorization128.info)
+    sc_factorization = MPISchurComplement(A_factorization, Float128.(Ainv_dot_B), Float128.(C),
+                                          Float128.(schur_complement),
+                                          schur_complement_factorization128, Float128.(Ainv_dot_u),
+                                          Float128.(top_vec_buffer), Float128.(bottom_vec_buffer))
 
     return sc_factorization
 end

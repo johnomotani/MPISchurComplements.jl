@@ -29,7 +29,7 @@ function do_test(n1, n2, tol, float_type)
 
     Alu = lu(A)
 
-    sc = mpi_schur_complement(Alu, B, C, D, similar(B), similar(D), similar(x),
+    sc = mpi_schur_complement(A, B, C, D, similar(B), similar(D), similar(x),
                               similar(x), similar(y))
 
     function test_once()
