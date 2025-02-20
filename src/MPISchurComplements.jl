@@ -84,7 +84,7 @@ function mpi_schur_complement(A, B::AbstractMatrix, C::AbstractMatrix,
     # that computes an operator norm (if I'm reading the comment in IterativeRefinement.jl
     # right) and requires the ability to transpose `F`, which might not be implemented for
     # every factorization.
-    Ainv_dot_B, _ = rfldiv(A, B; F=A_factorization, equilibrate=false, κ=1.0)
+    Ainv_dot_B, _ = rfldiv(A, B; F=A_factorization, equilibrate=false, κ=1.0, DT=Float128)
     mul!(schur_complement, C, Ainv_dot_B)
     @. schur_complement = D - schur_complement
     schur_complement_factorization64 = lu(schur_complement)
@@ -110,7 +110,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B, C, D)
     # that computes an operator norm (if I'm reading the comment in IterativeRefinement.jl
     # right) and requires the ability to transpose `F`, which might not be implemented for
     # every factorization.
-    Ainv_dot_B, _ = rfldiv(A, B; F=A_factorization, equilibrate=false, κ=1.0)
+    Ainv_dot_B, _ = rfldiv(A, B; F=A_factorization, equilibrate=false, κ=1.0, DT=Float128)
     sc.Ainv_dot_B .= Ainv_dot_B
     sc.C = C
     mul!(sc.schur_complement, C, sc.Ainv_dot_B)
