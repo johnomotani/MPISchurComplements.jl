@@ -4,10 +4,12 @@ authors = ["John Omotani <john.omotani@ukaea.uk>"]
 version = "0.1.0"
 
 [deps]
+IterativeRefinement = "bcb6b82e-7479-5933-8c8e-2e0b909ee6a3"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Quadmath = "be4d8f0f-7fa4-5f49-b795-2f01399ab2dd"
 
 [compat]
+IterativeRefinement = "0.2.1"
 LinearAlgebra = "1.11.0"
 Quadmath = "0.5.11"
 StableRNGs = "1"

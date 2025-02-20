@@ -22,6 +22,7 @@ module MPISchurComplements
 
 export MPISchurComplement, mpi_schur_complement, update_schur_complement!, ldiv!
 
+using IterativeRefinement
 using LinearAlgebra
 import LinearAlgebra: ldiv!
 using Quadmath
@@ -77,10 +78,13 @@ function mpi_schur_complement(A, B::AbstractMatrix, C::AbstractMatrix,
     @boundscheck size(D, 1) == size(bottom_vec_buffer, 1) || error(BoundsError, " Rows in D do not match rows in bottom_vec_buffer")
 
     A_factorization = lu(A)
-    A_factorization128 = lu(Float128.(A))
-    Ainv_dot_B128 = Float128.(Ainv_dot_B)
-    ldiv!(Ainv_dot_B128, A_factorization128, B)
-    Ainv_dot_B .= Ainv_dot_B128
+    # Pass an existing factorization so that we can support arbitrary types of
+    # factorization. Don't use `equilibrate` because this would have to be done before the
+    # factorization - hopefully we can get away without it. Set κ=1.0 to avoid a thing
+    # that computes an operator norm (if I'm reading the comment in IterativeRefinement.jl
+    # right) and requires the ability to transpose `F`, which might not be implemented for
+    # every factorization.
+    Ainv_dot_B, _ = rfldiv(A, B; F=A_factorization, equilibrate=false, κ=1.0)
     mul!(schur_complement, C, Ainv_dot_B)
     @. schur_complement = D - schur_complement
     schur_complement_factorization64 = lu(schur_complement)
