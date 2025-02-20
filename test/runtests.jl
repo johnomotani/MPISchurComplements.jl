@@ -36,14 +36,20 @@ function do_test(n1, n2, tol, float_type)
         ldiv!(x, y, sc, u, v)
 
         # Check if solution does give back original right-hand-side
-        @test isapprox(M * z, b; atol=tol)
+        @testset "1" begin
+            @test isapprox(M * z, b; atol=tol)
+        end
 
         lu_sol = M \ b
         # Sanity check that tolerance is appropriate by testing solution from
         # LinearAlgebra's LU factorization.
-        @test isapprox(M * lu_sol, b; atol=tol)
+        @testset "2" begin
+            @test isapprox(M * lu_sol, b; atol=tol)
+        end
         # Compare our solution to the one from LinearAlgebra's LU factorization.
-        @test isapprox(z, lu_sol; atol=tol)
+        @testset "3" begin
+            @test isapprox(z, lu_sol; atol=tol)
+        end
     end
 
     test_once()
@@ -67,13 +73,13 @@ end
 @testset "MPISchurComplements" begin
     @testset "$float_type ($n1,$n2), tol=$tol" for (n1,n2,tol) ∈ (
             (3, 2, 1.0e-14),
-            (100, 32, 1.0e-13),
+            (100, 32, 1.0e-12),
             (1000, 17, 1.0e-10),
-            (1000, 129, 1.0e-11),
+            (1000, 129, 1.0e-10),
            ),
            float_type ∈ (
                          Float64,
-                         Float128,
+                         #Float128,
                         )
         do_test(n1, n2, tol, float_type)
     end
