@@ -25,6 +25,7 @@ export MPISchurComplement, mpi_schur_complement, update_schur_complement!, ldiv!
 using LinearAlgebra
 import LinearAlgebra: ldiv!
 using MPI
+using TimerOutputs
 
 mutable struct MPISchurComplement{TA,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tsc<:Union{MPI.Comm,Nothing}}
     A_factorization::TA
@@ -145,18 +146,22 @@ function ldiv!(x, y, sc::MPISchurComplement, u, v, timer)
     shared_comm = sc.shared_comm
     shared_comm_rank = sc.shared_comm_rank
 
-    ldiv!(Ainv_dot_u, A_factorization, u)
+    @timeit timer "static condensation" ldiv!(Ainv_dot_u, A_factorization, u, timer)
     if shared_comm !== nothing
         MPI.Barrier(shared_comm)
     end
 
     if shared_comm_rank == 0
+@timeit timer "mul C" begin
         mul!(bottom_vec_buffer, C, Ainv_dot_u)
         @. bottom_vec_buffer = v - bottom_vec_buffer
-        ldiv!(y, schur_complement_factorization, bottom_vec_buffer)
+end
+        @timeit timer "schur complement" ldiv!(y, schur_complement_factorization, bottom_vec_buffer)
 
+@timeit timer "mul Ainv_dot_B" begin
         mul!(top_vec_buffer, Ainv_dot_B, y)
         @. x = Ainv_dot_u - top_vec_buffer
+end
     end
 
     return nothing
