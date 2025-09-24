@@ -1,8 +1,8 @@
 """
 Inefficient distributed-MPI LU factorization, for testing.
 
-Requires matrix to be passed on the root process. Just gathers the RHS vector to the root
-process, solves there, and scatters back.
+Requires local rows of matrix to be passed on each process. Just gathers the matrix and
+RHS vector to the root process, solves there, and scatters back.
 """
 module FakeMPILUs
 
@@ -12,42 +12,82 @@ import Base: size
 using LinearAlgebra
 import LinearAlgebra: ldiv!, lu!
 using MPI
+using SparseArrays
+
+function gather_A(A_local, row_counts, A_global_column_range, comm)
+    nproc = MPI.Comm_size(comm)
+    rank = MPI.Comm_rank(comm)
+
+    if rank == 0
+        total_size = sum(row_counts)
+        A = zeros(eltype(A_local), total_size, total_size)
+
+        row_minind = 1
+        row_maxind = row_counts[1]
+        A[row_minind:row_maxind,A_global_column_range] .= A_local
+
+        row_minind = row_maxind + 1
+        for iproc ∈ 2:nproc
+            row_maxind = row_minind - 1 + row_counts[iproc]
+            col_minind = MPI.Recv(Int64, comm; source=iproc-1)
+            col_maxind = MPI.Recv(Int64, comm; source=iproc-1)
+            @views MPI.Recv!(A[row_minind:row_maxind, col_minind:col_maxind], comm;
+                             source=iproc-1)
+            row_minind = row_maxind + 1
+        end
+    else
+        MPI.Send(A_global_column_range.start, comm; dest=0)
+        MPI.Send(A_global_column_range.stop, comm; dest=0)
+        MPI.Send(A_local, comm; dest=0)
+        A = nothing
+    end
+
+    return A
+end
 
 mutable struct FakeMPILU{T,TLU}
     Alu::TLU
     n::Int64
     m::Int64
     rhs_buffer::Vector{T}
-    counts::Vector{Int64}
+    row_counts::Vector{Int64}
+    A_global_column_range::UnitRange{Int64}
     comm::MPI.Comm
     rank::Cint
+    sparse::Bool
 
-    function FakeMPILU(A::Union{AbstractMatrix,Nothing}, local_vector_size;
-                       comm::MPI.Comm=MPI.COMM_WORLD, data_type::DataType=Float64)
+    function FakeMPILU(A_local::AbstractMatrix,
+                       A_global_column_range::Union{UnitRange{Int64},Nothing}=nothing;
+                       comm::MPI.Comm=MPI.COMM_WORLD, sparse=false)
 
+        data_type = eltype(A_local)
         nproc = MPI.Comm_size(comm)
         rank = MPI.Comm_rank(comm)
-
-        if A === nothing && rank == 0
-            error("Must pass `A` on root process, got `nothing`")
-        elseif A !== nothing && rank != 0
-            println("A was passed on non-root process, ignoring.")
+        if A_global_column_range === nothing
+            # All columns were present in A_local, not just a subset.
+            A_global_column_range = 1:size(A_local, 2)
         end
+        local_vector_size = size(A_local, 1)
 
         if rank == 0
-            if size(A, 1) != size(A, 2)
-                error("A must be square, got $(size(A)).")
-            end
             sendbuf = Ref(local_vector_size)
-            counts = zeros(Int64, nproc)
-            MPI.Gather!(sendbuf, counts, comm; root=0)
-            total_size = sum(counts)
-            if total_size != size(A, 1)
-                error("Values of local_vector_size ($counts) that were passed do not add "
-                      * "up to the matrix size ($(size(A, 1))).")
+            row_counts = zeros(Int64, nproc)
+            MPI.Gather!(sendbuf, row_counts, comm; root=0)
+            # total_size is given by the maximum column index in any chunk of A.
+            total_size = MPI.Reduce(A_global_column_range.stop, max, comm; root=0)
+            if sum(row_counts) != total_size
+                error("Values of local_vector_size ($row_counts) that were passed do not add "
+                      * "up to the matrix size ($total_size).")
             end
 
-            Alu = lu(A)
+            A = gather_A(A_local, row_counts, A_global_column_range, comm)
+
+            if sparse
+                Alu = lu(sparse(A))
+            else
+                Alu = lu(A)
+            end
+
             rhs_buffer = zeros(data_type, total_size)
 
             n, m = size(A)
@@ -55,14 +95,18 @@ mutable struct FakeMPILU{T,TLU}
         else
             sendbuf = Ref(local_vector_size)
             MPI.Gather!(sendbuf, nothing, comm; root=0)
+            MPI.Reduce(A_global_column_range.stop, max, comm; root=0)
+
+            gather_A(A_local, nothing, A_global_column_range, comm)
 
             Alu = nothing
             rhs_buffer = zeros(data_type, 0)
-            counts = Int64[]
+            row_counts = Int64[]
             (n, m) = MPI.bcast(nothing, 0, comm)
         end
 
-        return new{data_type,typeof(Alu)}(Alu, n, m, rhs_buffer, counts, comm, rank)
+        return new{data_type,typeof(Alu)}(Alu, n, m, rhs_buffer, row_counts,
+                                          A_global_column_range, comm, rank, sparse)
     end
 end
 
@@ -79,14 +123,23 @@ function size(Alu::FakeMPILU, d::Integer)
     end
 end
 
-function lu!(Alu::FakeMPILU, A::Union{AbstractMatrix,Nothing})
-    rank = Alu.rank
-    if A === nothing && rank == 0
-        error("Must pass `A` on root process, got `nothing`")
-    elseif rank == 0
-        Alu.Alu = lu(A)
-    elseif A !== nothing
-        println("A was passed on non-root process, ignoring.")
+function lu!(Alu::FakeMPILU, A_local::AbstractMatrix)
+    A = gather_A(A_local, Alu.row_counts, Alu.A_global_column_range, Alu.comm)
+    if Alu.rank == 0
+        if Alu.sparse
+            try
+                lu!(Alu.Alu, sparse(A))
+            catch e
+                if !isa(e, ArgumentError)
+                    rethrow(e)
+                end
+                println("FakeMPILU: Sparsity pattern of matrix changed, rebuilding "
+                        * " LU from scratch")
+                Alu.Alu = lu(sparse(A))
+            end
+        else
+            Alu.Alu = lu(A)
+        end
     end
     return Alu
 end
@@ -97,9 +150,9 @@ function ldiv!(x::AbstractVector, Alu::FakeMPILU, b::AbstractVector)
     end
     comm = Alu.comm
     rank = Alu.rank
-    counts = Alu.counts
+    row_counts = Alu.row_counts
     if rank == 0
-        rhs_buffer = VBuffer(Alu.rhs_buffer, counts)
+        rhs_buffer = VBuffer(Alu.rhs_buffer, row_counts)
     else
         rhs_buffer = nothing
     end

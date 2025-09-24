@@ -185,7 +185,7 @@ as the inputs to `mpi_schur_complement()` used to construct `sc`.
 """
 function update_schur_complement!(sc::MPISchurComplement, A::AbstractMatrix,
                                   B::AbstractMatrix, C::AbstractMatrix, D::AbstractMatrix)
-    @boundscheck size(sc.A_factorization) == size(A) || error(BoundsError, " Size of A does not match size of original A_factorization")
+    @boundscheck length(sc.owned_top_vector_entries) == size(A, 1) || error(BoundsError, " Number of rows in A does not match number of locally owned top_vector_entries")
     @boundscheck size(sc.Ainv_dot_B, 1) == size(B, 1) || error(BoundsError, " Number of rows in B does not match number of rows in original Ainv_dot_B")
     @boundscheck length(sc.B_global_column_range) == size(B, 2) || error(BoundsError, " Number of columns in B does not match number of columns in original B")
     @boundscheck size(sc.C) == size(C) || error(BoundsError, " Size of C does not match size of original C")
