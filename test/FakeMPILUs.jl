@@ -54,22 +54,29 @@ mutable struct FakeMPILU{T,TLU}
     A_global_column_range::UnitRange{Int64}
     comm::MPI.Comm
     rank::Cint
+    shared_rank::Cint
     sparse::Bool
 
     function FakeMPILU(A_local::AbstractMatrix,
                        A_global_column_range::Union{UnitRange{Int64},Nothing}=nothing;
-                       comm::MPI.Comm=MPI.COMM_WORLD, sparse=false)
+                       comm::MPI.Comm=MPI.COMM_WORLD,
+                       shared_comm::Union{MPI.Comm,Nothing}=nothing, sparse=false)
+
+        if shared_comm === nothing
+            shared_comm = MPI.COMM_NULL
+        end
 
         data_type = eltype(A_local)
-        nproc = MPI.Comm_size(comm)
-        rank = MPI.Comm_rank(comm)
+        nproc = (comm == MPI.COMM_NULL ? -1 : MPI.Comm_size(comm))
+        rank = (comm == MPI.COMM_NULL ? -1 : MPI.Comm_rank(comm))
+        shared_rank = shared_comm == MPI.COMM_NULL ? Cint(0) : MPI.Comm_rank(shared_comm)
         if A_global_column_range === nothing
             # All columns were present in A_local, not just a subset.
             A_global_column_range = 1:size(A_local, 2)
         end
         local_vector_size = size(A_local, 1)
 
-        if rank == 0
+        if rank == 0 && shared_rank == 0
             sendbuf = Ref(local_vector_size)
             row_counts = zeros(Int64, nproc)
             MPI.Gather!(sendbuf, row_counts, comm; root=0)
@@ -92,7 +99,8 @@ mutable struct FakeMPILU{T,TLU}
 
             n, m = size(A)
             MPI.bcast((n,m), 0, comm)
-        else
+            shared_comm != MPI.COMM_NULL && MPI.bcast((n,m), 0, shared_comm)
+        elseif shared_rank == 0
             sendbuf = Ref(local_vector_size)
             MPI.Gather!(sendbuf, nothing, comm; root=0)
             MPI.Reduce(A_global_column_range.stop, max, comm; root=0)
@@ -103,10 +111,17 @@ mutable struct FakeMPILU{T,TLU}
             rhs_buffer = zeros(data_type, 0)
             row_counts = Int64[]
             (n, m) = MPI.bcast(nothing, 0, comm)
+            shared_comm != MPI.COMM_NULL && MPI.bcast((n,m), 0, shared_comm)
+        else
+            Alu = nothing
+            rhs_buffer = zeros(data_type, 0)
+            row_counts = Int64[]
+            (n, m) = MPI.bcast(nothing, 0, shared_comm)
         end
 
         return new{data_type,typeof(Alu)}(Alu, n, m, rhs_buffer, row_counts,
-                                          A_global_column_range, comm, rank, sparse)
+                                          A_global_column_range, comm, rank, shared_rank,
+                                          sparse)
     end
 end
 
@@ -124,6 +139,10 @@ function size(Alu::FakeMPILU, d::Integer)
 end
 
 function lu!(Alu::FakeMPILU, A_local::AbstractMatrix)
+    if Alu.shared_rank != 0
+        # Non-root shared-memory block ranks do not participate in fake MPI.
+        return Alu
+    end
     A = gather_A(A_local, Alu.row_counts, Alu.A_global_column_range, Alu.comm)
     if Alu.rank == 0
         if Alu.sparse
@@ -147,6 +166,10 @@ end
 function ldiv!(x::AbstractVector, Alu::FakeMPILU, b::AbstractVector)
     if size(x) != size(b)
         error("x and b should have the same size")
+    end
+    if Alu.shared_rank != 0
+        # Non-root shared-memory block ranks do not participate in fake MPI.
+        return x
     end
     comm = Alu.comm
     rank = Alu.rank

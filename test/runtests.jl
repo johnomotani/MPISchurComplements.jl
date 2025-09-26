@@ -7,10 +7,57 @@ using MPISchurComplements
 
 include("FakeMPILUs.jl")
 
-function dense_matrix_test(n1, n2, tol)
-    distributed_comm = MPI.COMM_WORLD
-    distributed_nproc = MPI.Comm_size(distributed_comm)
-    distributed_rank = MPI.Comm_rank(distributed_comm)
+function get_comms(shared_nproc)
+    if shared_nproc == 1
+        distributed_comm = MPI.COMM_WORLD
+        distributed_nproc = MPI.Comm_size(distributed_comm)
+        distributed_rank = MPI.Comm_rank(distributed_comm)
+        shared_comm = nothing
+        shared_rank = 0
+    else
+        nproc = MPI.Comm_size(MPI.COMM_WORLD)
+        rank = MPI.Comm_rank(MPI.COMM_WORLD)
+        distributed_nproc, rem = divrem(nproc, shared_nproc)
+        if rem != 0
+            error("shared_nproc=$shared_nproc does not divide nproc=$nproc")
+        end
+        distributed_rank, shared_rank = divrem(rank, shared_nproc)
+        shared_comm = MPI.Comm_split(MPI.COMM_WORLD, distributed_rank, shared_rank)
+        if shared_rank == 0
+            distributed_color = 0
+        else
+            distributed_color = nothing
+        end
+        distributed_comm = MPI.Comm_split(MPI.COMM_WORLD, distributed_color,
+                                          distributed_rank)
+    end
+
+    local_win_store = nothing
+    if shared_comm === nothing
+        allocate_array = (args...)->zeros(Float64, args...)
+    else
+        local_win_store = MPI.Win[]
+        allocate_array = (dims...)->begin
+            if shared_rank == 0
+                dims_local = dims
+            else
+                dims_local = Tuple(0 for _ ∈ dims)
+            end
+            win, array_temp = MPI.Win_allocate_shared(Array{Float64}, dims_local,
+                                                      shared_comm)
+            array = MPI.Win_shared_query(Array{Float64}, dims, win; rank=0)
+            push!(local_win_store, win)
+            return array
+        end
+    end
+
+    return distributed_comm, distributed_nproc, distributed_rank, shared_comm,
+           shared_nproc, shared_rank, allocate_array, local_win_store
+end
+
+function dense_matrix_test(n1, n2, tol; n_shared=1)
+    distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
+        shared_rank, allocate_array, local_win_store = get_comms(n_shared)
 
     n = n1 + n2
 
@@ -27,19 +74,17 @@ function dense_matrix_test(n1, n2, tol)
     local_n = local_n1 + local_n2
 
     # Broadcast arrays from distributed_rank-0 so that all processes work with the same data.
-    if distributed_rank == 0
+    M = allocate_array(n, n)
+    b = allocate_array(n)
+    z = allocate_array(n)
+    if distributed_rank == 0 && shared_rank == 0
         rng = StableRNG(2001)
 
-        M = rand(rng, n, n)
-        b = rand(rng, n)
-        z = zeros(n)
-        MPI.Bcast!(M, distributed_comm; root=0)
-        MPI.Bcast!(b, distributed_comm; root=0)
-        MPI.Bcast!(z, distributed_comm; root=0)
-    else
-        M = zeros(n, n)
-        b = zeros(n)
-        z = zeros(n)
+        M .= rand(rng, n, n)
+        b .= rand(rng, n)
+        z .= 0.0
+    end
+    if shared_rank == 0
         MPI.Bcast!(M, distributed_comm; root=0)
         MPI.Bcast!(b, distributed_comm; root=0)
         MPI.Bcast!(z, distributed_comm; root=0)
@@ -65,7 +110,7 @@ function dense_matrix_test(n1, n2, tol)
     local_x = @view x[local_top_vec_range]
     local_y = @view y[local_bottom_vec_range]
 
-    Alu = FakeMPILU(local_A; comm=distributed_comm)
+    Alu = FakeMPILU(local_A; comm=distributed_comm, shared_comm=shared_comm)
 
     owned_top_vector_entries = distributed_rank*local_n1+1:(distributed_rank+1)*local_n1
     owned_bottom_vector_entries = distributed_rank*local_n2+1:(distributed_rank+1)*local_n2
@@ -75,26 +120,32 @@ function dense_matrix_test(n1, n2, tol)
 
     sc = mpi_schur_complement(Alu, copy(local_B), 1:n2, copy(local_C), 1:n2,
                               copy(local_D), 1:n2, owned_top_vector_entries,
-                              owned_bottom_vector_entries, distributed_comm)
+                              owned_bottom_vector_entries;
+                              distributed_comm=distributed_comm, shared_comm=shared_comm,
+                              allocate_array=allocate_array)
 
     function test_once()
         ldiv!(local_x, local_y, sc, local_u, local_v)
-        MPI.Barrier(distributed_comm)
-        MPI.Reduce!(z, +, distributed_comm)
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
+        if shared_rank == 0
+            MPI.Barrier(distributed_comm)
+            MPI.Reduce!(z, +, distributed_comm)
 
-        # Check if solution does give back original right-hand-side
-        if distributed_rank == 0
-            @test isapprox(M * z, b; atol=tol)
+            # Check if solution does give back original right-hand-side
+            if distributed_rank == 0
+                @test isapprox(M * z, b; atol=tol)
 
-            lu_sol = M \ b
-            # Sanity check that tolerance is appropriate by testing solution from
-            # LinearAlgebra's LU factorization.
-            @test isapprox(M * lu_sol, b; atol=tol)
-            # Compare our solution to the one from LinearAlgebra's LU factorization.
-            @test isapprox(z, lu_sol; rtol=tol)
+                lu_sol = M \ b
+                # Sanity check that tolerance is appropriate by testing solution from
+                # LinearAlgebra's LU factorization.
+                @test isapprox(M * lu_sol, b; atol=tol)
+                # Compare our solution to the one from LinearAlgebra's LU factorization.
+                @test isapprox(z, lu_sol; rtol=tol)
+            end
+
+            z .= 0.0
         end
-
-        z .= 0.0
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
     end
 
     @testset "solve" begin
@@ -103,42 +154,56 @@ function dense_matrix_test(n1, n2, tol)
 
     @testset "change b" begin
         # Check passing a new RHS is OK
-        if distributed_rank == 0
-            b .= rand(rng, n)
+        if shared_rank == 0
+            if distributed_rank == 0
+                b .= rand(rng, n)
+            end
+            MPI.Bcast!(b, distributed_comm; root=0)
         end
-        MPI.Bcast!(b, distributed_comm; root=0)
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
         test_once()
     end
 
     @testset "change M" begin
         # Check changing the matrix is OK
-        if distributed_rank == 0
-            M .= rand(rng, n, n)
+        if shared_rank == 0
+            if distributed_rank == 0
+                M .= rand(rng, n, n)
+                b .= rand(rng, n)
+            end
+            MPI.Bcast!(M, distributed_comm; root=0)
+            MPI.Bcast!(b, distributed_comm; root=0)
         end
-        MPI.Bcast!(M, distributed_comm; root=0)
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
         update_schur_complement!(sc, copy(local_A), copy(local_B), copy(local_C),
                                  copy(local_D))
-        if distributed_rank == 0
-            b .= rand(rng, n)
-        end
-        MPI.Bcast!(b, distributed_comm; root=0)
         test_once()
     end
 
     @testset "change M, change b" begin
         # Check passing another new RHS is OK
-        if distributed_rank == 0
-            b .= rand(rng, n)
+        if shared_rank == 0
+            if distributed_rank == 0
+                b .= rand(rng, n)
+            end
+            MPI.Bcast!(b, distributed_comm; root=0)
         end
-        MPI.Bcast!(b, distributed_comm; root=0)
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
         test_once()
+    end
+    if local_win_store !== nothing
+        # Free the MPI.Win objects, because if they are free'd by the garbage collector
+        # it may cause an MPI error or hang.
+        for w ∈ local_win_store
+            MPI.free(w)
+        end
+        resize!(local_win_store, 0)
     end
 end
 
-function sparse_matrix_test(n1, n2, tol)
-    distributed_comm = MPI.COMM_WORLD
-    distributed_nproc = MPI.Comm_size(distributed_comm)
-    distributed_rank = MPI.Comm_rank(distributed_comm)
+function sparse_matrix_test(n1, n2, tol; n_shared=1)
+    distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
+        shared_rank, allocate_array, local_win_store = get_comms(n_shared)
 
     n = n1 + n2
 
@@ -187,20 +252,18 @@ function sparse_matrix_test(n1, n2, tol)
     end
 
     # Broadcast arrays from distributed_rank-0 so that all processes work with the same data.
-    if distributed_rank == 0
+    M = allocate_array(n, n)
+    b = allocate_array(n)
+    z = allocate_array(n)
+    if distributed_rank == 0 && shared_rank == 0
         rng = StableRNG(2001)
 
-        M = rand(rng, n, n)
+        M .= rand(rng, n, n)
         sparsify_M!(M)
-        b = rand(rng, n)
-        z = zeros(n)
-        MPI.Bcast!(M, distributed_comm; root=0)
-        MPI.Bcast!(b, distributed_comm; root=0)
-        MPI.Bcast!(z, distributed_comm; root=0)
-    else
-        M = zeros(n, n)
-        b = zeros(n)
-        z = zeros(n)
+        b .= rand(rng, n)
+        z .= 0.0
+    end
+    if shared_rank == 0
         MPI.Bcast!(M, distributed_comm; root=0)
         MPI.Bcast!(b, distributed_comm; root=0)
         MPI.Bcast!(z, distributed_comm; root=0)
@@ -260,32 +323,37 @@ function sparse_matrix_test(n1, n2, tol)
     global_y = similar(y)
 
     Alu = @views FakeMPILU(local_A[:,local_top_irange], local_top_irange;
-                           comm=distributed_comm)
+                           comm=distributed_comm, shared_comm=shared_comm)
 
     sc = mpi_schur_complement(Alu, local_B[:,local_bottom_irange], local_bottom_irange,
                               local_C[local_bottom_irange,:], local_bottom_irange,
                               local_D[:,D_local_irange], D_local_irange,
-                              owned_top_vector_entries, owned_bottom_vector_entries,
-                              distributed_comm)
+                              owned_top_vector_entries, owned_bottom_vector_entries;
+                              distributed_comm=distributed_comm, shared_comm=shared_comm,
+                              allocate_array=allocate_array)
 
     function test_once()
         ldiv!(local_x, local_y, sc, local_u, local_v)
-        MPI.Barrier(distributed_comm)
-        MPI.Reduce!(z, +, distributed_comm)
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
+        if shared_rank == 0
+            MPI.Barrier(distributed_comm)
+            MPI.Reduce!(z, +, distributed_comm)
 
-        # Check if solution does give back original right-hand-side
-        if distributed_rank == 0
-            @test isapprox(M * z, b; atol=tol)
+            # Check if solution does give back original right-hand-side
+            if distributed_rank == 0
+                @test isapprox(M * z, b; atol=tol)
 
-            lu_sol = M \ b
-            # Sanity check that tolerance is appropriate by testing solution from
-            # LinearAlgebra's LU factorization.
-            @test isapprox(M * lu_sol, b; atol=tol)
-            # Compare our solution to the one from LinearAlgebra's LU factorization.
-            @test isapprox(z, lu_sol; rtol=tol)
+                lu_sol = M \ b
+                # Sanity check that tolerance is appropriate by testing solution from
+                # LinearAlgebra's LU factorization.
+                @test isapprox(M * lu_sol, b; atol=tol)
+                # Compare our solution to the one from LinearAlgebra's LU factorization.
+                @test isapprox(z, lu_sol; rtol=tol)
+            end
+
+            z .= 0.0
         end
-
-        z .= 0.0
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
     end
 
     @testset "solve" begin
@@ -294,38 +362,53 @@ function sparse_matrix_test(n1, n2, tol)
 
     @testset "change b" begin
         # Check passing a new RHS is OK
-        if distributed_rank == 0
-            b .= rand(rng, n)
+        if shared_rank == 0
+            if distributed_rank == 0
+                b .= rand(rng, n)
+            end
+            MPI.Bcast!(b, distributed_comm; root=0)
         end
-        MPI.Bcast!(b, distributed_comm; root=0)
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
         test_once()
     end
 
     @testset "change M" begin
         # Check changing the matrix is OK
-        if distributed_rank == 0
-            M .= rand(rng, n, n)
-            sparsify_M!(M)
+        if shared_rank == 0
+            if distributed_rank == 0
+                M .= rand(rng, n, n)
+                sparsify_M!(M)
+                b .= rand(rng, n)
+            end
+            MPI.Bcast!(M, distributed_comm; root=0)
+            MPI.Bcast!(b, distributed_comm; root=0)
         end
-        MPI.Bcast!(M, distributed_comm; root=0)
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
         update_schur_complement!(sc, local_A[:,local_top_irange],
                                  local_B[:,local_bottom_irange],
                                  local_C[local_bottom_irange,:],
                                  local_D[:,D_local_irange])
-        if distributed_rank == 0
-            b .= rand(rng, n)
-        end
-        MPI.Bcast!(b, distributed_comm; root=0)
         test_once()
     end
 
     @testset "change M, change b" begin
         # Check passing another new RHS is OK
-        if distributed_rank == 0
-            b .= rand(rng, n)
+        if shared_rank == 0
+            if distributed_rank == 0
+                b .= rand(rng, n)
+            end
+            MPI.Bcast!(b, distributed_comm; root=0)
         end
-        MPI.Bcast!(b, distributed_comm; root=0)
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
         test_once()
+    end
+    if local_win_store !== nothing
+        # Free the MPI.Win objects, because if they are free'd by the garbage collector
+        # it may cause an MPI error or hang.
+        for w ∈ local_win_store
+            MPI.free(w)
+        end
+        resize!(local_win_store, 0)
     end
 end
 
@@ -334,7 +417,8 @@ function runtests()
         MPI.Init()
     end
     @testset "MPISchurComplements" begin
-        if MPI.Comm_size(MPI.COMM_WORLD) == 1
+        nproc = MPI.Comm_size(MPI.COMM_WORLD)
+        if nproc == 1
             # Test prime vector sizes - easier to do in serial.
             @testset "($n1,$n2), tol=$tol" for (n1,n2,tol) ∈ (
                     (3, 2, 2.0e-14),
@@ -349,21 +433,25 @@ function runtests()
                     sparse_matrix_test(n1, n2, tol)
                 end
             end
-        elseif MPI.Comm_size(MPI.COMM_WORLD) % 2 != 0
+        elseif nproc % 2 != 0
             error("Distributed MPI test only implemented for distributed_nproc=2^n, distributed_nproc<32")
         else
-            # Test prime vector sizes - easier to do in serial.
-            @testset "($n1,$n2), tol=$tol" for (n1,n2,tol) ∈ (
-                    (128, 32, 4.0e-10),
-                    (1024, 32, 1.0e-8),
-                    (1024, 128, 3.0e-7),
-                   )
-                @testset "dense" begin
-                    dense_matrix_test(n1, n2, tol)
+            n_shared = 1
+            while n_shared ≤ nproc
+                # Test prime vector sizes - easier to do in serial.
+                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol" for (n1,n2,tol) ∈ (
+                        (128, 32, 4.0e-10),
+                        (1024, 32, 1.0e-8),
+                        (1024, 128, 3.0e-7),
+                       )
+                    @testset "dense" begin
+                        dense_matrix_test(n1, n2, tol; n_shared=n_shared)
+                    end
+                    @testset "sparse" begin
+                        sparse_matrix_test(n1, n2, tol; n_shared=n_shared)
+                    end
                 end
-                @testset "sparse" begin
-                    sparse_matrix_test(n1, n2, tol)
-                end
+                n_shared *= 2
             end
         end
     end
