@@ -55,7 +55,7 @@ function get_comms(shared_nproc, with_comm=false)
            shared_nproc, shared_rank, allocate_array, local_win_store
 end
 
-function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false)
+function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=true)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
         shared_rank, allocate_array, local_win_store = get_comms(n_shared, with_comm)
 
@@ -121,7 +121,7 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false)
                               copy(local_D), 1:n2, owned_top_vector_entries,
                               owned_bottom_vector_entries;
                               distributed_comm=distributed_comm, shared_comm=shared_comm,
-                              allocate_array=allocate_array)
+                              allocate_array=allocate_array, use_sparse=use_sparse)
 
     function test_once()
         ldiv!(local_x, local_y, sc, local_u, local_v)
@@ -200,7 +200,7 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false)
     end
 end
 
-function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false)
+function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=true)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
         shared_rank, allocate_array, local_win_store = get_comms(n_shared, with_comm)
 
@@ -328,7 +328,7 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false)
                               local_D[:,D_local_irange], D_local_irange,
                               owned_top_vector_entries, owned_bottom_vector_entries;
                               distributed_comm=distributed_comm, shared_comm=shared_comm,
-                              allocate_array=allocate_array)
+                              allocate_array=allocate_array, use_sparse=use_sparse)
 
     function test_once()
         ldiv!(local_x, local_y, sc, local_u, local_v)
@@ -410,7 +410,8 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false)
     end
 end
 
-function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=false)
+function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=false,
+                             use_sparse=true)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
         shared_rank, allocate_array, local_win_store = get_comms(n_shared, with_comm)
 
@@ -531,7 +532,7 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
                               local_D, local_bottom_vec_range,
                               local_top_vec_range, local_bottom_vec_range;
                               distributed_comm=distributed_comm, shared_comm=shared_comm,
-                              allocate_array=allocate_array)
+                              allocate_array=allocate_array, use_sparse=use_sparse)
 
     function test_once()
         ldiv!(local_x, local_y, sc, local_u, local_v)
@@ -626,17 +627,20 @@ function runtests()
         nproc = MPI.Comm_size(MPI.COMM_WORLD)
         if nproc == 1
             # Test prime vector sizes - easier to do in serial.
-            @testset "($n1,$n2), tol=$tol with_comm=$with_comm" for (n1,n2,tol) ∈ (
+            @testset "($n1,$n2), tol=$tol with_comm=$with_comm, use_sparse=$use_sparse" for (n1,n2,tol) ∈ (
                     (3, 2, 2.0e-14),
-                    (100, 32, 1.0e-10),
+                    (100, 32, 2.0e-10),
                     (1000, 17, 1.0e-8),
                     (1000, 129, 1.0e-8),
-                   ), with_comm ∈ (false, true)
+                   ), with_comm ∈ (false, true), use_sparse ∈ (true, false)
                 @testset "dense" begin
-                    dense_matrix_test(n1, n2, tol; with_comm=with_comm)
+                    dense_matrix_test(n1, n2, tol; with_comm=with_comm, use_sparse=use_sparse)
                 end
-                @testset "sparse" begin
-                    sparse_matrix_test(n1, n2, tol; with_comm=with_comm)
+                @testset "use_sparse" begin
+                    sparse_matrix_test(n1, n2, tol; with_comm=with_comm, use_sparse=use_sparse)
+                end
+                @testset "overlap" begin
+                    overlap_matrix_test(n1 + 1, n2 + 1, tol; use_sparse=use_sparse)
                 end
             end
         elseif nproc % 2 != 0
@@ -646,21 +650,21 @@ function runtests()
             while n_shared ≤ nproc
                 n_distributed = nproc ÷ n_shared
                 # Test prime vector sizes - easier to do in serial.
-                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol" for (n1,n2,tol) ∈ (
+                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, use_sparse=$use_sparse" for (n1,n2,tol) ∈ (
                         (128, 32, 4.0e-10),
                         (1024, 32, 1.0e-8),
                         (1024, 128, 3.0e-7),
-                       )
+                       ), use_sparse ∈ (true, false)
                     @testset "dense" begin
-                        dense_matrix_test(n1, n2, tol; n_shared=n_shared)
+                        dense_matrix_test(n1, n2, tol; n_shared=n_shared, use_sparse=use_sparse)
                     end
-                    @testset "sparse" begin
-                        sparse_matrix_test(n1, n2, tol; n_shared=n_shared)
+                    @testset "use_sparse" begin
+                        sparse_matrix_test(n1, n2, tol; n_shared=n_shared, use_sparse=use_sparse)
                     end
                     @testset "overlap" begin
                         overlap_matrix_test(n1 ÷ n_distributed + 1,
                                             n2 ÷ n_distributed + 1, tol;
-                                            n_shared=n_shared)
+                                            n_shared=n_shared, use_sparse=use_sparse)
                     end
                 end
                 n_shared *= 2

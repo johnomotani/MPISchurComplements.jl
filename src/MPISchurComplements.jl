@@ -25,6 +25,7 @@ export MPISchurComplement, mpi_schur_complement, update_schur_complement!, ldiv!
 using LinearAlgebra
 import LinearAlgebra: ldiv!
 using MPI
+using SparseArrays
 
 mutable struct MPISchurComplement{TA,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,Tscomm,Tsync}
     A_factorization::TA
@@ -63,6 +64,7 @@ mutable struct MPISchurComplement{TA,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,Tscomm,Tsyn
     shared_comm::Tscomm
     shared_rank::Int64
     synchronize_shared::Tsync
+    use_sparse::Bool
 end
 
 """
@@ -125,7 +127,8 @@ end
                          owned_bottom_vector_entries::UnitRange{Int64};
                          distributed_comm::MPI.Comm=MPI.COMM_SELF,
                          shared_comm::Union{MPI.Comm,Nothing}=nothing,
-                         allocate_array::Union{Function,Nothing}=nothing)
+                         allocate_array::Union{Function,Nothing}=nothing,
+                         use_sparse=true)
 
 Initialise an MPISchurComplement struct representing a 2x2 block-structured matrix
 ```math
@@ -138,30 +141,31 @@ C & D
 `A_factorization` should be a matrix factorization of `A`, or an object with similar
 functionality, that can be passed to the `ldiv!()` function to solve a matrix system.
 
-`B` and `D` are only used to initialize the MPISchurComplement, they are not stored. A
-reference to `C` is stored. Only the locally owned parts of `B`, `C` and `D` should be
-passed. `B`, `C` and `D` may be modified by this function. `owned_top_vector_entries`
-gives the range of global indices that are owned by this process in the top block of the
-state vector, `owned_bottom_vector_entries` the same for the bottom block. `B` should
-contain only the rows corresponding to `owned_top_vector_entries` and the columns
-corresponding to the global indices given by `B_global_column_range` (these do not have to
-be all the global indices, when it is known that the locally owned rows of `B` are zero
-outside of `B_global_column_range`). `C` should contain only the columns corresponding to
-`owned_top_vector_entries` and the rows corresponding to the global indices given by
-`C_global_row_range` (these do not have to be all the global indices, when it is known
-that the locally owned columns of `C` are zero outside of `C_global_row_range`). `D`
-should contain only the rows corresponding to `owned_bottom_vector_entries` and the
-columns corresponding to the global indices given by `D_global_column_range` (these do not
-have to be all the global indices, when it is known that the locally owned rows of `D` are
-zero outside of `D_global_column_range`). When shared-memory MPI parallelism is used, `B`,
-`C`, and `D` should all be shared memory arrays which are identical on all processes in
-`shared_comm` (or non-shared identical copies, but that would be an inefficient use of
-memory). When `owned_top_vector_entries` and/or `owned_bottom_vector_entries` are ranges
-that overlap between different distributed-MPI ranks, the matrices `A`, `B`, `C`, and `D`
-should be set up so that adding together the matrices passed on each distributed-MPI rank
-gives the full, global matrix (i.e. there should be no double-counting of overlapping
-entries, but any fraction of the overlap can be passed on any distributed rank, as long as
-the contributions from each distributed rank add up to the full value).
+`B` and `D` are only used to initialize the MPISchurComplement, they are not stored. If
+`sparse=false` is passed, a reference to `C` is stored. Only the locally owned parts of
+`B`, `C` and `D` should be passed. `B`, `C` and `D` may be modified by this function.
+`owned_top_vector_entries` gives the range of global indices that are owned by this
+process in the top block of the state vector, `owned_bottom_vector_entries` the same for
+the bottom block. `B` should contain only the rows corresponding to
+`owned_top_vector_entries` and the columns corresponding to the global indices given by
+`B_global_column_range` (these do not have to be all the global indices, when it is known
+that the locally owned rows of `B` are zero outside of `B_global_column_range`). `C`
+should contain only the columns corresponding to `owned_top_vector_entries` and the rows
+corresponding to the global indices given by `C_global_row_range` (these do not have to be
+all the global indices, when it is known that the locally owned columns of `C` are zero
+outside of `C_global_row_range`). `D` should contain only the rows corresponding to
+`owned_bottom_vector_entries` and the columns corresponding to the global indices given by
+`D_global_column_range` (these do not have to be all the global indices, when it is known
+that the locally owned rows of `D` are zero outside of `D_global_column_range`). When
+shared-memory MPI parallelism is used, `B`, `C`, and `D` should all be shared memory
+arrays which are identical on all processes in `shared_comm` (or non-shared identical
+copies, but that would be an inefficient use of memory). When `owned_top_vector_entries`
+and/or `owned_bottom_vector_entries` are ranges that overlap between different
+distributed-MPI ranks, the matrices `A`, `B`, `C`, and `D` should be set up so that adding
+together the matrices passed on each distributed-MPI rank gives the full, global matrix
+(i.e. there should be no double-counting of overlapping entries, but any fraction of the
+overlap can be passed on any distributed rank, as long as the contributions from each
+distributed rank add up to the full value).
 
 `distributed_comm` and `shared_comm` are the MPI communicators to use for
 distributed-memory and shared-memory communications.
@@ -176,6 +180,8 @@ freeing is not synchronized between different processes, causing errors.
 `synchronize_shared` can be passed a function that synchronizes all processes in
 `shared_comm`. This may be useful if a custom synchronization is required for debugging,
 etc. If it is not passed, `MPI.Barrier(shared_comm)` will be used.
+
+By default, makes `C` a sparse matrix. Pass `use_sparse=false` to force `C` to be dense.
 """
 function mpi_schur_complement(A_factorization, B::AbstractMatrix,
                               B_global_column_range::UnitRange{Int64}, C::AbstractMatrix,
@@ -186,7 +192,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
                               distributed_comm::MPI.Comm=MPI.COMM_SELF,
                               shared_comm::Union{MPI.Comm,Nothing}=nothing,
                               allocate_array::Union{Function,Nothing}=nothing,
-                              synchronize_shared::Union{Function,Nothing}=nothing)
+                              synchronize_shared::Union{Function,Nothing}=nothing,
+                              use_sparse=true)
 
     if distributed_comm != MPI.COMM_NULL
         distributed_nproc = MPI.Comm_size(distributed_comm)
@@ -364,6 +371,12 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
     bottom_vec_buffer = allocate_array(bottom_vec_global_size)
     global_y = allocate_array(bottom_vec_global_size)
 
+    # When using shared memory, only store the slice of C that this process needs.
+    C = @view C[C_local_row_range, :]
+    if use_sparse
+        C = sparse(C)
+    end
+
     update_schur_complement_arrays!(A_factorization, Ainv_dot_B, B, B_global_column_range,
                                     C, C_global_row_range, C_local_row_range,
                                     D, D_global_column_range, D_local_column_range,
@@ -403,7 +416,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
                                           local_bottom_vector_range_no_overlap,
                                           distributed_comm, distributed_rank,
                                           lower_boundary_comm, upper_boundary_comm,
-                                          shared_comm, shared_rank, synchronize_shared)
+                                          shared_comm, shared_rank, synchronize_shared,
+                                          use_sparse)
 
     return sc_factorization
 end
@@ -426,13 +440,19 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
     @boundscheck length(sc.owned_top_vector_entries) == size(A, 1) || error(BoundsError, " Number of rows in A does not match number of locally owned top_vector_entries")
     @boundscheck size(sc.Ainv_dot_B, 1) == size(B, 1) || error(BoundsError, " Number of rows in B does not match number of rows in original Ainv_dot_B")
     @boundscheck length(sc.B_global_column_range) == size(B, 2) || error(BoundsError, " Number of columns in B does not match number of columns in original B")
-    @boundscheck size(sc.C) == size(C) || error(BoundsError, " Size of C does not match size of original C")
+    # Don't check size(C, 1) because we don't store the full row range. There will be an
+    # out of bounds error from indexing by sc.C_local_row_range if C is too small.
+    @boundscheck size(sc.C, 2) == size(C, 2) || error(BoundsError, " Number of columns in C does not match original C")
     @boundscheck length(sc.owned_bottom_vector_entries) == size(D, 1) || error(BoundsError, " Number of rows in D does not match number of locally owned bottom_vector_entries")
     @boundscheck sc.D_local_column_range.stop ≤ size(D, 2) || error(BoundsError, " Number of columns in D is smaller than the largest index in D_local_column_range")
 
     A_factorization = sc.A_factorization
 
     lu!(A_factorization, A)
+    C = @view C[sc.C_local_row_range, :]
+    if sc.use_sparse
+        C = sparse(C)
+    end
     sc.C = C
     update_schur_complement_arrays!(A_factorization, sc.Ainv_dot_B, B,
                                     sc.B_global_column_range, C, sc.C_global_row_range,
@@ -517,8 +537,7 @@ function update_schur_complement_arrays!(A_factorization, Ainv_dot_B::AbstractMa
     # local columns). Therefore we can take the matrix product Ainv_dot_B*C with the local
     # chunks, then do a sum-reduce to get the final result. The schur_complement buffer is
     # full size on every rank.
-    @views mul!(schur_complement[C_global_row_range,:], C[C_local_row_range,:],
-                Ainv_dot_B, -1.0, 0.0)
+    @views mul!(schur_complement[C_global_row_range,:], C, Ainv_dot_B, -1.0, 0.0)
     synchronize_shared()
     # Only get the local rows for D, so just add these to the local rows of
     # schur_complement.
@@ -591,9 +610,8 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
     # multiplication below would not initialise all elements.
     bottom_vec_buffer[schur_complement_local_range] .= 0.0
     synchronize_shared()
-    # Need all rows of C, but only the local columns.
-    @views mul!(bottom_vec_buffer[sc.C_global_row_range], sc.C[sc.C_local_row_range,:],
-                Ainv_dot_u, -1.0, 0.0)
+    # Need all rows of C, but only the local columns - this is all that is stored in sc.C.
+    @views mul!(bottom_vec_buffer[sc.C_global_row_range], sc.C, Ainv_dot_u, -1.0, 0.0)
     synchronize_shared()
 
     # Only have the local entries of v, so add those to the local entries in
