@@ -14,30 +14,30 @@ import LinearAlgebra: ldiv!, lu!
 using MPI
 using SparseArrays
 
-function gather_A(A_local, row_counts, A_global_column_range, comm)
+function gather_A(A_local, total_size, global_row_range, global_column_range, comm)
     nproc = MPI.Comm_size(comm)
     rank = MPI.Comm_rank(comm)
 
     if rank == 0
-        total_size = sum(row_counts)
         A = zeros(eltype(A_local), total_size, total_size)
 
-        row_minind = 1
-        row_maxind = row_counts[1]
-        A[row_minind:row_maxind,A_global_column_range] .= A_local
+        A[global_row_range,global_column_range] .+= A_local
 
-        row_minind = row_maxind + 1
         for iproc ∈ 2:nproc
-            row_maxind = row_minind - 1 + row_counts[iproc]
+            row_minind = MPI.Recv(Int64, comm; source=iproc-1)
+            row_maxind = MPI.Recv(Int64, comm; source=iproc-1)
             col_minind = MPI.Recv(Int64, comm; source=iproc-1)
             col_maxind = MPI.Recv(Int64, comm; source=iproc-1)
-            @views MPI.Recv!(A[row_minind:row_maxind, col_minind:col_maxind], comm;
-                             source=iproc-1)
-            row_minind = row_maxind + 1
+            A_chunk = zeros(eltype(A_local), row_maxind - row_minind + 1,
+                            col_maxind - col_minind + 1)
+            MPI.Recv!(A_chunk, comm; source=iproc-1)
+            @views A[row_minind:row_maxind, col_minind:col_maxind] .+= A_chunk
         end
     else
-        MPI.Send(A_global_column_range.start, comm; dest=0)
-        MPI.Send(A_global_column_range.stop, comm; dest=0)
+        MPI.Send(global_row_range.start, comm; dest=0)
+        MPI.Send(global_row_range.stop, comm; dest=0)
+        MPI.Send(global_column_range.start, comm; dest=0)
+        MPI.Send(global_column_range.stop, comm; dest=0)
         MPI.Send(A_local, comm; dest=0)
         A = nothing
     end
@@ -50,15 +50,18 @@ mutable struct FakeMPILU{T,TLU}
     n::Int64
     m::Int64
     rhs_buffer::Vector{T}
-    row_counts::Vector{Int64}
-    A_global_column_range::UnitRange{Int64}
+    global_row_range::UnitRange{Int64}
+    global_column_range::UnitRange{Int64}
+    global_vector_ranges::Vector{UnitRange{Int64}}
     comm::MPI.Comm
     rank::Cint
+    nproc::Cint
     shared_rank::Cint
     sparse::Bool
 
     function FakeMPILU(A_local::AbstractMatrix,
-                       A_global_column_range::Union{UnitRange{Int64},Nothing}=nothing;
+                       global_row_range::Union{UnitRange{Int64},Nothing}=nothing,
+                       global_column_range::Union{UnitRange{Int64},Nothing}=nothing;
                        comm::MPI.Comm=MPI.COMM_WORLD,
                        shared_comm::Union{MPI.Comm,Nothing}=nothing, sparse=false)
 
@@ -67,27 +70,30 @@ mutable struct FakeMPILU{T,TLU}
         end
 
         data_type = eltype(A_local)
-        nproc = (comm == MPI.COMM_NULL ? -1 : MPI.Comm_size(comm))
-        rank = (comm == MPI.COMM_NULL ? -1 : MPI.Comm_rank(comm))
+        nproc = (comm == MPI.COMM_NULL ? Cint(-1) : MPI.Comm_size(comm))
+        rank = (comm == MPI.COMM_NULL ? Cint(-1) : MPI.Comm_rank(comm))
         shared_rank = shared_comm == MPI.COMM_NULL ? Cint(0) : MPI.Comm_rank(shared_comm)
-        if A_global_column_range === nothing
-            # All columns were present in A_local, not just a subset.
-            A_global_column_range = 1:size(A_local, 2)
+        if global_row_range === nothing
+            # All rows were present in A_local, not just a subset.
+            global_row_range = 1:size(A_local, 1)
         end
-        local_vector_size = size(A_local, 1)
+        if global_column_range === nothing
+            # All columns were present in A_local, not just a subset.
+            global_column_range = 1:size(A_local, 2)
+        end
 
         if rank == 0 && shared_rank == 0
-            sendbuf = Ref(local_vector_size)
-            row_counts = zeros(Int64, nproc)
-            MPI.Gather!(sendbuf, row_counts, comm; root=0)
             # total_size is given by the maximum column index in any chunk of A.
-            total_size = MPI.Reduce(A_global_column_range.stop, max, comm; root=0)
-            if sum(row_counts) != total_size
-                error("Values of local_vector_size ($row_counts) that were passed do not add "
-                      * "up to the matrix size ($total_size).")
+            total_size = MPI.Allreduce(global_row_range.stop, max, comm)
+            total_column_size = MPI.Allreduce(global_column_range.stop, max, comm)
+            if total_column_size != total_size
+                error("Values of global_row_range ($global_row_range) and "
+                      * "global_column_range($global_column_range) that were passed do "
+                      * "not give the same total size ($total_size vs. "
+                      * "$total_column_size).")
             end
 
-            A = gather_A(A_local, row_counts, A_global_column_range, comm)
+            A = gather_A(A_local, total_size, global_row_range, global_column_range, comm)
 
             if sparse
                 Alu = lu(sparse(A))
@@ -97,31 +103,51 @@ mutable struct FakeMPILU{T,TLU}
 
             rhs_buffer = zeros(data_type, total_size)
 
-            n, m = size(A)
+            n = total_size
+            m = total_column_size
+
             MPI.bcast((n,m), 0, comm)
             shared_comm != MPI.COMM_NULL && MPI.bcast((n,m), 0, shared_comm)
-        elseif shared_rank == 0
-            sendbuf = Ref(local_vector_size)
-            MPI.Gather!(sendbuf, nothing, comm; root=0)
-            MPI.Reduce(A_global_column_range.stop, max, comm; root=0)
 
-            gather_A(A_local, nothing, A_global_column_range, comm)
+            global_vector_ranges = [global_row_range]
+            for iproc ∈ 1:nproc-1
+                iproc_imin = MPI.Recv(Int64, comm; source=iproc)
+                iproc_imax = MPI.Recv(Int64, comm; source=iproc)
+                push!(global_vector_ranges, iproc_imin:iproc_imax)
+            end
+        elseif shared_rank == 0
+            total_size = MPI.Allreduce(global_row_range.stop, max, comm)
+            total_column_size = MPI.Allreduce(global_column_range.stop, max, comm)
+            if total_column_size != total_size
+                error("Values of global_row_range ($global_row_range) and "
+                      * "global_column_range($global_column_range) that were passed do "
+                      * "not give the same total size ($total_size vs. "
+                      * "$total_column_size).")
+            end
+
+            gather_A(A_local, total_size, global_row_range, global_column_range, comm)
 
             Alu = nothing
             rhs_buffer = zeros(data_type, 0)
-            row_counts = Int64[]
+
+            n = total_size
+            m = total_column_size
+
             (n, m) = MPI.bcast(nothing, 0, comm)
             shared_comm != MPI.COMM_NULL && MPI.bcast((n,m), 0, shared_comm)
+            global_vector_ranges = UnitRange{Int64}[]
+            MPI.Send(global_row_range.start, comm; dest=0)
+            MPI.Send(global_row_range.stop, comm; dest=0)
         else
             Alu = nothing
             rhs_buffer = zeros(data_type, 0)
-            row_counts = Int64[]
             (n, m) = MPI.bcast(nothing, 0, shared_comm)
+            global_vector_ranges = UnitRange{Int64}[]
         end
 
-        return new{data_type,typeof(Alu)}(Alu, n, m, rhs_buffer, row_counts,
-                                          A_global_column_range, comm, rank, shared_rank,
-                                          sparse)
+        return new{data_type,typeof(Alu)}(Alu, n, m, rhs_buffer, global_row_range,
+                                          global_column_range, global_vector_ranges, comm,
+                                          rank, nproc, shared_rank, sparse)
     end
 end
 
@@ -143,7 +169,7 @@ function lu!(Alu::FakeMPILU, A_local::AbstractMatrix)
         # Non-root shared-memory block ranks do not participate in fake MPI.
         return Alu
     end
-    A = gather_A(A_local, Alu.row_counts, Alu.A_global_column_range, Alu.comm)
+    A = gather_A(A_local, Alu.n, Alu.global_row_range, Alu.global_column_range, Alu.comm)
     if Alu.rank == 0
         if Alu.sparse
             try
@@ -173,20 +199,34 @@ function ldiv!(x::AbstractVector, Alu::FakeMPILU, b::AbstractVector)
     end
     comm = Alu.comm
     rank = Alu.rank
-    row_counts = Alu.row_counts
-    if rank == 0
-        rhs_buffer = VBuffer(Alu.rhs_buffer, row_counts)
-    else
-        rhs_buffer = nothing
-    end
-
-    MPI.Gatherv!(b, rhs_buffer, comm; root=0)
+    nproc = Alu.nproc
 
     if rank == 0
+        rhs_buffer = Alu.rhs_buffer
+
+        rhs_buffer[Alu.global_row_range] .= b
+        last_row_max = Alu.global_row_range.stop
+        for iproc ∈ 1:nproc-1
+            this_vector_range = Alu.global_vector_ranges[iproc+1]
+            this_rhs_buffer = zeros(eltype(rhs_buffer), length(this_vector_range))
+            MPI.Recv!(this_rhs_buffer, comm; source=iproc)
+
+            # Any entries in overlapping parts of the vector are identical, so is OK to
+            # overwirte them.
+            rhs_buffer[this_vector_range] .= this_rhs_buffer
+        end
+
         ldiv!(Alu.Alu, Alu.rhs_buffer)
-    end
 
-    MPI.Scatterv!(rhs_buffer, x, comm; root=0)
+        @views x .= rhs_buffer[Alu.global_row_range]
+        for iproc ∈ 1:nproc-1
+            @views MPI.Send(rhs_buffer[Alu.global_vector_ranges[iproc+1]], comm;
+                            dest=iproc)
+        end
+    else
+        MPI.Send(b, comm; dest=0)
+        MPI.Recv!(x, comm; source=0)
+    end
 
     return x
 end

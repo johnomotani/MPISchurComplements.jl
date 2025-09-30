@@ -7,8 +7,8 @@ using MPISchurComplements
 
 include("FakeMPILUs.jl")
 
-function get_comms(shared_nproc)
-    if shared_nproc == 1
+function get_comms(shared_nproc, with_comm=false)
+    if shared_nproc == 1 && !with_comm
         distributed_comm = MPI.COMM_WORLD
         distributed_nproc = MPI.Comm_size(distributed_comm)
         distributed_rank = MPI.Comm_rank(distributed_comm)
@@ -33,7 +33,7 @@ function get_comms(shared_nproc)
     end
 
     local_win_store = nothing
-    if shared_comm === nothing
+    if shared_comm === nothing && !with_comm
         allocate_array = (args...)->zeros(Float64, args...)
     else
         local_win_store = MPI.Win[]
@@ -55,9 +55,9 @@ function get_comms(shared_nproc)
            shared_nproc, shared_rank, allocate_array, local_win_store
 end
 
-function dense_matrix_test(n1, n2, tol; n_shared=1)
+function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array, local_win_store = get_comms(n_shared)
+        shared_rank, allocate_array, local_win_store = get_comms(n_shared, with_comm)
 
     n = n1 + n2
 
@@ -70,8 +70,6 @@ function dense_matrix_test(n1, n2, tol; n_shared=1)
     rem != 0 && error("distributed_nproc=$distributed_nproc does not divide n2=$n2")
 
     local_bottom_vec_range = (distributed_rank * local_n2 + 1):(distributed_rank + 1)*local_n2
-
-    local_n = local_n1 + local_n2
 
     # Broadcast arrays from distributed_rank-0 so that all processes work with the same data.
     M = allocate_array(n, n)
@@ -110,7 +108,8 @@ function dense_matrix_test(n1, n2, tol; n_shared=1)
     local_x = @view x[local_top_vec_range]
     local_y = @view y[local_bottom_vec_range]
 
-    Alu = FakeMPILU(local_A; comm=distributed_comm, shared_comm=shared_comm)
+    Alu = FakeMPILU(local_A, local_top_vec_range; comm=distributed_comm,
+                    shared_comm=shared_comm)
 
     owned_top_vector_entries = distributed_rank*local_n1+1:(distributed_rank+1)*local_n1
     owned_bottom_vector_entries = distributed_rank*local_n2+1:(distributed_rank+1)*local_n2
@@ -201,9 +200,9 @@ function dense_matrix_test(n1, n2, tol; n_shared=1)
     end
 end
 
-function sparse_matrix_test(n1, n2, tol; n_shared=1)
+function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array, local_win_store = get_comms(n_shared)
+        shared_rank, allocate_array, local_win_store = get_comms(n_shared, with_comm)
 
     n = n1 + n2
 
@@ -216,8 +215,6 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1)
     rem != 0 && error("distributed_nproc=$distributed_nproc does not divide n2=$n2")
 
     local_bottom_vec_range = (distributed_rank * local_n2 + 1):(distributed_rank + 1)*local_n2
-
-    local_n = local_n1 + local_n2
 
     # Boundaries in indices along 'n1' axes of B and C where the sparsity pattern changes.
     sparsity_boundaries = [1, max(n1 ÷ 4, 1), max(n1 ÷ 2, 1), max((3 * n1) ÷ 4, 1), n1+1]
@@ -322,8 +319,9 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1)
     bottom_vec_buffer = similar(y)
     global_y = similar(y)
 
-    Alu = @views FakeMPILU(local_A[:,local_top_irange], local_top_irange;
-                           comm=distributed_comm, shared_comm=shared_comm)
+    Alu = @views FakeMPILU(local_A[:,local_top_irange], local_top_vec_range,
+                           local_top_irange; comm=distributed_comm,
+                           shared_comm=shared_comm)
 
     sc = mpi_schur_complement(Alu, local_B[:,local_bottom_irange], local_bottom_irange,
                               local_C[local_bottom_irange,:], local_bottom_irange,
@@ -412,6 +410,216 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1)
     end
 end
 
+function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=false)
+    distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
+        shared_rank, allocate_array, local_win_store = get_comms(n_shared, with_comm)
+
+    rng = StableRNG(2001)
+
+    n1 = (local_n1 - 1) * distributed_nproc + 1
+    n2 = (local_n2 - 1) * distributed_nproc + 1
+    n = n1 + n2
+
+    # Set up overlapping 'owned' ranges
+    local_top_vec_range = (distributed_rank * (local_n1 - 1) + 1):((distributed_rank + 1) * (local_n1 - 1) + 1)
+    local_bottom_vec_range = (distributed_rank * (local_n2 - 1) + 1):((distributed_rank + 1) * (local_n2 - 1) + 1)
+
+    function initialize_M!(this_M)
+        this_A = @view this_M[1:n1, 1:n1]
+        this_B = @view this_M[1:n1, n1+1:n1+n2]
+        this_C = @view this_M[n1+1:n1+n2, 1:n1]
+        this_D = @view this_M[n1+1:n1+n2, n1+1:n1+n2]
+
+        this_M .= 0.0
+
+        for i ∈ 1:distributed_nproc
+            this_top_vec_range = ((i - 1) * (local_n1 - 1) + 1):(i * (local_n1 - 1) + 1)
+            this_bottom_vec_range = ((i - 1) * (local_n2 - 1) + 1):(i * (local_n2 - 1) + 1)
+            ntop = length(this_top_vec_range)
+            nbottom = length(this_bottom_vec_range)
+
+            this_A[this_top_vec_range,this_top_vec_range] .= rand(ntop,ntop)
+            this_B[this_top_vec_range,this_bottom_vec_range] .= rand(ntop,nbottom)
+            this_C[this_bottom_vec_range,this_top_vec_range] .= rand(nbottom,ntop)
+            this_D[this_bottom_vec_range,this_bottom_vec_range] .= rand(nbottom,nbottom)
+        end
+    end
+    function get_local_slices!(this_M)
+        # Need to extract slices, and multiply any overlaps by 0.5 so that they can be
+        # recombined by adding the overlapping chunks together.
+
+        this_A = @view this_M[1:n1, 1:n1]
+        this_B = @view this_M[1:n1, n1+1:n1+n2]
+        this_C = @view this_M[n1+1:n1+n2, 1:n1]
+        this_D = @view this_M[n1+1:n1+n2, n1+1:n1+n2]
+
+        # Make copies here so that we do not modify the original matrix.
+        local_ntop = length(local_top_vec_range)
+        local_nbottom = length(local_bottom_vec_range)
+        this_local_A = allocate_array(local_ntop,local_ntop)
+        this_local_B = allocate_array(local_ntop,local_nbottom)
+        this_local_C = allocate_array(local_nbottom,local_ntop)
+        this_local_D = allocate_array(local_nbottom,local_nbottom)
+
+        if shared_rank == 0
+            this_local_A .= this_A[local_top_vec_range,local_top_vec_range]
+            this_local_B .= this_B[local_top_vec_range,local_bottom_vec_range]
+            this_local_C .= this_C[local_bottom_vec_range,local_top_vec_range]
+            this_local_D .= this_D[local_bottom_vec_range,local_bottom_vec_range]
+
+            if distributed_rank != 0
+                # Overlap at top-left corners.
+                this_local_A[1,1] *= 0.5
+                this_local_B[1,1] *= 0.5
+                this_local_C[1,1] *= 0.5
+                this_local_D[1,1] *= 0.5
+            end
+            #if distributed_rank != distributed_nproc - 1
+            if distributed_rank != MPI.Comm_size(distributed_comm) - 1
+                # Overlap at bottom-right corners.
+                this_local_A[end,end] *= 0.5
+                this_local_B[end,end] *= 0.5
+                this_local_C[end,end] *= 0.5
+                this_local_D[end,end] *= 0.5
+            end
+        end
+
+        return this_local_A, this_local_B, this_local_C, this_local_D
+    end
+
+    # Broadcast arrays from distributed_rank-0 so that all processes work with the same data.
+    M = allocate_array(n, n)
+    b = allocate_array(n)
+    z = allocate_array(n)
+    if distributed_rank == 0 && shared_rank == 0
+        rng = StableRNG(2001)
+
+        initialize_M!(M)
+        b .= rand(rng, n)
+        z .= 0.0
+    end
+    if shared_rank == 0
+        MPI.Bcast!(M, distributed_comm; root=0)
+        MPI.Bcast!(b, distributed_comm; root=0)
+        MPI.Bcast!(z, distributed_comm; root=0)
+    end
+    shared_comm !== nothing && MPI.Barrier(shared_comm)
+
+    A = @view M[1:n1, 1:n1]
+    B = @view M[1:n1, n1+1:end]
+    C = @view M[n1+1:end, 1:n1]
+    D = @view M[n1+1:end, n1+1:end]
+    u = @view b[1:n1]
+    v = @view b[n1+1:end]
+    x = @view z[1:n1]
+    y = @view z[n1+1:end]
+
+    # This process owns the *columns* corresponding to local_top_vec_range and
+    # local_bottom_vec_range. The rows are distributed between different processes.
+    local_A, local_B, local_C, local_D = get_local_slices!(M)
+    local_u = @view u[local_top_vec_range]
+    local_v = @view v[local_bottom_vec_range]
+    local_x = @view x[local_top_vec_range]
+    local_y = @view y[local_bottom_vec_range]
+
+    bottom_vec_buffer = similar(y)
+    global_y = similar(y)
+
+    Alu = @views FakeMPILU(local_A, local_top_vec_range, local_top_vec_range;
+                           comm=distributed_comm, shared_comm=shared_comm)
+
+    sc = mpi_schur_complement(Alu, local_B, local_bottom_vec_range,
+                              local_C, local_bottom_vec_range,
+                              local_D, local_bottom_vec_range,
+                              local_top_vec_range, local_bottom_vec_range;
+                              distributed_comm=distributed_comm, shared_comm=shared_comm,
+                              allocate_array=allocate_array)
+
+    function test_once()
+        ldiv!(local_x, local_y, sc, local_u, local_v)
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
+
+        if shared_rank == 0
+            # Drop overlapping parts of solution.
+            if distributed_rank != 0
+                local_x[1] = 0.0
+                local_y[1] = 0.0
+            end
+
+            MPI.Barrier(distributed_comm)
+            MPI.Reduce!(z, +, distributed_comm)
+
+            # Check if solution does give back original right-hand-side
+            if distributed_rank == 0
+                @test isapprox(M * z, b; atol=tol)
+
+                lu_sol = M \ b
+                # Sanity check that tolerance is appropriate by testing solution from
+                # LinearAlgebra's LU factorization.
+                @test isapprox(M * lu_sol, b; atol=tol)
+                # Compare our solution to the one from LinearAlgebra's LU factorization.
+                @test isapprox(z, lu_sol; rtol=tol)
+            end
+
+            z .= 0.0
+        end
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
+    end
+
+    @testset "solve" begin
+        test_once()
+    end
+
+    @testset "change b" begin
+        # Check passing a new RHS is OK
+        if shared_rank == 0
+            if distributed_rank == 0
+                b .= rand(rng, n)
+            end
+            MPI.Bcast!(b, distributed_comm; root=0)
+        end
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
+        test_once()
+    end
+
+    @testset "change M" begin
+        # Check changing the matrix is OK
+        if shared_rank == 0
+            if distributed_rank == 0
+                initialize_M!(M)
+                b .= rand(rng, n)
+            end
+            MPI.Bcast!(M, distributed_comm; root=0)
+            MPI.Bcast!(b, distributed_comm; root=0)
+        end
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
+        local_A, local_B, local_C, local_D = get_local_slices!(M)
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
+        update_schur_complement!(sc, local_A, local_B, local_C, local_D)
+        test_once()
+    end
+
+    @testset "change M, change b" begin
+        # Check passing another new RHS is OK
+        if shared_rank == 0
+            if distributed_rank == 0
+                b .= rand(rng, n)
+            end
+            MPI.Bcast!(b, distributed_comm; root=0)
+        end
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
+        test_once()
+    end
+    if local_win_store !== nothing
+        # Free the MPI.Win objects, because if they are free'd by the garbage collector
+        # it may cause an MPI error or hang.
+        for w ∈ local_win_store
+            MPI.free(w)
+        end
+        resize!(local_win_store, 0)
+    end
+end
+
 function runtests()
     if !MPI.Initialized()
         MPI.Init()
@@ -420,17 +628,17 @@ function runtests()
         nproc = MPI.Comm_size(MPI.COMM_WORLD)
         if nproc == 1
             # Test prime vector sizes - easier to do in serial.
-            @testset "($n1,$n2), tol=$tol" for (n1,n2,tol) ∈ (
+            @testset "($n1,$n2), tol=$tol with_comm=$with_comm" for (n1,n2,tol) ∈ (
                     (3, 2, 2.0e-14),
                     (100, 32, 1.0e-10),
                     (1000, 17, 1.0e-8),
                     (1000, 129, 1.0e-8),
-                   )
+                   ), with_comm ∈ (false, true)
                 @testset "dense" begin
-                    dense_matrix_test(n1, n2, tol)
+                    dense_matrix_test(n1, n2, tol; with_comm=with_comm)
                 end
                 @testset "sparse" begin
-                    sparse_matrix_test(n1, n2, tol)
+                    sparse_matrix_test(n1, n2, tol; with_comm=with_comm)
                 end
             end
         elseif nproc % 2 != 0
@@ -438,6 +646,7 @@ function runtests()
         else
             n_shared = 1
             while n_shared ≤ nproc
+                n_distributed = nproc ÷ n_shared
                 # Test prime vector sizes - easier to do in serial.
                 @testset "n_shared=$n_shared ($n1,$n2), tol=$tol" for (n1,n2,tol) ∈ (
                         (128, 32, 4.0e-10),
@@ -449,6 +658,11 @@ function runtests()
                     end
                     @testset "sparse" begin
                         sparse_matrix_test(n1, n2, tol; n_shared=n_shared)
+                    end
+                    @testset "overlap" begin
+                        overlap_matrix_test(n1 ÷ n_distributed + 1,
+                                            n2 ÷ n_distributed + 1, tol;
+                                            n_shared=n_shared)
                     end
                 end
                 n_shared *= 2
