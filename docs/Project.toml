@@ -1,0 +1,6 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+MPISchurComplements = "586db363-8230-43f3-b4b3-2c5432ab38c6"
+
+[sources.MPISchurComplements]
+path = ".."
