@@ -253,7 +253,7 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false)
     b = allocate_array(n)
     z = allocate_array(n)
     if distributed_rank == 0 && shared_rank == 0
-        rng = StableRNG(2001)
+        rng = StableRNG(2002)
 
         M .= rand(rng, n, n)
         sparsify_M!(M)
@@ -414,7 +414,7 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
         shared_rank, allocate_array, local_win_store = get_comms(n_shared, with_comm)
 
-    rng = StableRNG(2001)
+    rng = StableRNG(2003)
 
     n1 = (local_n1 - 1) * distributed_nproc + 1
     n2 = (local_n2 - 1) * distributed_nproc + 1
@@ -438,10 +438,10 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
             ntop = length(this_top_vec_range)
             nbottom = length(this_bottom_vec_range)
 
-            this_A[this_top_vec_range,this_top_vec_range] .= rand(ntop,ntop)
-            this_B[this_top_vec_range,this_bottom_vec_range] .= rand(ntop,nbottom)
-            this_C[this_bottom_vec_range,this_top_vec_range] .= rand(nbottom,ntop)
-            this_D[this_bottom_vec_range,this_bottom_vec_range] .= rand(nbottom,nbottom)
+            this_A[this_top_vec_range,this_top_vec_range] .= rand(rng, ntop, ntop)
+            this_B[this_top_vec_range,this_bottom_vec_range] .= rand(rng, ntop, nbottom)
+            this_C[this_bottom_vec_range,this_top_vec_range] .= rand(rng, nbottom, ntop)
+            this_D[this_bottom_vec_range,this_bottom_vec_range] .= rand(rng, nbottom, nbottom)
         end
     end
     function get_local_slices!(this_M)
@@ -492,8 +492,6 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
     b = allocate_array(n)
     z = allocate_array(n)
     if distributed_rank == 0 && shared_rank == 0
-        rng = StableRNG(2001)
-
         initialize_M!(M)
         b .= rand(rng, n)
         z .= 0.0
