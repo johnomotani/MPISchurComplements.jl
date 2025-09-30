@@ -438,10 +438,10 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
             ntop = length(this_top_vec_range)
             nbottom = length(this_bottom_vec_range)
 
-            this_A[this_top_vec_range,this_top_vec_range] .= rand(ntop,ntop)
-            this_B[this_top_vec_range,this_bottom_vec_range] .= rand(ntop,nbottom)
-            this_C[this_bottom_vec_range,this_top_vec_range] .= rand(nbottom,ntop)
-            this_D[this_bottom_vec_range,this_bottom_vec_range] .= rand(nbottom,nbottom)
+            this_A[this_top_vec_range,this_top_vec_range] .= rand(rng, ntop, ntop)
+            this_B[this_top_vec_range,this_bottom_vec_range] .= rand(rng, ntop, nbottom)
+            this_C[this_bottom_vec_range,this_top_vec_range] .= rand(rng, nbottom, ntop)
+            this_D[this_bottom_vec_range,this_bottom_vec_range] .= rand(rng, nbottom, nbottom)
         end
     end
     function get_local_slices!(this_M)
