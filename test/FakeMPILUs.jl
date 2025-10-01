@@ -57,13 +57,13 @@ mutable struct FakeMPILU{T,TLU}
     rank::Cint
     nproc::Cint
     shared_rank::Cint
-    sparse::Bool
+    use_sparse::Bool
 
     function FakeMPILU(A_local::AbstractMatrix,
                        global_row_range::Union{UnitRange{Int64},Nothing}=nothing,
                        global_column_range::Union{UnitRange{Int64},Nothing}=nothing;
                        comm::MPI.Comm=MPI.COMM_WORLD,
-                       shared_comm::Union{MPI.Comm,Nothing}=nothing, sparse=false)
+                       shared_comm::Union{MPI.Comm,Nothing}=nothing, use_sparse=false)
 
         if shared_comm === nothing
             shared_comm = MPI.COMM_NULL
@@ -95,7 +95,7 @@ mutable struct FakeMPILU{T,TLU}
 
             A = gather_A(A_local, total_size, global_row_range, global_column_range, comm)
 
-            if sparse
+            if use_sparse
                 Alu = lu(sparse(A))
             else
                 Alu = lu(A)
@@ -147,7 +147,7 @@ mutable struct FakeMPILU{T,TLU}
 
         return new{data_type,typeof(Alu)}(Alu, n, m, rhs_buffer, global_row_range,
                                           global_column_range, global_vector_ranges, comm,
-                                          rank, nproc, shared_rank, sparse)
+                                          rank, nproc, shared_rank, use_sparse)
     end
 end
 
@@ -171,7 +171,7 @@ function lu!(Alu::FakeMPILU, A_local::AbstractMatrix)
     end
     A = gather_A(A_local, Alu.n, Alu.global_row_range, Alu.global_column_range, Alu.comm)
     if Alu.rank == 0
-        if Alu.sparse
+        if Alu.use_sparse
             try
                 lu!(Alu.Alu, sparse(A))
             catch e
