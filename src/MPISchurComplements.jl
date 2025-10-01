@@ -27,10 +27,11 @@ import LinearAlgebra: ldiv!
 using MPI
 using SparseArrays
 
-mutable struct MPISchurComplement{TA,TAiBl,TAiB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,Tscomm,Tsync}
+mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,Tscomm,Tsync}
     A_factorization::TA
     Ainv_dot_B::TAiB
     Ainv_dot_B_local::TAiBl
+    B::TB
     B_global_column_range::UnitRange{Int64}
     C::TC
     C_global_row_range::UnitRange{Int64}
@@ -66,6 +67,7 @@ mutable struct MPISchurComplement{TA,TAiBl,TAiB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,Tsc
     shared_rank::Int64
     synchronize_shared::Tsync
     use_sparse::Bool
+    separate_Ainv_B::Bool
 end
 
 """
@@ -129,7 +131,7 @@ end
                          distributed_comm::MPI.Comm=MPI.COMM_SELF,
                          shared_comm::Union{MPI.Comm,Nothing}=nothing,
                          allocate_array::Union{Function,Nothing}=nothing,
-                         use_sparse=true)
+                         use_sparse=true, separate_Ainv_B=false)
 
 Initialise an MPISchurComplement struct representing a 2x2 block-structured matrix
 ```math
@@ -183,6 +185,13 @@ freeing is not synchronized between different processes, causing errors.
 etc. If it is not passed, `MPI.Barrier(shared_comm)` will be used.
 
 By default, makes `C` a sparse matrix. Pass `use_sparse=false` to force `C` to be dense.
+
+If `B` is very sparse, and `A_factorization` is efficiently parallelised, it might be more
+efficient to compute `A \\ (B.y)` in two steps (`B.y` then `A \\ ()`) rather than
+multiplying by the dense `Ainv_dot_B`. If `separate_Ainv_B=true` is passed, this will be
+done (requires `use_sparse=true`). There is no saving in setup time because `Ainv_dot_B`
+still has to be calculated, to be multiplied by `C` when calculating `schur_complement`.
+There is also no memory saving as a dense B-sized buffer array is needed.
 """
 function mpi_schur_complement(A_factorization, B::AbstractMatrix,
                               B_global_column_range::UnitRange{Int64}, C::AbstractMatrix,
@@ -194,7 +203,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
                               shared_comm::Union{MPI.Comm,Nothing}=nothing,
                               allocate_array::Union{Function,Nothing}=nothing,
                               synchronize_shared::Union{Function,Nothing}=nothing,
-                              use_sparse=true)
+                              use_sparse=true, separate_Ainv_B=false)
 
     if distributed_comm != MPI.COMM_NULL
         distributed_nproc = MPI.Comm_size(distributed_comm)
@@ -366,9 +375,19 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
 
     # Allocate buffer arrays
     Ainv_dot_B = allocate_array(top_vec_local_size, bottom_vec_global_size)
-    # Store the chunk of Ainv_dot_B needed by this shared-memory process as a contiguous
-    # array.
-    Ainv_dot_B_local = Matrix{eltype(B)}(undef, length(local_top_vector_range), bottom_vec_global_size)
+    if separate_Ainv_B
+        if !use_sparse
+            error("It will always be more expensive to use `separate_Ainv_B` when "
+                  * "`use_sparse=false`.")
+        end
+        Ainv_dot_B_local = nothing
+        B_local = sparse(zeros(eltype(B), 1, 1))
+    else
+        # Store the chunk of Ainv_dot_B needed by this shared-memory process as a contiguous
+        # array.
+        Ainv_dot_B_local = Matrix{eltype(B)}(undef, length(local_top_vector_range), bottom_vec_global_size)
+        B_local = nothing
+    end
     Ainv_dot_u = allocate_array(top_vec_local_size)
     schur_complement = allocate_array(bottom_vec_global_size, bottom_vec_global_size)
     top_vec_buffer = allocate_array(top_vec_local_size)
@@ -387,7 +406,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
     end
 
     sc_factorization = MPISchurComplement(A_factorization, Ainv_dot_B, Ainv_dot_B_local,
-                                          B_global_column_range, fake_C,
+                                          B_local, B_global_column_range, fake_C,
                                           C_global_row_range, C_local_row_range,
                                           D_global_column_range, D_local_column_range,
                                           schur_complement,
@@ -409,7 +428,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
                                           distributed_comm, distributed_rank,
                                           lower_boundary_comm, upper_boundary_comm,
                                           shared_comm, shared_rank, synchronize_shared,
-                                          use_sparse)
+                                          use_sparse, separate_Ainv_B)
 
     update_schur_complement!(sc_factorization, missing, B, C, D)
 
@@ -459,19 +478,14 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
     lower_boundary_comm = sc.lower_boundary_comm
     upper_boundary_comm = sc.upper_boundary_comm
     synchronize_shared = sc.synchronize_shared
+    use_sparse = sc.use_sparse
+    separate_Ainv_B = sc.separate_Ainv_B
 
     # When `A===missing`, this was called from the `mpi_schur_complement()` constructor,
     # where we assume `A_factorization` was already initialized.
     if A !== missing
         lu!(A_factorization, A)
     end
-
-    # When using shared memory, only store the slice of C that this process needs.
-    C = @view C[sc.C_local_row_range, :]
-    if sc.use_sparse
-        C = sparse(C)
-    end
-    sc.C = C
 
     # Use `Ainv_dot_B` as a local-rows/global-columns sized buffer to collect `B` into.
     # This is slightly inefficient, as there will be chunks that are all-zero that we do
@@ -503,13 +517,28 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
     end
     synchronize_shared()
 
+    if separate_Ainv_B
+        # At this point `Ainv_dot_B` contains the dense array of `B`.
+        sc.B = @views sparse(Ainv_dot_B[local_top_vector_range,:])
+        synchronize_shared()
+    end
+
+    # When using shared memory, only store the slice of C that this process needs.
+    C = @view C[sc.C_local_row_range, :]
+    if use_sparse
+        C = sparse(C)
+    end
+    sc.C = C
+
     ldiv!(A_factorization, Ainv_dot_B)
 
     # Initialise to zero, because when C does not include all rows, the matrix
     # multiplication below would not initialise all elements.
     schur_complement[:,schur_complement_local_range] .= 0.0
     synchronize_shared()
-    Ainv_dot_B_local .= Ainv_dot_B[local_top_vector_range,:]
+    if !separate_Ainv_B
+        Ainv_dot_B_local .= Ainv_dot_B[local_top_vector_range,:]
+    end
     # We store locally all columns in Ainv_dot_B (only local rows) and all rows of C (only
     # local columns). Therefore we can take the matrix product Ainv_dot_B*C with the local
     # chunks, then do a sum-reduce to get the final result. The schur_complement buffer is
@@ -615,7 +644,16 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
     synchronize_shared()
 
     # Need all columns of Ainv_dot_B_local, but only the local rows.
-    @views mul!(top_vec_buffer[local_top_vector_range], Ainv_dot_B_local, global_y)
+    if sc.separate_Ainv_B
+        # B_local is a sparse matrix, so this might sometimes be numerically cheaper than
+        # multiplying by a dense, precomputed Ainv_dot_B_local`.
+        @views mul!(top_vec_buffer[local_top_vector_range], sc.B, global_y)
+        synchronize_shared()
+        ldiv!(A_factorization, top_vec_buffer)
+        synchronize_shared()
+    else
+        @views mul!(top_vec_buffer[local_top_vector_range], Ainv_dot_B_local, global_y)
+    end
     @. x[local_top_vector_range] = Ainv_dot_u[local_top_vector_range,:] - top_vec_buffer[local_top_vector_range]
 
     @views @. y[local_bottom_vector_range] = global_y[global_bottom_vector_range]
