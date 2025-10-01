@@ -375,33 +375,22 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
     bottom_vec_buffer = allocate_array(bottom_vec_global_size)
     global_y = allocate_array(bottom_vec_global_size)
 
-    # When using shared memory, only store the slice of C that this process needs.
-    C = @view C[C_local_row_range, :]
+    fake_C = zeros(eltype(C), 1, 1)
     if use_sparse
-        C = sparse(C)
+        fake_C = sparse(fake_C)
     end
 
-    update_schur_complement_arrays!(A_factorization, Ainv_dot_B, Ainv_dot_B_local, B,
-                                    B_global_column_range, C, C_global_row_range,
-                                    C_local_row_range, D, D_global_column_range,
-                                    D_local_column_range, schur_complement,
-                                    schur_complement_local_range, local_top_vector_range,
-                                    local_top_vector_lower_overlap,
-                                    local_top_vector_upper_overlap,
-                                    owned_bottom_vector_entries, distributed_comm,
-                                    distributed_rank, lower_boundary_comm,
-                                    upper_boundary_comm, shared_rank, synchronize_shared)
-
     if shared_rank == 0 && distributed_rank == 0
-        schur_complement_factorization = lu!(schur_complement)
+        schur_complement_factorization = lu!(ones(eltype(D), 1, 1))
     else
         schur_complement_factorization = nothing
     end
 
     sc_factorization = MPISchurComplement(A_factorization, Ainv_dot_B, Ainv_dot_B_local,
-                                          B_global_column_range, C, C_global_row_range,
-                                          C_local_row_range, D_global_column_range,
-                                          D_local_column_range, schur_complement,
+                                          B_global_column_range, fake_C,
+                                          C_global_row_range, C_local_row_range,
+                                          D_global_column_range, D_local_column_range,
+                                          schur_complement,
                                           schur_complement_factorization,
                                           schur_complement_local_range, Ainv_dot_u,
                                           top_vec_buffer, top_vec_local_size,
@@ -422,6 +411,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
                                           shared_comm, shared_rank, synchronize_shared,
                                           use_sparse)
 
+    update_schur_complement!(sc_factorization, missing, B, C, D)
+
     return sc_factorization
 end
 
@@ -440,66 +431,47 @@ modified.
 """
 function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
                                   C::AbstractMatrix, D::AbstractMatrix)
-    @boundscheck length(sc.owned_top_vector_entries) == size(A, 1) || error(BoundsError, " Number of rows in A does not match number of locally owned top_vector_entries")
+    @boundscheck A === missing || length(sc.owned_top_vector_entries) == size(A, 1) || error(BoundsError, " Number of rows in A does not match number of locally owned top_vector_entries")
     @boundscheck size(sc.Ainv_dot_B, 1) == size(B, 1) || error(BoundsError, " Number of rows in B does not match number of rows in original Ainv_dot_B")
     @boundscheck length(sc.B_global_column_range) == size(B, 2) || error(BoundsError, " Number of columns in B does not match number of columns in original B")
     # Don't check size(C, 1) because we don't store the full row range. There will be an
     # out of bounds error from indexing by sc.C_local_row_range if C is too small.
-    @boundscheck size(sc.C, 2) == size(C, 2) || error(BoundsError, " Number of columns in C does not match original C")
+    @boundscheck sc.top_vec_local_size == size(C, 2) || error(BoundsError, " Number of columns in C does not match original C")
     @boundscheck length(sc.owned_bottom_vector_entries) == size(D, 1) || error(BoundsError, " Number of rows in D does not match number of locally owned bottom_vector_entries")
     @boundscheck sc.D_local_column_range.stop ≤ size(D, 2) || error(BoundsError, " Number of columns in D is smaller than the largest index in D_local_column_range")
 
     A_factorization = sc.A_factorization
+    Ainv_dot_B = sc.Ainv_dot_B
+    Ainv_dot_B_local = sc.Ainv_dot_B_local
+    B_global_column_range = sc.B_global_column_range
+    C_global_row_range = sc.C_global_row_range
+    D_global_column_range = sc.D_global_column_range
+    D_local_column_range = sc.D_local_column_range
+    schur_complement = sc.schur_complement
+    schur_complement_local_range = sc.schur_complement_local_range
+    owned_bottom_vector_entries = sc.owned_bottom_vector_entries
+    local_top_vector_range = sc.local_top_vector_range
+    local_top_vector_lower_overlap = sc.local_top_vector_lower_overlap
+    local_top_vector_upper_overlap = sc.local_top_vector_upper_overlap
+    distributed_comm = sc.distributed_comm
+    distributed_rank = sc.distributed_rank
+    shared_rank = sc.shared_rank
+    lower_boundary_comm = sc.lower_boundary_comm
+    upper_boundary_comm = sc.upper_boundary_comm
+    synchronize_shared = sc.synchronize_shared
 
-    lu!(A_factorization, A)
+    # When `A===missing`, this was called from the `mpi_schur_complement()` constructor,
+    # where we assume `A_factorization` was already initialized.
+    if A !== missing
+        lu!(A_factorization, A)
+    end
+
+    # When using shared memory, only store the slice of C that this process needs.
     C = @view C[sc.C_local_row_range, :]
     if sc.use_sparse
         C = sparse(C)
     end
     sc.C = C
-    update_schur_complement_arrays!(A_factorization, sc.Ainv_dot_B, sc.Ainv_dot_B_local,
-                                    B, sc.B_global_column_range, C, sc.C_global_row_range,
-                                    sc.C_local_row_range, D, sc.D_global_column_range,
-                                    sc.D_local_column_range, sc.schur_complement,
-                                    sc.schur_complement_local_range,
-                                    sc.local_top_vector_range,
-                                    sc.local_top_vector_lower_overlap,
-                                    sc.local_top_vector_upper_overlap,
-                                    sc.owned_bottom_vector_entries,
-                                    sc.distributed_comm, sc.distributed_rank,
-                                    sc.lower_boundary_comm, sc.upper_boundary_comm,
-                                    sc.shared_rank, sc.synchronize_shared)
-
-    if sc.shared_rank == 0
-        if sc.distributed_rank == 0
-            sc.schur_complement_factorization = lu!(sc.schur_complement)
-        end
-    end
-
-    return nothing
-end
-
-function update_schur_complement_arrays!(A_factorization, Ainv_dot_B::AbstractMatrix,
-                                         Ainv_dot_B_local::AbstractMatrix,
-                                         B::AbstractMatrix,
-                                         B_global_column_range::UnitRange{Int64},
-                                         C::AbstractMatrix,
-                                         C_global_row_range::UnitRange{Int64},
-                                         C_local_row_range::UnitRange{Int64},
-                                         D::AbstractMatrix,
-                                         D_global_column_range::UnitRange{Int64},
-                                         D_local_column_range::UnitRange{Int64},
-                                         schur_complement::AbstractMatrix,
-                                         schur_complement_local_range::UnitRange{Int64},
-                                         local_top_vector_range::UnitRange{Int64},
-                                         local_top_vector_lower_overlap::UnitRange{Int64},
-                                         local_top_vector_upper_overlap::UnitRange{Int64},
-                                         owned_bottom_vector_entries::UnitRange{Int64},
-                                         distributed_comm::MPI.Comm,
-                                         distributed_rank::Int64,
-                                         lower_boundary_comm::MPI.Comm,
-                                         upper_boundary_comm::MPI.Comm,
-                                         shared_rank::Int64, synchronize_shared::Function)
 
     # Use `Ainv_dot_B` as a local-rows/global-columns sized buffer to collect `B` into.
     # This is slightly inefficient, as there will be chunks that are all-zero that we do
@@ -550,6 +522,12 @@ function update_schur_complement_arrays!(A_factorization, Ainv_dot_B::AbstractMa
     synchronize_shared()
     if shared_rank == 0
         MPI.Reduce!(schur_complement, +, distributed_comm; root=0)
+    end
+
+    if shared_rank == 0
+        if distributed_rank == 0
+            sc.schur_complement_factorization = lu!(schur_complement)
+        end
     end
 
     return nothing
