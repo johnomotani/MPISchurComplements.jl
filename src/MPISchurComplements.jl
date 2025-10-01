@@ -27,9 +27,10 @@ import LinearAlgebra: ldiv!
 using MPI
 using SparseArrays
 
-mutable struct MPISchurComplement{TA,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,Tscomm,Tsync}
+mutable struct MPISchurComplement{TA,TAiBl,TAiB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,Tscomm,Tsync}
     A_factorization::TA
-    Ainv_dot_B::TB
+    Ainv_dot_B::TAiB
+    Ainv_dot_B_local::TAiBl
     B_global_column_range::UnitRange{Int64}
     C::TC
     C_global_row_range::UnitRange{Int64}
@@ -365,6 +366,9 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
 
     # Allocate buffer arrays
     Ainv_dot_B = allocate_array(top_vec_local_size, bottom_vec_global_size)
+    # Store the chunk of Ainv_dot_B needed by this shared-memory process as a contiguous
+    # array.
+    Ainv_dot_B_local = Matrix{eltype(B)}(undef, length(local_top_vector_range), bottom_vec_global_size)
     Ainv_dot_u = allocate_array(top_vec_local_size)
     schur_complement = allocate_array(bottom_vec_global_size, bottom_vec_global_size)
     top_vec_buffer = allocate_array(top_vec_local_size)
@@ -377,11 +381,11 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
         C = sparse(C)
     end
 
-    update_schur_complement_arrays!(A_factorization, Ainv_dot_B, B, B_global_column_range,
-                                    C, C_global_row_range, C_local_row_range,
-                                    D, D_global_column_range, D_local_column_range,
-                                    schur_complement, schur_complement_local_range,
-                                    local_top_vector_range,
+    update_schur_complement_arrays!(A_factorization, Ainv_dot_B, Ainv_dot_B_local, B,
+                                    B_global_column_range, C, C_global_row_range,
+                                    C_local_row_range, D, D_global_column_range,
+                                    D_local_column_range, schur_complement,
+                                    schur_complement_local_range, local_top_vector_range,
                                     local_top_vector_lower_overlap,
                                     local_top_vector_upper_overlap,
                                     owned_bottom_vector_entries, distributed_comm,
@@ -394,7 +398,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
         schur_complement_factorization = nothing
     end
 
-    sc_factorization = MPISchurComplement(A_factorization, Ainv_dot_B,
+    sc_factorization = MPISchurComplement(A_factorization, Ainv_dot_B, Ainv_dot_B_local,
                                           B_global_column_range, C, C_global_row_range,
                                           C_local_row_range, D_global_column_range,
                                           D_local_column_range, schur_complement,
@@ -405,8 +409,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
                                           global_y, top_vec_global_size,
                                           bottom_vec_global_size,
                                           owned_top_vector_entries,
-                                          global_top_vector_range,
-                                          local_top_vector_range,
+                                          global_top_vector_range, local_top_vector_range,
                                           local_top_vector_lower_overlap,
                                           local_top_vector_upper_overlap,
                                           owned_bottom_vector_entries,
@@ -454,8 +457,8 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
         C = sparse(C)
     end
     sc.C = C
-    update_schur_complement_arrays!(A_factorization, sc.Ainv_dot_B, B,
-                                    sc.B_global_column_range, C, sc.C_global_row_range,
+    update_schur_complement_arrays!(A_factorization, sc.Ainv_dot_B, sc.Ainv_dot_B_local,
+                                    B, sc.B_global_column_range, C, sc.C_global_row_range,
                                     sc.C_local_row_range, D, sc.D_global_column_range,
                                     sc.D_local_column_range, sc.schur_complement,
                                     sc.schur_complement_local_range,
@@ -477,6 +480,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
 end
 
 function update_schur_complement_arrays!(A_factorization, Ainv_dot_B::AbstractMatrix,
+                                         Ainv_dot_B_local::AbstractMatrix,
                                          B::AbstractMatrix,
                                          B_global_column_range::UnitRange{Int64},
                                          C::AbstractMatrix,
@@ -533,6 +537,7 @@ function update_schur_complement_arrays!(A_factorization, Ainv_dot_B::AbstractMa
     # multiplication below would not initialise all elements.
     schur_complement[:,schur_complement_local_range] .= 0.0
     synchronize_shared()
+    Ainv_dot_B_local .= Ainv_dot_B[local_top_vector_range,:]
     # We store locally all columns in Ainv_dot_B (only local rows) and all rows of C (only
     # local columns). Therefore we can take the matrix product Ainv_dot_B*C with the local
     # chunks, then do a sum-reduce to get the final result. The schur_complement buffer is
@@ -591,7 +596,7 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
     distributed_comm = sc.distributed_comm
     distributed_rank = sc.distributed_rank
     A_factorization = sc.A_factorization
-    Ainv_dot_B = sc.Ainv_dot_B
+    Ainv_dot_B_local = sc.Ainv_dot_B_local
     schur_complement_factorization = sc.schur_complement_factorization
     Ainv_dot_u = sc.Ainv_dot_u
     top_vec_buffer = sc.top_vec_buffer
@@ -631,9 +636,8 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
     end
     synchronize_shared()
 
-    # Need all columns of Ainv_dot_B, but only the local rows.
-    @views mul!(top_vec_buffer[local_top_vector_range],
-                Ainv_dot_B[local_top_vector_range,:], global_y)
+    # Need all columns of Ainv_dot_B_local, but only the local rows.
+    @views mul!(top_vec_buffer[local_top_vector_range], Ainv_dot_B_local, global_y)
     @. x[local_top_vector_range] = Ainv_dot_u[local_top_vector_range,:] - top_vec_buffer[local_top_vector_range]
 
     @views @. y[local_bottom_vector_range] = global_y[global_bottom_vector_range]
