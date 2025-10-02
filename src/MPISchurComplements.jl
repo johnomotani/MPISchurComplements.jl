@@ -242,12 +242,10 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
         end
         if distributed_rank == distributed_nproc - 1
             # Cannot be overlap at the upper boundary
-            owned_top_vector_entries_no_overlap = owned_top_vector_entries
             owned_bottom_vector_entries_no_overlap = owned_bottom_vector_entries
             local_top_vector_upper_overlap = 1:0
         else
             next_proc_start = MPI.Recv(Int64, distributed_comm; source=distributed_rank+1)
-            owned_top_vector_entries_no_overlap = owned_top_vector_entries.start:min(owned_top_vector_entries.stop, next_proc_start - 1)
             top_vector_upper_overlap_size = owned_top_vector_entries.stop - min(owned_top_vector_entries.stop, next_proc_start - 1)
             local_top_vector_upper_overlap = top_vec_local_size - top_vector_upper_overlap_size + 1:top_vec_local_size
             next_proc_start = MPI.Recv(Int64, distributed_comm; source=distributed_rank+1)
@@ -269,7 +267,6 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
     else
         top_vec_global_size = nothing
         bottom_vec_global_size = nothing
-        owned_top_vector_entries_no_overlap = nothing
         owned_bottom_vector_entries_no_overlap = nothing
         local_top_vector_upper_overlap = nothing
         local_top_vector_lower_overlap = nothing
@@ -303,7 +300,6 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
 
         top_vec_global_size = shared_broadcast_int(top_vec_global_size)
         bottom_vec_global_size = shared_broadcast_int(bottom_vec_global_size)
-        owned_top_vector_entries_no_overlap = shared_broadcast_UnitRange(owned_top_vector_entries_no_overlap)
         local_top_vector_lower_overlap = shared_broadcast_UnitRange(local_top_vector_lower_overlap)
         local_top_vector_upper_overlap = shared_broadcast_UnitRange(local_top_vector_upper_overlap)
         owned_bottom_vector_entries_no_overlap = shared_broadcast_UnitRange(owned_bottom_vector_entries_no_overlap)
@@ -368,7 +364,6 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
         D_global_column_range, D_local_column_range = get_shared_ranges(D_global_column_range)
         _, schur_complement_local_range = get_shared_ranges(1:bottom_vec_global_size)
         global_top_vector_range, local_top_vector_range = get_shared_ranges(owned_top_vector_entries)
-        global_top_vector_range_no_overlap, local_top_vector_range_no_overlap = get_shared_ranges(owned_top_vector_entries_no_overlap)
         global_bottom_vector_range, local_bottom_vector_range = get_shared_ranges(owned_bottom_vector_entries)
         global_bottom_vector_range_no_overlap, local_bottom_vector_range_no_overlap = get_shared_ranges(owned_bottom_vector_entries_no_overlap)
     end
