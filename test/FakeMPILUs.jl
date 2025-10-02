@@ -14,7 +14,8 @@ import LinearAlgebra: ldiv!, lu!
 using MPI
 using SparseArrays
 
-function gather_A(A_local, total_size, global_row_range, global_column_range, comm)
+function gather_A(A_local, total_size, global_row_range::Trange,
+                  global_column_range::Trange, comm) where Trange
     nproc = MPI.Comm_size(comm)
     rank = MPI.Comm_rank(comm)
 
@@ -24,20 +25,31 @@ function gather_A(A_local, total_size, global_row_range, global_column_range, co
         A[global_row_range,global_column_range] .+= A_local
 
         for iproc ∈ 2:nproc
-            row_minind = MPI.Recv(Int64, comm; source=iproc-1)
-            row_maxind = MPI.Recv(Int64, comm; source=iproc-1)
-            col_minind = MPI.Recv(Int64, comm; source=iproc-1)
-            col_maxind = MPI.Recv(Int64, comm; source=iproc-1)
-            A_chunk = zeros(eltype(A_local), row_maxind - row_minind + 1,
-                            col_maxind - col_minind + 1)
+            if Trange === UnitRange{Int64}
+                row_minind = MPI.Recv(Int64, comm; source=iproc-1)
+                row_maxind = MPI.Recv(Int64, comm; source=iproc-1)
+                col_minind = MPI.Recv(Int64, comm; source=iproc-1)
+                col_maxind = MPI.Recv(Int64, comm; source=iproc-1)
+                row_range = row_minind:row_maxind
+                col_range = col_minind:col_maxind
+            else
+                row_range = MPI.recv(comm; source=iproc-1)
+                col_range = MPI.recv(comm; source=iproc-1)
+            end
+            A_chunk = zeros(eltype(A_local), length(row_range), length(col_range))
             MPI.Recv!(A_chunk, comm; source=iproc-1)
-            @views A[row_minind:row_maxind, col_minind:col_maxind] .+= A_chunk
+            @views A[row_range, col_range] .+= A_chunk
         end
     else
-        MPI.Send(global_row_range.start, comm; dest=0)
-        MPI.Send(global_row_range.stop, comm; dest=0)
-        MPI.Send(global_column_range.start, comm; dest=0)
-        MPI.Send(global_column_range.stop, comm; dest=0)
+        if Trange === UnitRange{Int64}
+            MPI.Send(global_row_range.start, comm; dest=0)
+            MPI.Send(global_row_range.stop, comm; dest=0)
+            MPI.Send(global_column_range.start, comm; dest=0)
+            MPI.Send(global_column_range.stop, comm; dest=0)
+        else
+            MPI.send(global_row_range, comm; dest=0)
+            MPI.send(global_column_range, comm; dest=0)
+        end
         MPI.Send(A_local, comm; dest=0)
         A = nothing
     end
@@ -45,14 +57,14 @@ function gather_A(A_local, total_size, global_row_range, global_column_range, co
     return A
 end
 
-mutable struct FakeMPILU{T,TLU}
+mutable struct FakeMPILU{T,TLU,Trange}
     Alu::TLU
     n::Int64
     m::Int64
     rhs_buffer::Vector{T}
-    global_row_range::UnitRange{Int64}
-    global_column_range::UnitRange{Int64}
-    global_vector_ranges::Vector{UnitRange{Int64}}
+    global_row_range::Trange
+    global_column_range::Trange
+    global_vector_ranges::Vector{Trange}
     comm::MPI.Comm
     rank::Cint
     nproc::Cint
@@ -60,8 +72,8 @@ mutable struct FakeMPILU{T,TLU}
     use_sparse::Bool
 
     function FakeMPILU(A_local::AbstractMatrix,
-                       global_row_range::Union{UnitRange{Int64},Nothing}=nothing,
-                       global_column_range::Union{UnitRange{Int64},Nothing}=nothing;
+                       global_row_range::Union{UnitRange{Int64},Vector{Int64},Nothing}=nothing,
+                       global_column_range::Union{UnitRange{Int64},Vector{Int64},Nothing}=nothing;
                        comm::MPI.Comm=MPI.COMM_WORLD,
                        shared_comm::Union{MPI.Comm,Nothing}=nothing, use_sparse=false)
 
@@ -77,15 +89,17 @@ mutable struct FakeMPILU{T,TLU}
             # All rows were present in A_local, not just a subset.
             global_row_range = 1:size(A_local, 1)
         end
+        Trange = typeof(global_row_range)
         if global_column_range === nothing
             # All columns were present in A_local, not just a subset.
             global_column_range = 1:size(A_local, 2)
         end
+        global_column_range = Trange(global_column_range)
 
         if rank == 0 && shared_rank == 0
             # total_size is given by the maximum column index in any chunk of A.
-            total_size = MPI.Allreduce(global_row_range.stop, max, comm)
-            total_column_size = MPI.Allreduce(global_column_range.stop, max, comm)
+            total_size = MPI.Allreduce(maximum(global_row_range), max, comm)
+            total_column_size = MPI.Allreduce(maximum(global_column_range), max, comm)
             if total_column_size != total_size
                 error("Values of global_row_range ($global_row_range) and "
                       * "global_column_range($global_column_range) that were passed do "
@@ -111,13 +125,11 @@ mutable struct FakeMPILU{T,TLU}
 
             global_vector_ranges = [global_row_range]
             for iproc ∈ 1:nproc-1
-                iproc_imin = MPI.Recv(Int64, comm; source=iproc)
-                iproc_imax = MPI.Recv(Int64, comm; source=iproc)
-                push!(global_vector_ranges, iproc_imin:iproc_imax)
+                push!(global_vector_ranges, MPI.recv(comm; source=iproc))
             end
         elseif shared_rank == 0
-            total_size = MPI.Allreduce(global_row_range.stop, max, comm)
-            total_column_size = MPI.Allreduce(global_column_range.stop, max, comm)
+            total_size = MPI.Allreduce(maximum(global_row_range), max, comm)
+            total_column_size = MPI.Allreduce(maximum(global_column_range), max, comm)
             if total_column_size != total_size
                 error("Values of global_row_range ($global_row_range) and "
                       * "global_column_range($global_column_range) that were passed do "
@@ -135,19 +147,19 @@ mutable struct FakeMPILU{T,TLU}
 
             (n, m) = MPI.bcast(nothing, 0, comm)
             shared_comm != MPI.COMM_NULL && MPI.bcast((n,m), 0, shared_comm)
-            global_vector_ranges = UnitRange{Int64}[]
-            MPI.Send(global_row_range.start, comm; dest=0)
-            MPI.Send(global_row_range.stop, comm; dest=0)
+            global_vector_ranges = Trange[]
+            MPI.send(global_row_range, comm; dest=0)
         else
             Alu = nothing
             rhs_buffer = zeros(data_type, 0)
             (n, m) = MPI.bcast(nothing, 0, shared_comm)
-            global_vector_ranges = UnitRange{Int64}[]
+            global_vector_ranges = Trange[]
         end
 
-        return new{data_type,typeof(Alu)}(Alu, n, m, rhs_buffer, global_row_range,
-                                          global_column_range, global_vector_ranges, comm,
-                                          rank, nproc, shared_rank, use_sparse)
+        return new{data_type,typeof(Alu),Trange}(Alu, n, m, rhs_buffer, global_row_range,
+                                                 global_column_range,
+                                                 global_vector_ranges, comm, rank, nproc,
+                                                 shared_rank, use_sparse)
     end
 end
 
@@ -205,7 +217,7 @@ function ldiv!(x::AbstractVector, Alu::FakeMPILU, b::AbstractVector)
         rhs_buffer = Alu.rhs_buffer
 
         rhs_buffer[Alu.global_row_range] .= b
-        last_row_max = Alu.global_row_range.stop
+        last_row_max = maximum(Alu.global_row_range)
         for iproc ∈ 1:nproc-1
             this_vector_range = Alu.global_vector_ranges[iproc+1]
             this_rhs_buffer = zeros(eltype(rhs_buffer), length(this_vector_range))
@@ -220,8 +232,8 @@ function ldiv!(x::AbstractVector, Alu::FakeMPILU, b::AbstractVector)
 
         @views x .= rhs_buffer[Alu.global_row_range]
         for iproc ∈ 1:nproc-1
-            @views MPI.Send(rhs_buffer[Alu.global_vector_ranges[iproc+1]], comm;
-                            dest=iproc)
+            this_buffer = rhs_buffer[Alu.global_vector_ranges[iproc+1]]
+            MPI.Send(this_buffer, comm; dest=iproc)
         end
     else
         MPI.Send(b, comm; dest=0)
