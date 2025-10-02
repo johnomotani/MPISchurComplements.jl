@@ -61,9 +61,15 @@ function get_comms(shared_nproc, with_comm=false)
 end
 
 function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=true,
-                           separate_Ainv_B=false)
+                           separate_Ainv_B=false, use_unitrange=true)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
         shared_rank, allocate_array, local_win_store = get_comms(n_shared, with_comm)
+
+    if use_unitrange
+        convert_range = identity
+    else
+        convert_range = collect
+    end
 
     n = n1 + n2
 
@@ -114,7 +120,7 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=
     local_x = @view x[local_top_vec_range]
     local_y = @view y[local_bottom_vec_range]
 
-    Alu = FakeMPILU(local_A, local_top_vec_range; comm=distributed_comm,
+    Alu = FakeMPILU(local_A, convert_range(local_top_vec_range); comm=distributed_comm,
                     shared_comm=shared_comm)
 
     owned_top_vector_entries = distributed_rank*local_n1+1:(distributed_rank+1)*local_n1
@@ -123,9 +129,10 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=
     bottom_vec_buffer = similar(y)
     global_y = similar(y)
 
-    sc = mpi_schur_complement(Alu, copy(local_B), 1:n2, copy(local_C), 1:n2,
-                              copy(local_D), 1:n2, owned_top_vector_entries,
-                              owned_bottom_vector_entries;
+    sc = mpi_schur_complement(Alu, copy(local_B), convert_range(1:n2), copy(local_C),
+                              convert_range(1:n2), copy(local_D), convert_range(1:n2),
+                              convert_range(owned_top_vector_entries),
+                              convert_range(owned_bottom_vector_entries);
                               distributed_comm=distributed_comm, shared_comm=shared_comm,
                               allocate_array=allocate_array, use_sparse=use_sparse,
                               separate_Ainv_B=separate_Ainv_B)
@@ -208,9 +215,15 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=
 end
 
 function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=true,
-                            separate_Ainv_B=false)
+                            separate_Ainv_B=false, use_unitrange=true)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
         shared_rank, allocate_array, local_win_store = get_comms(n_shared, with_comm)
+
+    if use_unitrange
+        convert_range = identity
+    else
+        convert_range = collect
+    end
 
     n = n1 + n2
 
@@ -327,14 +340,18 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse
     bottom_vec_buffer = similar(y)
     global_y = similar(y)
 
-    Alu = @views FakeMPILU(local_A[:,local_top_irange], local_top_vec_range,
-                           local_top_irange; comm=distributed_comm,
+    Alu = @views FakeMPILU(local_A[:,local_top_irange],
+                           convert_range(local_top_vec_range),
+                           convert_range(local_top_irange); comm=distributed_comm,
                            shared_comm=shared_comm)
 
-    sc = mpi_schur_complement(Alu, local_B[:,local_bottom_irange], local_bottom_irange,
-                              local_C[local_bottom_irange,:], local_bottom_irange,
-                              local_D[:,D_local_irange], D_local_irange,
-                              owned_top_vector_entries, owned_bottom_vector_entries;
+    sc = mpi_schur_complement(Alu, local_B[:,local_bottom_irange],
+                              convert_range(local_bottom_irange),
+                              local_C[local_bottom_irange,:],
+                              convert_range(local_bottom_irange),
+                              local_D[:,D_local_irange], convert_range(D_local_irange),
+                              convert_range(owned_top_vector_entries),
+                              convert_range(owned_bottom_vector_entries);
                               distributed_comm=distributed_comm, shared_comm=shared_comm,
                               allocate_array=allocate_array, use_sparse=use_sparse,
                               separate_Ainv_B=separate_Ainv_B)
@@ -420,9 +437,15 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse
 end
 
 function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=false,
-                             use_sparse=true, separate_Ainv_B=false)
+                             use_sparse=true, separate_Ainv_B=false, use_unitrange=true)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
         shared_rank, allocate_array, local_win_store = get_comms(n_shared, with_comm)
+
+    if use_unitrange
+        convert_range = identity
+    else
+        convert_range = collect
+    end
 
     rng = StableRNG(2003)
 
@@ -454,7 +477,7 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
             this_D[this_bottom_vec_range,this_bottom_vec_range] .= rand(rng, nbottom, nbottom)
         end
     end
-    function get_local_slices!(this_M)
+    function get_local_slices(this_M)
         # Need to extract slices, and multiply any overlaps by 0.5 so that they can be
         # recombined by adding the overlapping chunks together.
 
@@ -524,7 +547,7 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
 
     # This process owns the *columns* corresponding to local_top_vec_range and
     # local_bottom_vec_range. The rows are distributed between different processes.
-    local_A, local_B, local_C, local_D = get_local_slices!(M)
+    local_A, local_B, local_C, local_D = get_local_slices(M)
     local_u = @view u[local_top_vec_range]
     local_v = @view v[local_bottom_vec_range]
     local_x = @view x[local_top_vec_range]
@@ -536,10 +559,11 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
     Alu = @views FakeMPILU(local_A, local_top_vec_range, local_top_vec_range;
                            comm=distributed_comm, shared_comm=shared_comm)
 
-    sc = mpi_schur_complement(Alu, local_B, local_bottom_vec_range,
-                              local_C, local_bottom_vec_range,
-                              local_D, local_bottom_vec_range,
-                              local_top_vec_range, local_bottom_vec_range;
+    sc = mpi_schur_complement(Alu, local_B, convert_range(local_bottom_vec_range),
+                              local_C, convert_range(local_bottom_vec_range), local_D,
+                              convert_range(local_bottom_vec_range),
+                              convert_range(local_top_vec_range),
+                              convert_range(local_bottom_vec_range);
                               distributed_comm=distributed_comm, shared_comm=shared_comm,
                               allocate_array=allocate_array, use_sparse=use_sparse,
                               separate_Ainv_B=separate_Ainv_B)
@@ -602,7 +626,7 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
             MPI.Bcast!(b, distributed_comm; root=0)
         end
         shared_comm !== nothing && MPI.Barrier(shared_comm)
-        local_A, local_B, local_C, local_D = get_local_slices!(M)
+        local_A, local_B, local_C, local_D = get_local_slices(M)
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         update_schur_complement!(sc, local_A, local_B, local_C, local_D)
         test_once()
@@ -637,30 +661,33 @@ function runtests()
         nproc = MPI.Comm_size(MPI.COMM_WORLD)
         if nproc == 1
             # Test prime vector sizes - easier to do in serial.
-            @testset "($n1,$n2), tol=$tol with_comm=$with_comm, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B" for (n1,n2,tol) ∈ (
+            @testset "($n1,$n2), tol=$tol with_comm=$with_comm, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B, use_unitrange=$use_unitrange" for (n1,n2,tol) ∈ (
                     (3, 2, 2.0e-14),
                     (100, 32, 2.0e-10),
                     (1000, 17, 1.0e-8),
                     (1000, 129, 1.0e-8),
-                   ), with_comm ∈ (false, true), use_sparse ∈ (true, false), separate_Ainv_B ∈ (true, false)
+                   ), with_comm ∈ (false, true), use_sparse ∈ (true, false), separate_Ainv_B ∈ (true, false), use_unitrange ∈ (true, false)
                 if !use_sparse && separate_Ainv_B
                     continue
                 end
                 @testset "dense" begin
                     dense_matrix_test(n1, n2, tol; with_comm=with_comm,
                                       use_sparse=use_sparse,
-                                      separate_Ainv_B=separate_Ainv_B)
+                                      separate_Ainv_B=separate_Ainv_B,
+                                      use_unitrange=use_unitrange)
                 end
                 @testset "use_sparse" begin
                     sparse_matrix_test(n1, n2, tol; with_comm=with_comm,
                                        use_sparse=use_sparse,
-                                       separate_Ainv_B=separate_Ainv_B)
+                                       separate_Ainv_B=separate_Ainv_B,
+                                       use_unitrange=use_unitrange)
                 end
                 @testset "overlap" begin
                     # As there is only one process here, there is no 'overlap', but run
                     # the test anyway as a sanity-check.
                     overlap_matrix_test(n1 + 1, n2 + 1, tol; use_sparse=use_sparse,
-                                        separate_Ainv_B=separate_Ainv_B)
+                                        separate_Ainv_B=separate_Ainv_B,
+                                        use_unitrange=use_unitrange)
                 end
             end
         elseif nproc % 2 != 0
@@ -669,30 +696,32 @@ function runtests()
             n_shared = 1
             while n_shared ≤ nproc
                 n_distributed = nproc ÷ n_shared
-                # Test prime vector sizes - easier to do in serial.
-                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B" for (n1,n2,tol) ∈ (
+                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B, use_unitrange=$use_unitrange" for (n1,n2,tol) ∈ (
                         (128, 32, 4.0e-10),
                         (1024, 32, 1.0e-8),
                         (1024, 128, 3.0e-7),
-                       ), use_sparse ∈ (true, false), separate_Ainv_B ∈ (true, false)
+                       ), use_sparse ∈ (true, false), separate_Ainv_B ∈ (true, false), use_unitrange ∈ (true, false)
                     if !use_sparse && separate_Ainv_B
                         continue
                     end
                     @testset "dense" begin
                         dense_matrix_test(n1, n2, tol; n_shared=n_shared,
                                           use_sparse=use_sparse,
-                                          separate_Ainv_B=separate_Ainv_B)
+                                          separate_Ainv_B=separate_Ainv_B,
+                                          use_unitrange=use_unitrange)
                     end
                     @testset "use_sparse" begin
                         sparse_matrix_test(n1, n2, tol; n_shared=n_shared,
                                            use_sparse=use_sparse,
-                                           separate_Ainv_B=separate_Ainv_B)
+                                           separate_Ainv_B=separate_Ainv_B,
+                                           use_unitrange=use_unitrange)
                     end
                     @testset "overlap" begin
                         overlap_matrix_test(n1 ÷ n_distributed + 1,
                                             n2 ÷ n_distributed + 1, tol;
                                             n_shared=n_shared, use_sparse=use_sparse,
-                                            separate_Ainv_B=separate_Ainv_B)
+                                            separate_Ainv_B=separate_Ainv_B,
+                                            use_unitrange=use_unitrange)
                     end
                 end
                 n_shared *= 2

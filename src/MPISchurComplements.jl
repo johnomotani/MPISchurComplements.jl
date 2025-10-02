@@ -27,16 +27,18 @@ import LinearAlgebra: ldiv!
 using MPI
 using SparseArrays
 
-mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,Tscomm,Tsync}
+mutable struct MPISchurComplement{Trange <: Union{UnitRange{Int64},Vector{Int64}},
+                                  TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,TBob,
+                                  Tscomm,Tsync}
     A_factorization::TA
     Ainv_dot_B::TAiB
     Ainv_dot_B_local::TAiBl
     B::TB
-    B_global_column_range::UnitRange{Int64}
+    B_global_column_range::Trange
     C::TC
-    C_global_row_range::UnitRange{Int64}
+    C_global_row_range::Trange
     C_local_row_range::UnitRange{Int64}
-    D_global_column_range::UnitRange{Int64}
+    D_global_column_range::Trange
     D_local_column_range::UnitRange{Int64}
     schur_complement::TSC
     schur_complement_factorization::TSCF
@@ -49,20 +51,18 @@ mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,
     global_y::Tgy
     top_vec_global_size::Int64
     bottom_vec_global_size::Int64
-    owned_top_vector_entries::UnitRange{Int64}
-    global_top_vector_range::UnitRange{Int64}
+    owned_top_vector_entries::Trange
     local_top_vector_range::UnitRange{Int64}
-    local_top_vector_lower_overlap::UnitRange{Int64}
-    local_top_vector_upper_overlap::UnitRange{Int64}
-    owned_bottom_vector_entries::UnitRange{Int64}
-    global_bottom_vector_range::UnitRange{Int64}
-    global_bottom_vector_range_no_overlap::UnitRange{Int64}
+    local_top_vector_overlaps::Vector{Trange}
+    B_overlap_buffers::TBob
+    overlap_comms::Vector{MPI.Comm}
+    owned_bottom_vector_entries::Trange
+    global_bottom_vector_range::Trange
+    global_bottom_vector_range_no_overlap::Trange
     local_bottom_vector_range::UnitRange{Int64}
     local_bottom_vector_range_no_overlap::UnitRange{Int64}
     distributed_comm::MPI.Comm
     distributed_rank::Int64
-    lower_boundary_comm::MPI.Comm
-    upper_boundary_comm::MPI.Comm
     shared_comm::Tscomm
     shared_rank::Int64
     synchronize_shared::Tsync
@@ -73,52 +73,20 @@ end
 """
 Get communicators which include this rank and one neighbouring rank.
 """
-function get_neighbour_comms(distributed_comm::MPI.Comm)
+function get_overlap_comm(distributed_comm::MPI.Comm, other_rank)
     this_rank = MPI.Comm_rank(distributed_comm)
-    nproc = MPI.Comm_size(distributed_comm)
 
     # Creating communicators is a collective operation. We will construct MPI.Group
     # objects to construct the communicators here - the communicator construction is then
     # collective on all processes in a group. Therefore we need to split the ranks up so
     # that upper boundaries of even ranks link with lower boundaries of odd ranks in one
     # step, and the reverse in a second step.
-    if this_rank % 2 == 0
-        # Upper boundary comm.
-        ranks = Cint[this_rank]
-        if this_rank < nproc - 1
-            push!(ranks, this_rank + 1)
-        end
-        upper_group = MPI.Group_incl(MPI.Comm_group(distributed_comm), ranks)
-        upper_comm = MPI.Comm_create_group(distributed_comm, upper_group, 0)
+    ranks = Cint[this_rank, other_rank]
+    sort!(ranks)
+    group = MPI.Group_incl(MPI.Comm_group(distributed_comm), ranks)
+    comm = MPI.Comm_create_group(distributed_comm, group, 0)
 
-        # Lower boundary comm.
-        ranks = Cint[]
-        if this_rank > 0
-            push!(ranks, this_rank - 1)
-        end
-        push!(ranks, this_rank)
-        lower_group = MPI.Group_incl(MPI.Comm_group(distributed_comm), ranks)
-        lower_comm = MPI.Comm_create_group(distributed_comm, lower_group, 1)
-    else
-        # Lower boundary comm.
-        ranks = Cint[]
-        if this_rank > 0
-            push!(ranks, this_rank - 1)
-        end
-        push!(ranks, this_rank)
-        lower_group = MPI.Group_incl(MPI.Comm_group(distributed_comm), ranks)
-        lower_comm = MPI.Comm_create_group(distributed_comm, lower_group, 0)
-
-        # Upper boundary comm.
-        ranks = Cint[this_rank]
-        if this_rank < nproc - 1
-            push!(ranks, this_rank + 1)
-        end
-        upper_group = MPI.Group_incl(MPI.Comm_group(distributed_comm), ranks)
-        upper_comm = MPI.Comm_create_group(distributed_comm, upper_group, 1)
-    end
-
-    return lower_comm, upper_comm
+    return comm
 end
 
 """
@@ -194,16 +162,18 @@ still has to be calculated, to be multiplied by `C` when calculating `schur_comp
 There is also no memory saving as a dense B-sized buffer array is needed.
 """
 function mpi_schur_complement(A_factorization, B::AbstractMatrix,
-                              B_global_column_range::UnitRange{Int64}, C::AbstractMatrix,
-                              C_global_row_range::UnitRange{Int64}, D::AbstractMatrix,
-                              D_global_column_range::UnitRange{Int64},
-                              owned_top_vector_entries::UnitRange{Int64},
-                              owned_bottom_vector_entries::UnitRange{Int64};
+                              B_global_column_range::Trange, C::AbstractMatrix,
+                              C_global_row_range::Trange, D::AbstractMatrix,
+                              D_global_column_range::Trange,
+                              owned_top_vector_entries::Trange,
+                              owned_bottom_vector_entries::Trange;
                               distributed_comm::MPI.Comm=MPI.COMM_SELF,
                               shared_comm::Union{MPI.Comm,Nothing}=nothing,
                               allocate_array::Union{Function,Nothing}=nothing,
                               synchronize_shared::Union{Function,Nothing}=nothing,
-                              use_sparse=true, separate_Ainv_B=false)
+                              use_sparse=true, separate_Ainv_B=false) where Trange <: Union{UnitRange{Int64},Vector{Int64}}
+
+    data_type = eltype(D)
 
     if distributed_comm != MPI.COMM_NULL
         distributed_nproc = MPI.Comm_size(distributed_comm)
@@ -219,57 +189,129 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
         shared_nproc = MPI.Comm_size(shared_comm)
         shared_rank = MPI.Comm_rank(shared_comm)
     end
-    if shared_rank == 0
-        lower_boundary_comm, upper_boundary_comm = get_neighbour_comms(distributed_comm)
-    else
-        lower_boundary_comm = MPI.COMM_NULL
-        upper_boundary_comm = MPI.COMM_NULL
-    end
 
     top_vec_local_size = length(owned_top_vector_entries)
     bottom_vec_local_size = length(owned_bottom_vector_entries)
     if shared_rank == 0
-        top_vec_global_size = MPI.Allreduce(owned_top_vector_entries.stop, max, distributed_comm)
-        bottom_vec_global_size = MPI.Allreduce(owned_bottom_vector_entries.stop, max, distributed_comm)
-        reqs = MPI.Request[]
-        if distributed_rank > 0
-            push!(reqs, MPI.Isend(owned_top_vector_entries.start, distributed_comm; dest=distributed_rank-1))
-            push!(reqs, MPI.Isend(owned_bottom_vector_entries.start, distributed_comm; dest=distributed_rank-1))
+        top_vec_global_size = MPI.Allreduce(maximum(owned_top_vector_entries), max, distributed_comm)
+        bottom_vec_global_size = MPI.Allreduce(maximum(owned_bottom_vector_entries), max, distributed_comm)
+
+        # Collect a range of row/column indices from all distributed ranks, and return as
+        # a Vector{Trange}.
+        function get_distributed_ranges(local_range::UnitRange{Int64})
+            local_range_vec = [local_range.start, local_range.stop]
+            distributed_ranges_vec = MPI.Allgather(local_range_vec, distributed_comm)
+            distributed_ranges = [distributed_ranges_vec[i]:distributed_ranges_vec[i+1]
+                                  for i ∈ 1:2:2*distributed_nproc]
+            return distributed_ranges
         end
-        if distributed_rank < distributed_nproc - 1
-            push!(reqs, MPI.Isend(owned_top_vector_entries.stop, distributed_comm; dest=distributed_rank+1))
-            push!(reqs, MPI.Isend(owned_bottom_vector_entries.stop, distributed_comm; dest=distributed_rank+1))
+        function get_distributed_ranges(local_range::Vector{Int64})
+            vec_sizes = MPI.Allgather(Cint(length(local_range)), distributed_comm)
+            distributed_ranges_vec = similar(local_range, sum(vec_sizes))
+            MPI.Allgatherv!(local_range, MPI.VBuffer(distributed_ranges_vec, vec_sizes),
+                            distributed_comm)
+            distributed_ranges = Vector{Int64}[]
+            imin = 1
+            for idist ∈ 1:distributed_nproc
+                imax = imin + vec_sizes[idist] - 1
+                push!(distributed_ranges, distributed_ranges_vec[imin:imax])
+                imin = imax + 1
+            end
+            return distributed_ranges
         end
-        if distributed_rank == distributed_nproc - 1
-            # Cannot be overlap at the upper boundary
-            owned_bottom_vector_entries_no_overlap = owned_bottom_vector_entries
-            local_top_vector_upper_overlap = 1:0
+
+        # Find all overlaps (i.e. intersections) between locally-owned range and
+        # remotely-owned ranges on all other processes.
+        function get_overlaps(local_range::T) where T
+            distributed_ranges = get_distributed_ranges(local_range)
+            overlaps = T[]
+            for idist ∈ 1:distributed_nproc
+                # Remember distributed_rank is 0-based index, but idist is 1-based.
+                if idist - 1 == distributed_rank || distributed_comm == MPI.COMM_NULL
+                    # Don't care about overlap of this rank with itself.
+                    # Make start/stop negative so they are easy to filter out later.
+                    push!(overlaps, -1:-2)
+                else
+                    push!(overlaps, intersect(local_range, distributed_ranges[idist]))
+                end
+            end
+            return overlaps
+        end
+
+        # For any ranks that have a 'top vector overlap' that is not empty, need to create
+        # a communicator so that the different ranks can sum-reduce their entries of the
+        # `B` matrix.
+        all_top_vector_overlaps = get_overlaps(owned_top_vector_entries)
+        local_top_vector_overlaps = Trange[]
+        B_overlap_buffers = Matrix{data_type}[]
+        overlap_comms = MPI.Comm[]
+        # Need to make sure all of overlap_comms are created in a consistent order on all
+        # processes to avoid deadlock. To do this, sort the overlaps by the lowest index
+        # value in the overlap. The overlap communicators are created for pairs of
+        # processes. There might be more than two processes sharing a single overlap, e.g.
+        # at a corner of a multidimensional domain decomposition - break these 'ties' by
+        # sorting by distributed_rank (everything is already sorted by distributed_rank,
+        # so we do not need to do any more work to achieve this).
+        sorted_overlap_ranks = sortperm(collect(length(o) == 0 ? -1 : first(o) for o ∈ all_top_vector_overlaps))
+        # Filter out empty overlaps.
+        filter!((i) -> length(all_top_vector_overlaps[i]) > 0, sorted_overlap_ranks)
+        top_vector_offset = first(owned_top_vector_entries) - 1
+        function find_local_top_vector_inds(global_inds)
+            # Assume global_inds is sorted, and owned_top_vector_entries is sorted.
+            local_inds = similar(global_inds)
+            lind = 0
+            for (i, gind) ∈ enumerate(global_inds)
+                # As `global_inds` is sorted, there is no need to search already-checked
+                # entries (although this is probably an unnecessary optimisation!).
+                lind = @views searchsortedfirst(owned_top_vector_entries[lind+1:end], gind) + lind
+                local_inds[i] = lind
+            end
+            return local_inds
+        end
+        for idist ∈ sorted_overlap_ranks
+            this_overlap = all_top_vector_overlaps[idist]
+            if Trange === UnitRange{Int64}
+                this_local_overlap = this_overlap.start-top_vector_offset:this_overlap.stop-top_vector_offset
+            else
+                this_local_overlap = find_local_top_vector_inds(this_overlap)
+            end
+            push!(local_top_vector_overlaps, this_local_overlap)
+            push!(B_overlap_buffers, zeros(data_type, length(this_overlap),
+                                           bottom_vec_global_size))
+            push!(overlap_comms, get_overlap_comm(distributed_comm, idist-1))
+        end
+
+        # For 'bottom vector' need to work out a set of non-overlapping ranges so that
+        # each distributed rank owns a unique set of entries.
+        bottom_vector_overlaps = get_overlaps(owned_bottom_vector_entries)
+        owned_bottom_vector_entries_no_overlap = copy(owned_bottom_vector_entries)
+        # Say that this process 'owns' an entry if there is no process with a lower rank
+        # that also owns that entry.
+        # Note distributed_rank is a 0-based index, but idist is 1-based.
+        if Trange === UnitRange{Int64}
+            for idist ∈ 1:distributed_rank
+                other_proc_overlap = bottom_vector_overlaps[idist]
+                if other_proc_overlap.stop ≥ owned_bottom_vector_entries_no_overlap.start
+                    owned_bottom_vector_entries_no_overlap = other_proc_overlap.stop+1:owned_bottom_vector_entries_no_overlap.stop
+                end
+            end
+            bottom_vector_offset = owned_bottom_vector_entries.start - 1
+            local_bottom_vector_range_no_overlap = owned_bottom_vector_entries_no_overlap.start-bottom_vector_offset:owned_bottom_vector_entries_no_overlap.stop-bottom_vector_offset
         else
-            next_proc_start = MPI.Recv(Int64, distributed_comm; source=distributed_rank+1)
-            top_vector_upper_overlap_size = owned_top_vector_entries.stop - min(owned_top_vector_entries.stop, next_proc_start - 1)
-            local_top_vector_upper_overlap = top_vec_local_size - top_vector_upper_overlap_size + 1:top_vec_local_size
-            next_proc_start = MPI.Recv(Int64, distributed_comm; source=distributed_rank+1)
-            owned_bottom_vector_entries_no_overlap = owned_bottom_vector_entries.start:min(owned_bottom_vector_entries.stop, next_proc_start - 1)
+            for idist ∈ 1:distributed_rank
+                other_proc_overlap = bottom_vector_overlaps[idist]
+                filter!((i) -> i ∉ other_proc_overlap, owned_bottom_vector_entries_no_overlap)
+            end
+            bottom_vector_offset = owned_bottom_vector_entries[1] - 1
+            local_bottom_vector_range_no_overlap = owned_bottom_vector_entries_no_overlap .- bottom_vector_offset
         end
-        if distributed_rank == 0
-            # Cannot be overlap at the lower boundary
-            local_top_vector_lower_overlap = 1:0
-            local_bottom_vector_lower_overlap = 1:0
-        else
-            prev_proc_stop = MPI.Recv(Int64, distributed_comm; source=distributed_rank-1)
-            top_vector_lower_overlap_size = max(owned_top_vector_entries.start, prev_proc_stop + 1) - owned_top_vector_entries.start
-            local_top_vector_lower_overlap = 1:top_vector_lower_overlap_size
-            prev_proc_stop = MPI.Recv(Int64, distributed_comm; source=distributed_rank-1)
-            bottom_vector_lower_overlap_size = max(owned_bottom_vector_entries.start, prev_proc_stop + 1) - owned_bottom_vector_entries.start
-            local_bottom_vector_lower_overlap = 1:bottom_vector_lower_overlap_size
-        end
-        MPI.Waitall(reqs)
     else
         top_vec_global_size = nothing
         bottom_vec_global_size = nothing
+        local_top_vector_overlaps = Trange[]
+        B_overlap_buffers = nothing
+        overlap_comms = MPI.Comm[]
         owned_bottom_vector_entries_no_overlap = nothing
-        local_top_vector_upper_overlap = nothing
-        local_top_vector_lower_overlap = nothing
     end
     if shared_comm !== nothing
         function shared_broadcast_int(i::Union{Int64,Nothing})
@@ -283,26 +325,26 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
                 return MPI.Bcast(-1, 0, shared_comm)
             end
         end
-        function shared_broadcast_UnitRange(r::Union{UnitRange{Int64},Nothing})
+        function shared_broadcast_range(r::Union{Trange,Nothing})
             if shared_rank == 0
                 if r === nothing
                     error("`r` should not be `nothing` on root of shared-memory communicator")
                 end
-                MPI.Bcast(r.start, 0, shared_comm)
-                MPI.Bcast(r.stop, 0, shared_comm)
+                MPI.bcast(r, 0, shared_comm)
                 return r
             else
-                range_start = MPI.Bcast(-1, 0, shared_comm)
-                range_stop = MPI.Bcast(-1, 0, shared_comm)
-                return range_start:range_stop
+                if Trange === UnitRange{Int64}
+                    range = MPI.bcast(1:0, 0, shared_comm)
+                else
+                    range = MPI.bcast(Int64[], 0, shared_comm)
+                end
+                return range
             end
         end
 
         top_vec_global_size = shared_broadcast_int(top_vec_global_size)
         bottom_vec_global_size = shared_broadcast_int(bottom_vec_global_size)
-        local_top_vector_lower_overlap = shared_broadcast_UnitRange(local_top_vector_lower_overlap)
-        local_top_vector_upper_overlap = shared_broadcast_UnitRange(local_top_vector_upper_overlap)
-        owned_bottom_vector_entries_no_overlap = shared_broadcast_UnitRange(owned_bottom_vector_entries_no_overlap)
+        owned_bottom_vector_entries_no_overlap = shared_broadcast_range(owned_bottom_vector_entries_no_overlap)
     end
 
     @boundscheck size(A_factorization, 1) == top_vec_global_size || error(BoundsError, " Rows in A_factorization do not match size of 'top vector'.")
@@ -314,8 +356,6 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
     @boundscheck size(D, 1) == bottom_vec_local_size || error(BoundsError, " Rows in D do not match locally-owned 'bottom vector' entries.")
     @boundscheck size(D, 2) == length(D_global_column_range) || error(BoundsError, " Columns in D do not match size of 'bottom vector'.")
 
-    data_type = eltype(D)
-
     if shared_comm !== nothing && allocate_array === nothing
         error("when `shared_comm` is passed, `allocate_array` argument is required, "
               * "because it is necessary to manage the MPI.Win objects to ensure they "
@@ -325,23 +365,23 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
         allocate_array = (args...) -> zeros(data_type, args...)
     end
 
+    local_bottom_vector_offset = searchsortedfirst(owned_bottom_vector_entries, owned_bottom_vector_entries_no_overlap[1]) - 1
     if shared_comm === nothing
         synchronize_shared = ()->nothing
         C_local_row_range = 1:length(C_global_row_range)
         D_local_column_range = 1:length(D_global_column_range)
         schur_complement_local_range = 1:bottom_vec_global_size
-        global_top_vector_range = owned_top_vector_entries
         local_top_vector_range = 1:top_vec_local_size
         global_bottom_vector_range = owned_bottom_vector_entries
         local_bottom_vector_range = 1:bottom_vec_local_size
         global_bottom_vector_range_no_overlap = owned_bottom_vector_entries_no_overlap
-        local_bottom_vector_range_no_overlap = 1:length(owned_bottom_vector_entries_no_overlap)
+        local_bottom_vector_range_no_overlap = 1+local_bottom_vector_offset:length(owned_bottom_vector_entries_no_overlap)+local_bottom_vector_offset
     else
         if synchronize_shared === nothing
             synchronize_shared = ()->MPI.Barrier(shared_comm)
         end
 
-        function get_shared_ranges(global_range)
+        function get_shared_ranges(global_range; local_offset=0)
             # Select a subset of C_global_row_range that will be handled locally.
             n = length(global_range)
             local_n_list = fill(n ÷ shared_nproc, shared_nproc)
@@ -354,8 +394,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
             imin = sum(local_n_list[1:shared_rank]) + 1
             imax = imin + local_n_list[shared_rank+1] - 1
 
-            local_range = imin:imax
-            new_global_range = global_range[local_range]
+            local_range = imin+local_offset:imax+local_offset
+            new_global_range = global_range[imin:imax]
 
             return new_global_range, local_range
         end
@@ -363,9 +403,9 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
         C_global_row_range, C_local_row_range = get_shared_ranges(C_global_row_range)
         D_global_column_range, D_local_column_range = get_shared_ranges(D_global_column_range)
         _, schur_complement_local_range = get_shared_ranges(1:bottom_vec_global_size)
-        global_top_vector_range, local_top_vector_range = get_shared_ranges(owned_top_vector_entries)
+        _, local_top_vector_range = get_shared_ranges(owned_top_vector_entries)
         global_bottom_vector_range, local_bottom_vector_range = get_shared_ranges(owned_bottom_vector_entries)
-        global_bottom_vector_range_no_overlap, local_bottom_vector_range_no_overlap = get_shared_ranges(owned_bottom_vector_entries_no_overlap)
+        global_bottom_vector_range_no_overlap, local_bottom_vector_range_no_overlap = get_shared_ranges(owned_bottom_vector_entries_no_overlap; local_offset=local_bottom_vector_offset)
     end
 
     # Allocate buffer arrays
@@ -376,11 +416,11 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
                   * "`use_sparse=false`.")
         end
         Ainv_dot_B_local = nothing
-        B_local = sparse(zeros(eltype(B), 1, 1))
+        B_local = sparse(zeros(data_type, 1, 1))
     else
         # Store the chunk of Ainv_dot_B needed by this shared-memory process as a contiguous
         # array.
-        Ainv_dot_B_local = Matrix{eltype(B)}(undef, length(local_top_vector_range), bottom_vec_global_size)
+        Ainv_dot_B_local = Matrix{data_type}(undef, length(local_top_vector_range), bottom_vec_global_size)
         B_local = nothing
     end
     Ainv_dot_u = allocate_array(top_vec_local_size)
@@ -389,13 +429,13 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
     bottom_vec_buffer = allocate_array(bottom_vec_global_size)
     global_y = allocate_array(bottom_vec_global_size)
 
-    fake_C = zeros(eltype(C), 1, 1)
+    fake_C = zeros(data_type, 1, 1)
     if use_sparse
         fake_C = sparse(fake_C)
     end
 
     if shared_rank == 0 && distributed_rank == 0
-        schur_complement_factorization = lu!(ones(eltype(D), 1, 1))
+        schur_complement_factorization = lu!(ones(data_type, 1, 1))
     else
         schur_complement_factorization = nothing
     end
@@ -412,16 +452,14 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
                                           global_y, top_vec_global_size,
                                           bottom_vec_global_size,
                                           owned_top_vector_entries,
-                                          global_top_vector_range, local_top_vector_range,
-                                          local_top_vector_lower_overlap,
-                                          local_top_vector_upper_overlap,
-                                          owned_bottom_vector_entries,
+                                          local_top_vector_range,
+                                          local_top_vector_overlaps, B_overlap_buffers,
+                                          overlap_comms, owned_bottom_vector_entries,
                                           global_bottom_vector_range,
                                           global_bottom_vector_range_no_overlap,
                                           local_bottom_vector_range,
                                           local_bottom_vector_range_no_overlap,
                                           distributed_comm, distributed_rank,
-                                          lower_boundary_comm, upper_boundary_comm,
                                           shared_comm, shared_rank, synchronize_shared,
                                           use_sparse, separate_Ainv_B)
 
@@ -452,7 +490,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
     # out of bounds error from indexing by sc.C_local_row_range if C is too small.
     @boundscheck sc.top_vec_local_size == size(C, 2) || error(BoundsError, " Number of columns in C does not match original C")
     @boundscheck length(sc.owned_bottom_vector_entries) == size(D, 1) || error(BoundsError, " Number of rows in D does not match number of locally owned bottom_vector_entries")
-    @boundscheck sc.D_local_column_range.stop ≤ size(D, 2) || error(BoundsError, " Number of columns in D is smaller than the largest index in D_local_column_range")
+    @boundscheck maximum(sc.D_local_column_range) ≤ size(D, 2) || error(BoundsError, " Number of columns in D is smaller than the largest index in D_local_column_range")
 
     A_factorization = sc.A_factorization
     Ainv_dot_B = sc.Ainv_dot_B
@@ -465,13 +503,12 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
     schur_complement_local_range = sc.schur_complement_local_range
     owned_bottom_vector_entries = sc.owned_bottom_vector_entries
     local_top_vector_range = sc.local_top_vector_range
-    local_top_vector_lower_overlap = sc.local_top_vector_lower_overlap
-    local_top_vector_upper_overlap = sc.local_top_vector_upper_overlap
+    local_top_vector_overlaps = sc.local_top_vector_overlaps
+    B_overlap_buffers = sc.B_overlap_buffers
+    overlap_comms = sc.overlap_comms
     distributed_comm = sc.distributed_comm
     distributed_rank = sc.distributed_rank
     shared_rank = sc.shared_rank
-    lower_boundary_comm = sc.lower_boundary_comm
-    upper_boundary_comm = sc.upper_boundary_comm
     synchronize_shared = sc.synchronize_shared
     use_sparse = sc.use_sparse
     separate_Ainv_B = sc.separate_Ainv_B
@@ -492,22 +529,22 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
     synchronize_shared()
     # Sum-reduce the overlapping rows of B (temporarily stored in `Ainv_dot_B`).
     if shared_rank == 0
-        if distributed_rank % 2 == 0
-            comm_buffer = Ainv_dot_B[local_top_vector_upper_overlap,:]
-            MPI.Allreduce!(comm_buffer, +, upper_boundary_comm)
-            @views Ainv_dot_B[local_top_vector_upper_overlap,:] .= comm_buffer
-
-            comm_buffer = Ainv_dot_B[local_top_vector_lower_overlap,:]
-            MPI.Allreduce!(comm_buffer, +, lower_boundary_comm)
-            @views Ainv_dot_B[local_top_vector_lower_overlap,:] .= comm_buffer
-        else
-            comm_buffer = Ainv_dot_B[local_top_vector_lower_overlap,:]
-            MPI.Allreduce!(comm_buffer, +, lower_boundary_comm)
-            @views Ainv_dot_B[local_top_vector_lower_overlap,:] .= comm_buffer
-
-            comm_buffer = Ainv_dot_B[local_top_vector_upper_overlap,:]
-            MPI.Allreduce!(comm_buffer, +, upper_boundary_comm)
-            @views Ainv_dot_B[local_top_vector_upper_overlap,:] .= comm_buffer
+        reqs = MPI.Request[]
+        for (overlap_range, buffer, comm) ∈ zip(local_top_vector_overlaps,
+                                                B_overlap_buffers, overlap_comms)
+            @views buffer .= Ainv_dot_B[overlap_range, :]
+            # Iallreduce seems not to be included in the nice Julia API, so have to use
+            # lower level call here.
+            this_req = MPI.Request()
+            mpi_buffer = MPI.Buffer(buffer)
+            mpi_op = MPI.Op(+, eltype(buffer))
+            MPI.API.MPI_Iallreduce(MPI.IN_PLACE, mpi_buffer.data, mpi_buffer.count,
+                                   mpi_buffer.datatype, mpi_op, comm, this_req)
+            push!(reqs, this_req)
+        end
+        MPI.Waitall(reqs)
+        for (overlap_range, buffer) ∈ zip(local_top_vector_overlaps, B_overlap_buffers)
+            @views Ainv_dot_B[overlap_range, :] .= buffer
         end
     end
     synchronize_shared()
