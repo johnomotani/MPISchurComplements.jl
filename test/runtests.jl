@@ -1,4 +1,9 @@
 using LinearAlgebra
+
+# Ensure BLAS only uses 1 thread, to avoid oversubscribing processes as we are probably
+# already fully parallelised.
+BLAS.set_num_threads(1)
+
 using MPI
 using StableRNGs
 using Test
