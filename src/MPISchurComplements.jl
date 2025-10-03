@@ -90,6 +90,93 @@ function get_overlap_comm(distributed_comm::MPI.Comm, other_rank)
 end
 
 """
+    remove_gaps_in_ranges!(distributed_ranges::Vector{UnitRange{Int64}})
+    remove_gaps_in_ranges!(distributed_ranges::Vector{Vector{Int64}})
+
+Where `distributed_ranges` does not include only a contiguous range (possibly overlapping)
+of indices starting from 1, identify and remove any 'gaps' (indices 1 or greater and less
+than the largest index in `distributed_ranges` which are not present in any element of
+`distributed_ranges`) from the index ranges.
+"""
+function remove_gaps_in_ranges! end
+function remove_gaps_in_ranges!(distributed_ranges::Vector{UnitRange{Int64}})
+    sorted_ranges = sort(distributed_ranges; by=(x)->x.start)
+    gaps = UnitRange{Int64}[]
+    for i ∈ 1:length(sorted_ranges)-1
+        this_stop = sorted_ranges[i].stop
+        next_start = sorted_ranges[i+1].start
+        if next_start > this_stop + 1
+            push!(gaps, this_stop+1:next_start-1)
+        end
+    end
+
+    if length(gaps) > 0
+        for i ∈ 1:length(distributed_ranges)
+            this_range = distributed_ranges[i]
+            # Start here so that if the first index is >1 (i.e. there is an 'initial
+            # gap') we also remove that.
+            gaps_offset = sorted_ranges[1].start - 1
+            for this_gap ∈ gaps
+                if gaps.stop < this_range.start
+                    gaps_offset += length(this_gap)
+                else
+                    # `gaps` is sorted, so no need to check more gaps.
+                    break
+                end
+            end
+            distributed_ranges[i] = this_range.start-gaps_offset:this_range.stop-gaps_offset
+        end
+    elseif sorted_ranges[1].start > 1
+        offset = sorted_ranges[1].start - 1
+        for i ∈ 1:length(distributed_ranges)
+            this_range = distributed_ranges[i]
+            distributed_ranges[i] = this_range.start-offset:this_range.stop-offset
+        end
+    end
+
+    return nothing
+end
+function remove_gaps_in_ranges!(distributed_ranges::Vector{Vector{Int64}})
+    # This may be a bit inefficient when the state vector size gets large. In that
+    # case, it is suggested to use UnitRange{Int64}-based ranges.
+    all_indices = vcat(distributed_ranges...)
+    sort!(all_indices)
+    gaps = UnitRange{Int64}[]
+    prev_ind = 0
+    for i ∈ all_indices
+        if i > prev_ind + 1
+            push!(gaps, prev_ind+1:i-1)
+        end
+        prev_ind = i
+    end
+
+    if length(gaps) > 0
+        # Remove `gaps` from distributed_ranges
+        for this_range ∈ distributed_ranges
+            igap = 1
+            n_gaps = length(gaps)
+            this_gap = gaps[igap]
+            # Start here so that if the first index is >1 (i.e. there is an
+            # 'initial gap') we also remove that.
+            gaps_offset = 0
+            for i ∈ 1:length(this_range)
+                this_ind = this_range[i]
+                if this_ind > this_gap.start
+                    while igap ≤ n_gaps && gaps[igap].stop < this_ind
+                        gaps_offset += length(gaps[igap])
+                        igap += 1
+                    end
+                    this_gap = gaps[min(igap, n_gaps)]
+                end
+                this_range[i] -= gaps_offset
+            end
+        end
+    end
+
+    return nothing
+end
+
+"""
     mpi_schur_complement(A_factorization, B::AbstractMatrix,
                          B_global_column_range::UnitRange{Int64}, C::AbstractMatrix,
                          C_global_row_range::UnitRange{Int64}, D::AbstractMatrix,
@@ -161,12 +248,12 @@ done (requires `use_sparse=true`). There is no saving in setup time because `Ain
 still has to be calculated, to be multiplied by `C` when calculating `schur_complement`.
 There is also no memory saving as a dense B-sized buffer array is needed.
 """
-function mpi_schur_complement(A_factorization, B::AbstractMatrix,
-                              B_global_column_range::Trange, C::AbstractMatrix,
-                              C_global_row_range::Trange, D::AbstractMatrix,
-                              D_global_column_range::Trange,
-                              owned_top_vector_entries::Trange,
+function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMatrix,
+                              D::AbstractMatrix, owned_top_vector_entries::Trange,
                               owned_bottom_vector_entries::Trange;
+                              B_global_column_range::Union{Trange,Nothing}=nothing,
+                              C_global_row_range::Union{Trange,Nothing}=nothing,
+                              D_global_column_range::Union{Trange,Nothing}=nothing,
                               distributed_comm::MPI.Comm=MPI.COMM_SELF,
                               shared_comm::Union{MPI.Comm,Nothing}=nothing,
                               allocate_array::Union{Function,Nothing}=nothing,
@@ -193,9 +280,6 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
     top_vec_local_size = length(owned_top_vector_entries)
     bottom_vec_local_size = length(owned_bottom_vector_entries)
     if shared_rank == 0
-        top_vec_global_size = MPI.Allreduce(maximum(owned_top_vector_entries), max, distributed_comm)
-        bottom_vec_global_size = MPI.Allreduce(maximum(owned_bottom_vector_entries), max, distributed_comm)
-
         # Collect a range of row/column indices from all distributed ranks, and return as
         # a Vector{Trange}.
         function get_distributed_ranges(local_range::UnitRange{Int64})
@@ -220,10 +304,20 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
             return distributed_ranges
         end
 
+        top_vector_distributed_ranges = get_distributed_ranges(owned_top_vector_entries)
+        bottom_vector_distributed_ranges = get_distributed_ranges(owned_bottom_vector_entries)
+
+        remove_gaps_in_ranges!(top_vector_distributed_ranges)
+        owned_top_vector_entries = top_vector_distributed_ranges[distributed_rank+1]
+        remove_gaps_in_ranges!(bottom_vector_distributed_ranges)
+        owned_bottom_vector_entries = bottom_vector_distributed_ranges[distributed_rank+1]
+
+        top_vec_global_size = maximum(maximum(r) for r ∈ top_vector_distributed_ranges)
+        bottom_vec_global_size = maximum(maximum(r) for r ∈ bottom_vector_distributed_ranges)
+
         # Find all overlaps (i.e. intersections) between locally-owned range and
         # remotely-owned ranges on all other processes.
-        function get_overlaps(local_range::T) where T
-            distributed_ranges = get_distributed_ranges(local_range)
+        function get_overlaps(local_range::T, distributed_ranges) where T
             overlaps = T[]
             for idist ∈ 1:distributed_nproc
                 # Remember distributed_rank is 0-based index, but idist is 1-based.
@@ -238,10 +332,40 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
             return overlaps
         end
 
+        # For 'bottom vector' need to work out a set of non-overlapping ranges so that
+        # each distributed rank owns a unique set of entries.
+        bottom_vector_overlaps = get_overlaps(owned_bottom_vector_entries,
+                                              bottom_vector_distributed_ranges)
+        owned_bottom_vector_entries_no_overlap = copy(owned_bottom_vector_entries)
+        # Say that this process 'owns' an entry if there is no process with a lower rank
+        # that also owns that entry.
+        # Note distributed_rank is a 0-based index, but idist is 1-based.
+        if Trange === UnitRange{Int64}
+            for idist ∈ 1:distributed_rank
+                other_proc_overlap = bottom_vector_overlaps[idist]
+                if other_proc_overlap.stop ≥ owned_bottom_vector_entries_no_overlap.start
+                    # This way of filtering to non-overlapping entries will not work for a
+                    # multi-dimensional domain decomposition, but that case cannot be
+                    # represented by `UnitRange{Int64}` ranges, so it is OK.
+                    owned_bottom_vector_entries_no_overlap = other_proc_overlap.stop+1:owned_bottom_vector_entries_no_overlap.stop
+                end
+            end
+            bottom_vector_offset = owned_bottom_vector_entries.start - 1
+            local_bottom_vector_range_no_overlap = owned_bottom_vector_entries_no_overlap.start-bottom_vector_offset:owned_bottom_vector_entries_no_overlap.stop-bottom_vector_offset
+        else
+            for idist ∈ 1:distributed_rank
+                other_proc_overlap = bottom_vector_overlaps[idist]
+                filter!((i) -> i ∉ other_proc_overlap, owned_bottom_vector_entries_no_overlap)
+            end
+            bottom_vector_offset = owned_bottom_vector_entries[1] - 1
+            local_bottom_vector_range_no_overlap = owned_bottom_vector_entries_no_overlap .- bottom_vector_offset
+        end
+
         # For any ranks that have a 'top vector overlap' that is not empty, need to create
         # a communicator so that the different ranks can sum-reduce their entries of the
         # `B` matrix.
-        all_top_vector_overlaps = get_overlaps(owned_top_vector_entries)
+        all_top_vector_overlaps = get_overlaps(owned_top_vector_entries,
+                                               top_vector_distributed_ranges)
         local_top_vector_overlaps = Trange[]
         B_overlap_buffers = Matrix{data_type}[]
         overlap_comms = MPI.Comm[]
@@ -255,43 +379,26 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
         sorted_overlap_ranks = sortperm(collect(length(o) == 0 ? -1 : first(o) for o ∈ all_top_vector_overlaps))
         # Filter out empty overlaps.
         filter!((i) -> length(all_top_vector_overlaps[i]) > 0, sorted_overlap_ranks)
+        owned_top_vector_entries_no_overlap = copy(owned_top_vector_entries)
         top_vector_offset = first(owned_top_vector_entries) - 1
         for idist ∈ sorted_overlap_ranks
             this_overlap = all_top_vector_overlaps[idist]
             if Trange === UnitRange{Int64}
                 this_local_overlap = this_overlap.start-top_vector_offset:this_overlap.stop-top_vector_offset
+                if this_overlap.stop ≥ owned_top_vector_entries_no_overlap.start
+                    # This way of filtering to non-overlapping entries will not work for a
+                    # multi-dimensional domain decomposition, but that case cannot be
+                    # represented by `UnitRange{Int64}` ranges, so it is OK.
+                    owned_top_vector_entries_no_overlap = this_overlap.stop+1:owned_top_vector_entries_no_overlap.stop
+                end
             else
                 this_local_overlap = this_overlap .- top_vector_offset
+                filter!((i) -> i ∉ this_overlap, owned_top_vector_entries_no_overlap)
             end
             push!(local_top_vector_overlaps, this_local_overlap)
             push!(B_overlap_buffers, zeros(data_type, length(this_overlap),
                                            bottom_vec_global_size))
             push!(overlap_comms, get_overlap_comm(distributed_comm, idist-1))
-        end
-
-        # For 'bottom vector' need to work out a set of non-overlapping ranges so that
-        # each distributed rank owns a unique set of entries.
-        bottom_vector_overlaps = get_overlaps(owned_bottom_vector_entries)
-        owned_bottom_vector_entries_no_overlap = copy(owned_bottom_vector_entries)
-        # Say that this process 'owns' an entry if there is no process with a lower rank
-        # that also owns that entry.
-        # Note distributed_rank is a 0-based index, but idist is 1-based.
-        if Trange === UnitRange{Int64}
-            for idist ∈ 1:distributed_rank
-                other_proc_overlap = bottom_vector_overlaps[idist]
-                if other_proc_overlap.stop ≥ owned_bottom_vector_entries_no_overlap.start
-                    owned_bottom_vector_entries_no_overlap = other_proc_overlap.stop+1:owned_bottom_vector_entries_no_overlap.stop
-                end
-            end
-            bottom_vector_offset = owned_bottom_vector_entries.start - 1
-            local_bottom_vector_range_no_overlap = owned_bottom_vector_entries_no_overlap.start-bottom_vector_offset:owned_bottom_vector_entries_no_overlap.stop-bottom_vector_offset
-        else
-            for idist ∈ 1:distributed_rank
-                other_proc_overlap = bottom_vector_overlaps[idist]
-                filter!((i) -> i ∉ other_proc_overlap, owned_bottom_vector_entries_no_overlap)
-            end
-            bottom_vector_offset = owned_bottom_vector_entries[1] - 1
-            local_bottom_vector_range_no_overlap = owned_bottom_vector_entries_no_overlap .- bottom_vector_offset
         end
     else
         top_vec_global_size = nothing
@@ -332,7 +439,52 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix,
 
         top_vec_global_size = shared_broadcast_int(top_vec_global_size)
         bottom_vec_global_size = shared_broadcast_int(bottom_vec_global_size)
+        owned_top_vector_entries = shared_broadcast_range(owned_top_vector_entries)
+        owned_bottom_vector_entries = shared_broadcast_range(owned_bottom_vector_entries)
         owned_bottom_vector_entries_no_overlap = shared_broadcast_range(owned_bottom_vector_entries_no_overlap)
+    end
+
+    if B_global_column_range === nothing
+        B_global_column_range = owned_bottom_vector_entries
+    else
+        if shared_rank == 0
+            B_distributed_ranges = get_distributed_ranges(B_global_column_range)
+            remove_gaps_in_ranges!(B_distributed_ranges)
+            B_global_column_range = B_distributed_ranges[distributed_rank+1]
+        else
+            B_global_column_range = Trange === UnitRange{Int64} ? (-1:-2) : Int64[]
+        end
+        if shared_comm !== nothing
+            B_global_column_range = shared_broadcast_range(B_global_column_range)
+        end
+    end
+    if C_global_row_range === nothing
+        C_global_row_range = owned_bottom_vector_entries
+    else
+        if shared_rank == 0
+            C_distributed_ranges = get_distributed_ranges(C_global_row_range)
+            remove_gaps_in_ranges!(C_distributed_ranges)
+            C_global_column_range = C_distributed_ranges[distributed_rank+1]
+        else
+            C_global_column_range = Trange === UnitRange{Int64} ? (-1:-2) : Int64[]
+        end
+        if shared_comm !== nothing
+            C_global_column_range = shared_broadcast_range(C_global_column_range)
+        end
+    end
+    if D_global_column_range === nothing
+        D_global_column_range = owned_bottom_vector_entries
+    else
+        if shared_rank == 0
+            D_distributed_ranges = get_distributed_ranges(D_global_column_range)
+            remove_gaps_in_ranges!(D_distributed_ranges)
+            D_global_column_range = D_distributed_ranges[distributed_rank+1]
+        else
+            D_global_column_range = Trange === UnitRange{Int64} ? (-1:-2) : Int64[]
+        end
+        if shared_comm !== nothing
+            D_global_column_range = shared_broadcast_range(D_global_column_range)
+        end
     end
 
     @boundscheck size(A_factorization, 1) == top_vec_global_size || error(BoundsError, " Rows in A_factorization do not match size of 'top vector'.")
