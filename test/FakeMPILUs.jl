@@ -12,17 +12,23 @@ import Base: size
 using LinearAlgebra
 import LinearAlgebra: ldiv!, lu!
 using MPI
+using MPISchurComplements: remove_gaps_in_ranges!
 using SparseArrays
 
-function gather_A(A_local, total_size, global_row_range::Trange,
-                  global_column_range::Trange, comm) where Trange
+function gather_A(A_local, global_row_range::Trange, global_column_range::Trange,
+                  comm) where Trange
     nproc = MPI.Comm_size(comm)
     rank = MPI.Comm_rank(comm)
 
-    if rank == 0
-        A = zeros(eltype(A_local), total_size, total_size)
+    if Trange === Vector{Int64}
+        # Ensure we do not modify the inputs.
+        global_row_range = copy(global_row_range)
+        global_column_range = copy(global_column_range)
+    end
 
-        A[global_row_range,global_column_range] .+= A_local
+    if rank == 0
+        distributed_row_ranges = [global_row_range]
+        distributed_col_ranges = [global_column_range]
 
         for iproc ∈ 2:nproc
             if Trange === UnitRange{Int64}
@@ -36,6 +42,36 @@ function gather_A(A_local, total_size, global_row_range::Trange,
                 row_range = MPI.recv(comm; source=iproc-1)
                 col_range = MPI.recv(comm; source=iproc-1)
             end
+            push!(distributed_row_ranges, row_range)
+            push!(distributed_col_ranges, col_range)
+        end
+
+        remove_gaps_in_ranges!(distributed_row_ranges)
+        remove_gaps_in_ranges!(distributed_col_ranges)
+
+        total_size = maximum(maximum(rowinds) for rowinds ∈ distributed_row_ranges)
+        total_column_size = maximum(maximum(colinds) for colinds ∈ distributed_col_ranges)
+
+        if total_column_size != total_size
+            message = ("Values of global_row_range ($global_row_range) and "
+                       * "global_column_range($global_column_range) that were passed do "
+                       * "not give the same total size ($total_size vs. "
+                       * "$total_column_size).")
+            if nproc == 1
+                error(message)
+            else
+                # Need to stop all processes
+                println(message)
+                MPI.Abort()
+            end
+        end
+
+        A = zeros(eltype(A_local), total_size, total_size)
+
+        @views A[distributed_row_ranges[1],distributed_col_ranges[1]] .+= A_local
+        for iproc ∈ 2:nproc
+            row_range = distributed_row_ranges[iproc]
+            col_range = distributed_col_ranges[iproc]
             A_chunk = zeros(eltype(A_local), length(row_range), length(col_range))
             MPI.Recv!(A_chunk, comm; source=iproc-1)
             @views A[row_range, col_range] .+= A_chunk
@@ -51,10 +87,11 @@ function gather_A(A_local, total_size, global_row_range::Trange,
             MPI.send(global_column_range, comm; dest=0)
         end
         MPI.Send(A_local, comm; dest=0)
+        distributed_row_ranges = Trange[]
         A = nothing
     end
 
-    return A
+    return A, distributed_row_ranges
 end
 
 mutable struct FakeMPILU{T,TLU,Trange}
@@ -97,17 +134,8 @@ mutable struct FakeMPILU{T,TLU,Trange}
         global_column_range = Trange(global_column_range)
 
         if rank == 0 && shared_rank == 0
-            # total_size is given by the maximum column index in any chunk of A.
-            total_size = MPI.Allreduce(maximum(global_row_range), max, comm)
-            total_column_size = MPI.Allreduce(maximum(global_column_range), max, comm)
-            if total_column_size != total_size
-                error("Values of global_row_range ($global_row_range) and "
-                      * "global_column_range($global_column_range) that were passed do "
-                      * "not give the same total size ($total_size vs. "
-                      * "$total_column_size).")
-            end
-
-            A = gather_A(A_local, total_size, global_row_range, global_column_range, comm)
+            A, global_vector_ranges = gather_A(A_local, global_row_range,
+                                               global_column_range, comm)
 
             if use_sparse
                 Alu = lu(sparse(A))
@@ -115,40 +143,21 @@ mutable struct FakeMPILU{T,TLU,Trange}
                 Alu = lu(A)
             end
 
-            rhs_buffer = zeros(data_type, total_size)
+            n, m = size(A)
 
-            n = total_size
-            m = total_column_size
+            rhs_buffer = zeros(data_type, n)
 
             MPI.bcast((n,m), 0, comm)
             shared_comm != MPI.COMM_NULL && MPI.bcast((n,m), 0, shared_comm)
-
-            global_vector_ranges = [global_row_range]
-            for iproc ∈ 1:nproc-1
-                push!(global_vector_ranges, MPI.recv(comm; source=iproc))
-            end
         elseif shared_rank == 0
-            total_size = MPI.Allreduce(maximum(global_row_range), max, comm)
-            total_column_size = MPI.Allreduce(maximum(global_column_range), max, comm)
-            if total_column_size != total_size
-                error("Values of global_row_range ($global_row_range) and "
-                      * "global_column_range($global_column_range) that were passed do "
-                      * "not give the same total size ($total_size vs. "
-                      * "$total_column_size).")
-            end
-
-            gather_A(A_local, total_size, global_row_range, global_column_range, comm)
+            _, global_vector_ranges = gather_A(A_local, global_row_range,
+                                               global_column_range, comm)
 
             Alu = nothing
             rhs_buffer = zeros(data_type, 0)
 
-            n = total_size
-            m = total_column_size
-
             (n, m) = MPI.bcast(nothing, 0, comm)
             shared_comm != MPI.COMM_NULL && MPI.bcast((n,m), 0, shared_comm)
-            global_vector_ranges = Trange[]
-            MPI.send(global_row_range, comm; dest=0)
         else
             Alu = nothing
             rhs_buffer = zeros(data_type, 0)
@@ -181,7 +190,7 @@ function lu!(Alu::FakeMPILU, A_local::AbstractMatrix)
         # Non-root shared-memory block ranks do not participate in fake MPI.
         return Alu
     end
-    A = gather_A(A_local, Alu.n, Alu.global_row_range, Alu.global_column_range, Alu.comm)
+    A, _ = gather_A(A_local, Alu.global_row_range, Alu.global_column_range, Alu.comm)
     if Alu.rank == 0
         if Alu.use_sparse
             try
@@ -216,8 +225,7 @@ function ldiv!(x::AbstractVector, Alu::FakeMPILU, b::AbstractVector)
     if rank == 0
         rhs_buffer = Alu.rhs_buffer
 
-        rhs_buffer[Alu.global_row_range] .= b
-        last_row_max = maximum(Alu.global_row_range)
+        rhs_buffer[Alu.global_vector_ranges[1]] .= b
         for iproc ∈ 1:nproc-1
             this_vector_range = Alu.global_vector_ranges[iproc+1]
             this_rhs_buffer = zeros(eltype(rhs_buffer), length(this_vector_range))
@@ -230,14 +238,21 @@ function ldiv!(x::AbstractVector, Alu::FakeMPILU, b::AbstractVector)
 
         ldiv!(Alu.Alu, Alu.rhs_buffer)
 
-        @views x .= rhs_buffer[Alu.global_row_range]
+        @views x .= rhs_buffer[Alu.global_vector_ranges[1]]
         for iproc ∈ 1:nproc-1
             this_buffer = rhs_buffer[Alu.global_vector_ranges[iproc+1]]
             MPI.Send(this_buffer, comm; dest=iproc)
         end
     else
+        b = Vector(b)
         MPI.Send(b, comm; dest=0)
-        MPI.Recv!(x, comm; source=0)
+        if isa(x, Vector)
+            MPI.Recv!(x, comm; source=0)
+        else
+            buffer = Vector(x)
+            MPI.Recv!(buffer, comm; source=0)
+            x .= buffer
+        end
     end
 
     return x

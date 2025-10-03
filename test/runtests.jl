@@ -129,10 +129,12 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=
     bottom_vec_buffer = similar(y)
     global_y = similar(y)
 
-    sc = mpi_schur_complement(Alu, copy(local_B), convert_range(1:n2), copy(local_C),
-                              convert_range(1:n2), copy(local_D), convert_range(1:n2),
+    sc = mpi_schur_complement(Alu, copy(local_B), copy(local_C), copy(local_D),
                               convert_range(owned_top_vector_entries),
                               convert_range(owned_bottom_vector_entries);
+                              B_global_column_range=convert_range(1:n2),
+                              C_global_row_range=convert_range(1:n2),
+                              D_global_column_range=convert_range(1:n2),
                               distributed_comm=distributed_comm, shared_comm=shared_comm,
                               allocate_array=allocate_array, use_sparse=use_sparse,
                               separate_Ainv_B=separate_Ainv_B)
@@ -346,12 +348,12 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse
                            shared_comm=shared_comm)
 
     sc = mpi_schur_complement(Alu, local_B[:,local_bottom_irange],
-                              convert_range(local_bottom_irange),
-                              local_C[local_bottom_irange,:],
-                              convert_range(local_bottom_irange),
-                              local_D[:,D_local_irange], convert_range(D_local_irange),
+                              local_C[local_bottom_irange,:], local_D[:,D_local_irange],
                               convert_range(owned_top_vector_entries),
                               convert_range(owned_bottom_vector_entries);
+                              B_global_column_range=convert_range(local_bottom_irange),
+                              C_global_row_range=convert_range(local_bottom_irange),
+                              D_global_column_range=convert_range(D_local_irange),
                               distributed_comm=distributed_comm, shared_comm=shared_comm,
                               allocate_array=allocate_array, use_sparse=use_sparse,
                               separate_Ainv_B=separate_Ainv_B)
@@ -437,7 +439,8 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse
 end
 
 function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=false,
-                             use_sparse=true, separate_Ainv_B=false, use_unitrange=true)
+                             use_sparse=true, separate_Ainv_B=false, use_unitrange=true,
+                             add_index_gap=false)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
         shared_rank, allocate_array, local_win_store = get_comms(n_shared, with_comm)
 
@@ -456,6 +459,16 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
     # Set up overlapping 'owned' ranges
     local_top_vec_range = (distributed_rank * (local_n1 - 1) + 1):((distributed_rank + 1) * (local_n1 - 1) + 1)
     local_bottom_vec_range = (distributed_rank * (local_n2 - 1) + 1):((distributed_rank + 1) * (local_n2 - 1) + 1)
+
+    if add_index_gap
+        local_top_vec_range = collect(local_top_vec_range)
+        local_bottom_vec_range = collect(local_bottom_vec_range)
+        nominal_local_top_vec_range = [i > 2*n1÷3 ? i+20 : i for i ∈ local_top_vec_range]
+        nominal_local_bottom_vec_range = [i > 2*n2÷3 ? i+10 : i for i ∈ local_bottom_vec_range]
+    else
+        nominal_local_top_vec_range = local_top_vec_range
+        nominal_local_bottom_vec_range = local_bottom_vec_range
+    end
 
     function initialize_M!(this_M)
         this_A = @view this_M[1:n1, 1:n1]
@@ -556,14 +569,13 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
     bottom_vec_buffer = similar(y)
     global_y = similar(y)
 
-    Alu = @views FakeMPILU(local_A, local_top_vec_range, local_top_vec_range;
-                           comm=distributed_comm, shared_comm=shared_comm)
+    Alu = @views FakeMPILU(local_A, convert_range(nominal_local_top_vec_range),
+                           convert_range(nominal_local_top_vec_range); comm=distributed_comm,
+                           shared_comm=shared_comm)
 
-    sc = mpi_schur_complement(Alu, local_B, convert_range(local_bottom_vec_range),
-                              local_C, convert_range(local_bottom_vec_range), local_D,
-                              convert_range(local_bottom_vec_range),
-                              convert_range(local_top_vec_range),
-                              convert_range(local_bottom_vec_range);
+    sc = mpi_schur_complement(Alu, local_B, local_C, local_D,
+                              convert_range(nominal_local_top_vec_range),
+                              convert_range(nominal_local_bottom_vec_range);
                               distributed_comm=distributed_comm, shared_comm=shared_comm,
                               allocate_array=allocate_array, use_sparse=use_sparse,
                               separate_Ainv_B=separate_Ainv_B)
@@ -689,6 +701,13 @@ function runtests()
                                         separate_Ainv_B=separate_Ainv_B,
                                         use_unitrange=use_unitrange)
                 end
+                @testset "overlap with index gap" begin
+                    # As there is only one process here, there is no 'overlap', but run
+                    # the test anyway as a sanity-check.
+                    overlap_matrix_test(n1 + 1, n2 + 1, tol; use_sparse=use_sparse,
+                                        separate_Ainv_B=separate_Ainv_B,
+                                        use_unitrange=use_unitrange, add_index_gap=true)
+                end
             end
         elseif nproc % 2 != 0
             error("Distributed MPI test only implemented for distributed_nproc=2^n, distributed_nproc<32")
@@ -722,6 +741,14 @@ function runtests()
                                             n_shared=n_shared, use_sparse=use_sparse,
                                             separate_Ainv_B=separate_Ainv_B,
                                             use_unitrange=use_unitrange)
+                    end
+                    @testset "overlap with index gap" begin
+                        overlap_matrix_test(n1 ÷ n_distributed + 1,
+                                            n2 ÷ n_distributed + 1, tol;
+                                            n_shared=n_shared, use_sparse=use_sparse,
+                                            separate_Ainv_B=separate_Ainv_B,
+                                            use_unitrange=use_unitrange,
+                                            add_index_gap=true)
                     end
                 end
                 n_shared *= 2
