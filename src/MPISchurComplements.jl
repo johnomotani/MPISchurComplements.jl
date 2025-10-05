@@ -667,7 +667,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
     # out of bounds error from indexing by sc.C_local_row_range if C is too small.
     @boundscheck sc.top_vec_local_size == size(C, 2) || error(BoundsError, " Number of columns in C does not match original C")
     @boundscheck length(sc.owned_bottom_vector_entries) == size(D, 1) || error(BoundsError, " Number of rows in D does not match number of locally owned bottom_vector_entries")
-    @boundscheck maximum(sc.D_local_column_range) ≤ size(D, 2) || error(BoundsError, " Number of columns in D is smaller than the largest index in D_local_column_range")
+    @boundscheck length(sc.D_local_column_range) == 0 || maximum(sc.D_local_column_range) ≤ size(D, 2) || error(BoundsError, " Number of columns in D is smaller than the largest index in D_local_column_range")
 
     A_factorization = sc.A_factorization
     Ainv_dot_B = sc.Ainv_dot_B
