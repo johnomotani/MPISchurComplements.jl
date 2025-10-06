@@ -11,12 +11,14 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 [compat]
 LinearAlgebra = "1.11.0"
 MPI = "0.20.23"
+Primes = "0.5.7"
 SparseArrays = "1.11.0"
 StableRNGs = "1"
 
 [extras]
+Primes = "27ebfcd6-29c5-5fa9-bf4b-fb8fc14df3ae"
 StableRNGs = "860ef19b-820b-49d6-a774-d7a799459cd3"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["StableRNGs", "Test"]
+test = ["Primes", "StableRNGs", "Test"]
