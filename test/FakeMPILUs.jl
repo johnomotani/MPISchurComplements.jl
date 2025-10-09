@@ -20,6 +20,12 @@ function gather_A(A_local, global_row_range::Trange, global_column_range::Trange
     nproc = MPI.Comm_size(comm)
     rank = MPI.Comm_rank(comm)
 
+    if Trange === Vector{Int64}
+        # Ensure we do not modify the inputs.
+        global_row_range = copy(global_row_range)
+        global_column_range = copy(global_column_range)
+    end
+
     if rank == 0
         distributed_row_ranges = [global_row_range]
         distributed_col_ranges = [global_column_range]
@@ -219,8 +225,7 @@ function ldiv!(x::AbstractVector, Alu::FakeMPILU, b::AbstractVector)
     if rank == 0
         rhs_buffer = Alu.rhs_buffer
 
-        rhs_buffer[Alu.global_row_range] .= b
-        last_row_max = maximum(Alu.global_row_range)
+        rhs_buffer[Alu.global_vector_ranges[1]] .= b
         for iproc ∈ 1:nproc-1
             this_vector_range = Alu.global_vector_ranges[iproc+1]
             this_rhs_buffer = zeros(eltype(rhs_buffer), length(this_vector_range))
@@ -233,7 +238,7 @@ function ldiv!(x::AbstractVector, Alu::FakeMPILU, b::AbstractVector)
 
         ldiv!(Alu.Alu, Alu.rhs_buffer)
 
-        @views x .= rhs_buffer[Alu.global_row_range]
+        @views x .= rhs_buffer[Alu.global_vector_ranges[1]]
         for iproc ∈ 1:nproc-1
             this_buffer = rhs_buffer[Alu.global_vector_ranges[iproc+1]]
             MPI.Send(this_buffer, comm; dest=iproc)
