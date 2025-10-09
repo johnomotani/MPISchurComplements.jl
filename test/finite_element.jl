@@ -126,8 +126,14 @@ function get_fe_like_matrix(n_element_list...; allocate_array, rng, distributed_
     # Fill top block with multi-dimensional matrix, and bottom block with 1d matrix, using
     # the first dimension of the top block.
     top_block_sizes, top_block_total = get_fe_sizes(n_element_list...)
-    bottom_block_nelement_list = n_element_list[1:bottom_block_ndims]
-    bottom_block_sizes, bottom_block_total = get_fe_sizes(bottom_block_nelement_list...)
+    if bottom_block_ndims === nothing
+        bottom_block_nelement_list = Int64[]
+        bottom_block_sizes = Int64[]
+        bottom_block_total = 0
+    else
+        bottom_block_nelement_list = n_element_list[1:bottom_block_ndims]
+        bottom_block_sizes, bottom_block_total = get_fe_sizes(bottom_block_nelement_list...)
+    end
     total_size = top_block_total + bottom_block_total
     M = allocate_array(total_size, total_size)
 
@@ -192,15 +198,17 @@ function get_fe_like_matrix(n_element_list...; allocate_array, rng, distributed_
         # Fill 'A' block
         @views fill_fe_recursive!(M[top_block_slice,top_block_slice], n_element_list,
                                   n_element_list)
-        # Fill 'B' block
-        @views fill_fe_recursive!(M[top_block_slice,bottom_block_slice], n_element_list,
-                                  bottom_block_nelement_list)
-        # Fill 'C' block
-        @views fill_fe_recursive!(M[bottom_block_slice,top_block_slice],
-                                  bottom_block_nelement_list, n_element_list)
-        # Fill 'D' block
-        @views fill_fe_recursive!(M[bottom_block_slice,bottom_block_slice],
-                                  bottom_block_nelement_list, bottom_block_nelement_list)
+        if bottom_block_ndims !== nothing
+            # Fill 'B' block
+            @views fill_fe_recursive!(M[top_block_slice,bottom_block_slice], n_element_list,
+                                      bottom_block_nelement_list)
+            # Fill 'C' block
+            @views fill_fe_recursive!(M[bottom_block_slice,top_block_slice],
+                                      bottom_block_nelement_list, n_element_list)
+            # Fill 'D' block
+            @views fill_fe_recursive!(M[bottom_block_slice,bottom_block_slice],
+                                      bottom_block_nelement_list, bottom_block_nelement_list)
+        end
     end
     if shared_comm === nothing || MPI.Comm_rank(shared_comm) == 0
         MPI.Bcast!(M, distributed_comm; root=0)
@@ -668,6 +676,271 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, separate_Ainv_B=f
     end
 end
 
+# In this test there is a finite element matrix for one 'variable', without the second
+# smaller coupled variable. Instead, the 'bottom vector' is chosen to be some entries that
+# make the remainder of the matrix block-diagonal parts (i.e. split into disconnected
+# parts).
+function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv_B=false)
+    distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
+        shared_rank, allocate_array, local_win_store = get_comms(n_shared)
+
+    rng = StableRNG(2007)
+
+    nelement_list = (4, 4, 4)
+    ndims = length(nelement_list)
+
+    # Broadcast arrays from distributed_rank-0 so that all processes work with the same data.
+    M, n, _ = get_fe_like_matrix(nelement_list...; allocate_array=allocate_array, rng=rng,
+                                 distributed_comm=distributed_comm,
+                                 shared_comm=shared_comm, bottom_block_ndims=nothing)
+    b = allocate_array(n)
+    z = allocate_array(n)
+    if distributed_rank == 0 && shared_rank == 0
+        b .= rand(rng, n)
+        z .= 0.0
+    end
+    if shared_rank == 0
+        MPI.Bcast!(b, distributed_comm; root=0)
+        MPI.Bcast!(z, distributed_comm; root=0)
+    end
+    shared_comm !== nothing && MPI.Barrier(shared_comm)
+
+    # Get the 'bottom_vector' indices corresponding to the splits s1, s2, s3 - the grid
+    # points corresponding to an element boundary that, when removed, decouple the matrix
+    # on either side of the split.
+    function get_splitting_inds(idim, n_split)
+        this_nelement = nelement_list[idim]
+        if this_nelement % n_split != 0
+            error("Dimension with $this_nelement elements cannot be split into $n_split "
+                  * "equally sized parts.")
+        end
+        chunk_nelement = this_nelement ÷ n_split
+        split_inds_1d = [isplit * chunk_nelement * (ngrid - 1) + 1 for isplit ∈ 1:n_split-1]
+        split_inds = Int64[]
+        function insert_inds!(this_dim, offset)
+            if this_dim > ndims
+                push!(split_inds, offset + 1)
+                return nothing
+            elseif this_dim == idim
+                this_inds = split_inds_1d
+            else
+                dim_size = nelement_list[this_dim] * (ngrid - 1) + 1
+                this_inds = 1:dim_size
+            end
+            inner_dims_size = prod(nelement_list[d] * (ngrid - 1) + 1 for d ∈ this_dim+1:ndims; init=1)
+            for i ∈ this_inds
+                insert_inds!(this_dim + 1, offset + (i - 1) * inner_dims_size)
+            end
+            return nothing
+        end
+        insert_inds!(1, 0)
+        return split_inds
+    end
+    # Calculate 'splitting inds' for each dimension
+    splitting_inds = Tuple(get_splitting_inds(i, s) for (i, s) ∈ enumerate((s1, s2, s3)))
+    # Combine into a single list, and sort
+    bottom_vector_inds = union(splitting_inds...)
+    sort!(bottom_vector_inds)
+
+    # The 'top vector' in this case is just all the indices that aren't in the 'bottom
+    # vector'.
+    top_vector_inds = setdiff(collect(1:n), bottom_vector_inds)
+
+    # Decide how to split up the matrix among the distributed blocks.
+    distributed_factors = factor(Vector, distributed_nproc)
+    n_factors = length(distributed_factors)
+    first_dim_n_factors = (n_factors + 1) ÷ 2
+    first_dim_distributed_nproc = prod(distributed_factors[1:first_dim_n_factors]; init=1)
+    second_dim_distributed_nproc = prod(distributed_factors[first_dim_n_factors+1:end]; init=1)
+
+    function get_local_slices(this_M)
+        # Need to extract slices, and multiply any overlaps by 0.5 so that they can be
+        # recombined by adding the overlapping chunks together.
+
+        # Split first dimension among distributed ranks.
+        distributed_chunks, distributed_chunk_lower_boundaries,
+        distributed_chunk_upper_boundaries =
+            get_distributed_slices([first_dim_distributed_nproc,
+                                    second_dim_distributed_nproc],
+                                   nelement_list)
+        top_chunks = [intersect(c, top_vector_inds) for c ∈ distributed_chunks]
+        bottom_chunks = [intersect(c, bottom_vector_inds) for c ∈ distributed_chunks]
+
+        this_chunk = distributed_chunks[distributed_rank+1]
+
+        local_n = length(this_chunk)
+        local_top_vector_global_inds = top_chunks[distributed_rank+1]
+        local_bottom_vector_global_inds = bottom_chunks[distributed_rank+1]
+        local_top_vector_local_inds = MPISchurComplements.find_local_vector_inds(local_top_vector_global_inds, this_chunk)
+        local_bottom_vector_local_inds = MPISchurComplements.find_local_vector_inds(local_bottom_vector_global_inds, this_chunk)
+
+        # Make copy here so that we do not modify the original matrix.
+        this_local_M = allocate_array(local_n, local_n)
+        this_local_M .= @view this_M[this_chunk,this_chunk]
+
+        this_local_A = @view this_local_M[local_top_vector_local_inds,local_top_vector_local_inds]
+        this_local_B = @view this_local_M[local_top_vector_local_inds,local_bottom_vector_local_inds]
+        this_local_C = @view this_local_M[local_bottom_vector_local_inds,local_top_vector_local_inds]
+        this_local_D = @view this_local_M[local_bottom_vector_local_inds,local_bottom_vector_local_inds]
+
+        if shared_rank == 0
+
+            # Overlap at top-left corners.
+            if distributed_rank ÷ second_dim_distributed_nproc > 0
+                @views this_local_M[distributed_chunk_lower_boundaries[1],distributed_chunk_lower_boundaries[1]] .*= 0.5
+            end
+            if distributed_rank % second_dim_distributed_nproc > 0
+                @views this_local_M[distributed_chunk_lower_boundaries[2],distributed_chunk_lower_boundaries[2]] .*= 0.5
+            end
+            # Overlap at bottom-right corners.
+            if distributed_rank ÷ second_dim_distributed_nproc < first_dim_distributed_nproc - 1
+                @views this_local_M[distributed_chunk_upper_boundaries[1],distributed_chunk_upper_boundaries[1]] .*= 0.5
+            end
+            if distributed_rank % second_dim_distributed_nproc < second_dim_distributed_nproc - 1
+                @views this_local_M[distributed_chunk_upper_boundaries[2],distributed_chunk_upper_boundaries[2]] .*= 0.5
+            end
+
+            # Check that re-assembling our split matrices gives back the original matrix as
+            # expected.
+            check_M = similar(this_M)
+            check_M .= 0.0
+            check_M[local_top_vector_global_inds,local_top_vector_global_inds] .= this_local_A
+            check_M[local_top_vector_global_inds,local_bottom_vector_global_inds] .= this_local_B
+            check_M[local_bottom_vector_global_inds,local_top_vector_global_inds] .= this_local_C
+            check_M[local_bottom_vector_global_inds,local_bottom_vector_global_inds] .= this_local_D
+            MPI.Allreduce!(check_M, +, distributed_comm)
+            if !isapprox(M, check_M; atol=1.0e-15)
+                error("M and split/reassembled M differ. Extrema: $(extrema(M .- check_M))")
+            end
+        end
+
+        return this_local_A, this_local_B, this_local_C, this_local_D,
+               local_top_vector_global_inds, local_bottom_vector_global_inds, top_chunks,
+               bottom_chunks
+    end
+
+    u = @view b[top_vector_inds]
+    v = @view b[bottom_vector_inds]
+    x = @view z[top_vector_inds]
+    y = @view z[bottom_vector_inds]
+
+    # This process owns the rows/columns corresponding to top_chunk_slice and
+    # bottom_chunk_slice.
+    # Note in this test it is more convenient to slice the local chunks of u/v/x/y
+    # directly out of b and z, rather than out of u/v/x/y.
+    local_A, local_B, local_C, local_D, top_chunk_slice, bottom_chunk_slice,
+        all_top_chunks, all_bottom_chunks = get_local_slices(M)
+    local_u = @view b[top_chunk_slice]
+    local_v = @view b[bottom_chunk_slice]
+    local_x = @view z[top_chunk_slice]
+    local_y = @view z[bottom_chunk_slice]
+
+    bottom_vec_buffer = similar(y)
+    global_y = similar(y)
+
+    Alu = @views FakeMPILU(local_A, top_chunk_slice, top_chunk_slice;
+                           comm=distributed_comm, shared_comm=shared_comm)
+
+    sc = mpi_schur_complement(Alu, local_B, local_C, local_D, top_chunk_slice,
+                              bottom_chunk_slice; distributed_comm=distributed_comm,
+                              shared_comm=shared_comm, allocate_array=allocate_array,
+                              separate_Ainv_B=separate_Ainv_B)
+
+    function test_once()
+        ldiv!(local_x, local_y, sc, local_u, local_v)
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
+
+        if shared_rank == 0
+            buffer_x = similar(local_x)
+            buffer_y = similar(local_y)
+            if distributed_rank == 0
+                for iproc ∈ 2:distributed_nproc
+                    @views MPI.Recv!(buffer_x, distributed_comm;
+                                     source=iproc-1)
+                    x[all_top_chunks[iproc]] .= buffer_x
+                    @views MPI.Recv!(buffer_y, distributed_comm;
+                                     source=iproc-1)
+                    y[all_bottom_chunks[iproc]] .= buffer_y
+                end
+            else
+                buffer_x .= local_x
+                @views MPI.Send(buffer_x, distributed_comm; dest=0)
+                buffer_y .= local_y
+                @views MPI.Send(buffer_y, distributed_comm; dest=0)
+            end
+
+            # Check if solution does give back original right-hand-side
+            if distributed_rank == 0
+                @test isapprox(M * z, b; atol=tol)
+
+                lu_sol = M \ b
+                # Sanity check that tolerance is appropriate by testing solution from
+                # LinearAlgebra's LU factorization.
+                @test isapprox(M * lu_sol, b; atol=tol)
+                # Compare our solution to the one from LinearAlgebra's LU factorization.
+                @test isapprox(z, lu_sol; rtol=tol)
+            end
+
+            z .= 0.0
+        end
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
+    end
+
+    @testset "solve" begin
+        test_once()
+    end
+
+    @testset "change b" begin
+        # Check passing a new RHS is OK
+        if shared_rank == 0
+            if distributed_rank == 0
+                b .= rand(rng, n)
+            end
+            MPI.Bcast!(b, distributed_comm; root=0)
+        end
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
+        test_once()
+    end
+
+    @testset "change M" begin
+        # Check changing the matrix is OK
+        M, _, _ = get_fe_like_matrix(nelement_list...; allocate_array=allocate_array,
+                                     rng=rng, distributed_comm=distributed_comm,
+                                     shared_comm=shared_comm, bottom_block_ndims=nothing)
+        if shared_rank == 0
+            if distributed_rank == 0
+                b .= rand(rng, n)
+            end
+            MPI.Bcast!(b, distributed_comm; root=0)
+        end
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
+        local_A, local_B, local_C, local_D, _, _, _, _ = get_local_slices(M)
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
+        update_schur_complement!(sc, local_A, local_B, local_C, local_D)
+        test_once()
+    end
+
+    @testset "change M, change b" begin
+        # Check passing another new RHS is OK
+        if shared_rank == 0
+            if distributed_rank == 0
+                b .= rand(rng, n)
+            end
+            MPI.Bcast!(b, distributed_comm; root=0)
+        end
+        shared_comm !== nothing && MPI.Barrier(shared_comm)
+        test_once()
+    end
+    if local_win_store !== nothing
+        # Free the MPI.Win objects, because if they are free'd by the garbage collector
+        # it may cause an MPI error or hang.
+        for w ∈ local_win_store
+            MPI.free(w)
+        end
+        resize!(local_win_store, 0)
+    end
+end
+
 function finite_element_tests()
     @testset "finite element" begin
         nproc = MPI.Comm_size(MPI.COMM_WORLD)
@@ -700,6 +973,45 @@ function finite_element_tests()
                        ), separate_Ainv_B ∈ (false, true)
                     finite_element_2D1V_test(n1, n2, 3, tol; n_shared=n_shared,
                                              separate_Ainv_B=separate_Ainv_B)
+                end
+                n_shared *= 2
+            end
+        end
+        @testset "3D split" begin
+            n_shared = 1
+            while n_shared ≤ nproc
+                n_distributed = nproc ÷ n_shared
+                tol = 1.0e-11
+                @testset "n_shared=$n_shared ($s1,$s2,$s3), separate_Ainv_B=$separate_Ainv_B" for (s1,s2,s3) ∈ (
+                        (1, 1, 2),
+                        (1, 1, 4),
+                        (1, 2, 1),
+                        (1, 2, 2),
+                        (1, 2, 4),
+                        (1, 4, 1),
+                        (1, 4, 2),
+                        (1, 4, 4),
+                        (2, 1, 1),
+                        (2, 1, 2),
+                        (2, 1, 4),
+                        (2, 2, 1),
+                        (2, 2, 2),
+                        (2, 2, 4),
+                        (2, 4, 1),
+                        (2, 4, 2),
+                        (2, 4, 4),
+                        (4, 1, 1),
+                        (4, 1, 2),
+                        (4, 1, 4),
+                        (4, 2, 1),
+                        (4, 2, 2),
+                        (4, 2, 4),
+                        (4, 4, 1),
+                        (4, 4, 2),
+                        (4, 4, 4),
+                       ), separate_Ainv_B ∈ (false, true)
+                    finite_element_3D_split_test(s1, s2, s3, tol; n_shared=n_shared,
+                                                 separate_Ainv_B=separate_Ainv_B)
                 end
                 n_shared *= 2
             end
