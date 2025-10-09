@@ -122,12 +122,18 @@ function get_distributed_slices(n_chunks, n_element_list)
 end
 
 function get_fe_like_matrix(n_element_list...; allocate_array, rng, distributed_comm,
-                            shared_comm, bottom_block_ndims=1)
+                            shared_comm, bottom_block_ndims=nothing)
     # Fill top block with multi-dimensional matrix, and bottom block with 1d matrix, using
     # the first dimension of the top block.
     top_block_sizes, top_block_total = get_fe_sizes(n_element_list...)
-    bottom_block_nelement_list = n_element_list[1:bottom_block_ndims]
-    bottom_block_sizes, bottom_block_total = get_fe_sizes(bottom_block_nelement_list...)
+    if bottom_block_ndims === nothing
+        bottom_block_nelement_list = Int64[]
+        bottom_block_sizes = Int64[]
+        bottom_block_total = 0
+    else
+        bottom_block_nelement_list = n_element_list[1:bottom_block_ndims]
+        bottom_block_sizes, bottom_block_total = get_fe_sizes(bottom_block_nelement_list...)
+    end
     total_size = top_block_total + bottom_block_total
     M = allocate_array(total_size, total_size)
 
@@ -192,15 +198,17 @@ function get_fe_like_matrix(n_element_list...; allocate_array, rng, distributed_
         # Fill 'A' block
         @views fill_fe_recursive!(M[top_block_slice,top_block_slice], n_element_list,
                                   n_element_list)
-        # Fill 'B' block
-        @views fill_fe_recursive!(M[top_block_slice,bottom_block_slice], n_element_list,
-                                  bottom_block_nelement_list)
-        # Fill 'C' block
-        @views fill_fe_recursive!(M[bottom_block_slice,top_block_slice],
-                                  bottom_block_nelement_list, n_element_list)
-        # Fill 'D' block
-        @views fill_fe_recursive!(M[bottom_block_slice,bottom_block_slice],
-                                  bottom_block_nelement_list, bottom_block_nelement_list)
+        if bottom_block_ndims !== nothing
+            # Fill 'B' block
+            @views fill_fe_recursive!(M[top_block_slice,bottom_block_slice], n_element_list,
+                                      bottom_block_nelement_list)
+            # Fill 'C' block
+            @views fill_fe_recursive!(M[bottom_block_slice,top_block_slice],
+                                      bottom_block_nelement_list, n_element_list)
+            # Fill 'D' block
+            @views fill_fe_recursive!(M[bottom_block_slice,bottom_block_slice],
+                                      bottom_block_nelement_list, bottom_block_nelement_list)
+        end
     end
     if shared_comm === nothing || MPI.Comm_rank(shared_comm) == 0
         MPI.Bcast!(M, distributed_comm; root=0)
@@ -679,12 +687,12 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
     rng = StableRNG(2007)
 
     nelement_list = (4, 4, 4)
+    ndims = length(nelement_list)
 
     # Broadcast arrays from distributed_rank-0 so that all processes work with the same data.
-    M, n, _ =
-        get_fe_like_matrix(nelement_list...; allocate_array=allocate_array, rng=rng,
-                           distributed_comm=distributed_comm, shared_comm=shared_comm,
-                           bottom_block_ndims=0)
+    M, n, _ = get_fe_like_matrix(nelement_list...; allocate_array=allocate_array, rng=rng,
+                                 distributed_comm=distributed_comm,
+                                 shared_comm=shared_comm, bottom_block_ndims=nothing)
     b = allocate_array(n)
     z = allocate_array(n)
     if distributed_rank == 0 && shared_rank == 0
@@ -710,8 +718,8 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
         split_inds_1d = [isplit * chunk_nelement * (ngrid - 1) + 1 for isplit ∈ 1:n_split-1]
         split_inds = Int64[]
         function insert_inds!(this_dim, offset)
-            if this_dim > 3
-                push!(offset, split_inds)
+            if this_dim > ndims
+                push!(split_inds, offset + 1)
                 return nothing
             elseif this_dim == idim
                 this_inds = split_inds_1d
@@ -719,7 +727,7 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
                 dim_size = nelement_list[this_dim] * (ngrid - 1) + 1
                 this_inds = 1:dim_size
             end
-            inner_dims_size = prod(nelement_list[d] * (ngrid - 1) + 1 for d ∈ this_dim+1:3; init=1)
+            inner_dims_size = prod(nelement_list[d] * (ngrid - 1) + 1 for d ∈ this_dim+1:ndims; init=1)
             for i ∈ this_inds
                 insert_inds!(this_dim + 1, (i - 1) * inner_dims_size)
             end
@@ -749,11 +757,6 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
         # Need to extract slices, and multiply any overlaps by 0.5 so that they can be
         # recombined by adding the overlapping chunks together.
 
-        this_A = @view this_M[top_vector_inds, top_vector_inds]
-        this_B = @view this_M[top_vector_inds, bottom_vector_inds]
-        this_C = @view this_M[bottom_vector_inds, top_vector_inds]
-        this_D = @view this_M[bottom_vector_inds, bottom_vector_inds]
-
         # Split first dimension among distributed ranks.
         distributed_chunks, distributed_chunk_lower_boundaries,
         distributed_chunk_upper_boundaries =
@@ -765,14 +768,15 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
 
         this_chunk = distributed_chunks[distributed_rank+1]
 
-        # Make copies here so that we do not modify the original matrix.
         local_n = length(this_chunk)
         local_top_vector_global_inds = top_chunks[distributed_rank+1]
         local_bottom_vector_global_inds = bottom_chunks[distributed_rank+1]
         local_top_vector_local_inds = MPISchurComplements.find_local_vector_inds(local_top_vector_global_inds, this_chunk)
         local_bottom_vector_local_inds = MPISchurComplements.find_local_vector_inds(local_bottom_vector_global_inds, this_chunk)
 
+        # Make copy here so that we do not modify the original matrix.
         this_local_M = allocate_array(local_n, local_n)
+        this_local_M .= @view this_M[this_chunk,this_chunk]
 
         this_local_A = @view this_local_M[local_top_vector_local_inds,local_top_vector_local_inds]
         this_local_B = @view this_local_M[local_top_vector_local_inds,local_bottom_vector_local_inds]
@@ -798,16 +802,12 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
 
             # Check that re-assembling our split matrices gives back the original matrix as
             # expected.
-            check_M = similar(M)
+            check_M = similar(this_M)
             check_M .= 0.0
-            check_A = @view check_M[top_vector_inds, top_vector_inds]
-            check_B = @view check_M[top_vector_inds, bottom_vector_inds]
-            check_C = @view check_M[bottom_vector_inds, top_vector_inds]
-            check_D = @view check_M[bottom_vector_inds, bottom_vector_inds]
-            check_A[local_top_vector_global_inds,local_top_vector_global_inds] .= this_local_A
-            check_B[local_top_vector_global_inds,local_bottom_vector_global_inds] .= this_local_B
-            check_C[local_bottom_vector_global_inds,local_top_vector_global_inds] .= this_local_C
-            check_D[local_bottom_vector_global_inds,local_bottom_vector_global_inds] .= this_local_D
+            check_M[local_top_vector_global_inds,local_top_vector_global_inds] .= this_local_A
+            check_M[local_top_vector_global_inds,local_bottom_vector_global_inds] .= this_local_B
+            check_M[local_bottom_vector_global_inds,local_top_vector_global_inds] .= this_local_C
+            check_M[local_bottom_vector_global_inds,local_bottom_vector_global_inds] .= this_local_D
             MPI.Allreduce!(check_M, +, distributed_comm)
             if !isapprox(M, check_M; atol=1.0e-15)
                 error("M and split/reassembled M differ. Extrema: $(extrema(M .- check_M))")
@@ -826,12 +826,14 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
 
     # This process owns the rows/columns corresponding to top_chunk_slice and
     # bottom_chunk_slice.
+    # Note in this test it is more convenient to slice the local chunks of u/v/x/y
+    # directly out of b and z, rather than out of u/v/x/y.
     local_A, local_B, local_C, local_D, top_chunk_slice, bottom_chunk_slice,
         all_top_chunks, all_bottom_chunks = get_local_slices(M)
-    local_u = @view u[top_chunk_slice]
-    local_v = @view v[bottom_chunk_slice]
-    local_x = @view x[top_chunk_slice]
-    local_y = @view y[bottom_chunk_slice]
+    local_u = @view b[top_chunk_slice]
+    local_v = @view b[bottom_chunk_slice]
+    local_x = @view z[top_chunk_slice]
+    local_y = @view z[bottom_chunk_slice]
 
     bottom_vec_buffer = similar(y)
     global_y = similar(y)
@@ -902,9 +904,9 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
 
     @testset "change M" begin
         # Check changing the matrix is OK
-        M, _, _ = get_fe_like_matrix(n1, n2, n3; allocate_array=allocate_array, rng=rng,
-                                     distributed_comm=distributed_comm,
-                                     shared_comm=shared_comm, bottom_block_ndims=2)
+        M, _, _ = get_fe_like_matrix(nelement_list...; allocate_array=allocate_array,
+                                     rng=rng, distributed_comm=distributed_comm,
+                                     shared_comm=shared_comm, bottom_block_ndims=nothing)
         if shared_rank == 0
             if distributed_rank == 0
                 b .= rand(rng, n)
