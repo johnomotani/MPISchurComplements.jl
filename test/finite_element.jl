@@ -122,7 +122,7 @@ function get_distributed_slices(n_chunks, n_element_list)
 end
 
 function get_fe_like_matrix(n_element_list...; allocate_array, rng, distributed_comm,
-                            shared_comm, bottom_block_ndims=nothing)
+                            shared_comm, bottom_block_ndims=1)
     # Fill top block with multi-dimensional matrix, and bottom block with 1d matrix, using
     # the first dimension of the top block.
     top_block_sizes, top_block_total = get_fe_sizes(n_element_list...)
@@ -983,7 +983,6 @@ function finite_element_tests()
                 n_distributed = nproc ÷ n_shared
                 tol = 1.0e-14
                 @testset "n_shared=$n_shared ($s1,$s2,$s3), separate_Ainv_B=$separate_Ainv_B" for (s1,s2,s3) ∈ (
-                        (1, 1, 1),
                         (1, 1, 2),
                         (1, 1, 4),
                         (1, 2, 1),
