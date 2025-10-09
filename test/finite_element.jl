@@ -289,7 +289,7 @@ function finite_element_1D1V_test(n1, n2, tol; n_shared=1, separate_Ainv_B=false
 
             # Check that re-assembling our split matrices gives back the original matrix as
             # expected.
-            check_M = similar(M)
+            check_M = similar(this_M)
             check_M .= 0.0
             check_A = @view check_M[1:top_block_total_size, 1:top_block_total_size]
             check_B = @view check_M[1:top_block_total_size,
@@ -525,7 +525,7 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, separate_Ainv_B=f
 
             # Check that re-assembling our split matrices gives back the original matrix as
             # expected.
-            check_M = similar(M)
+            check_M = similar(this_M)
             check_M .= 0.0
             check_A = @view check_M[1:top_block_total_size, 1:top_block_total_size]
             check_B = @view check_M[1:top_block_total_size,
