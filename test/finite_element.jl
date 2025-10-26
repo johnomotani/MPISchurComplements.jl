@@ -217,7 +217,8 @@ function get_fe_like_matrix(n_element_list...; allocate_array, rng, distributed_
     return M, top_block_total, bottom_block_total
 end
 
-function finite_element_1D1V_test(n1, n2, tol; n_shared=1, separate_Ainv_B=false)
+function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
+                                  separate_Ainv_B=false)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
         shared_rank, allocate_array, local_win_store = get_comms(n_shared)
 
@@ -320,10 +321,27 @@ function finite_element_1D1V_test(n1, n2, tol; n_shared=1, separate_Ainv_B=false
                this_bottom_chunk, top_chunks, bottom_chunks
     end
 
+    A = @view M[1:top_block_total_size,1:top_block_total_size]
+    B = @view M[1:top_block_total_size,top_block_total_size+1:end]
+    C = @view M[top_block_total_size+1:end,1:top_block_total_size]
+    D = @view M[top_block_total_size+1:end,top_block_total_size+1:end]
     u = @view b[1:top_block_total_size]
     v = @view b[top_block_total_size+1:end]
     x = @view z[1:top_block_total_size]
     y = @view z[top_block_total_size+1:end]
+
+    if periodic
+        n_other_dims = top_block_total_size ÷ bottom_block_total_size
+        # Make RHS vectors periodic in the first dimension.
+        function enforce_rhs_periodicity()
+            if shared_rank == 0
+                @views u[end-n_other_dims+1:end] .= u[1:n_other_dims]
+                v[end] = v[1]
+            end
+            shared_comm !== nothing && MPI.Barrier(shared_comm)
+        end
+        enforce_rhs_periodicity()
+    end
 
     # This process owns the rows/columns corresponding to top_chunk_slice and
     # bottom_chunk_slice.
@@ -334,20 +352,82 @@ function finite_element_1D1V_test(n1, n2, tol; n_shared=1, separate_Ainv_B=false
     local_x = @view x[top_chunk_slice]
     local_y = @view y[bottom_chunk_slice]
 
+    if periodic
+        top_chunk_global_inds = collect(top_chunk_slice)
+        bottom_chunk_global_inds = collect(bottom_chunk_slice)
+        if distributed_rank == distributed_nproc - 1
+            @views top_chunk_global_inds[end-n_other_dims+1:end] .= 1:n_other_dims
+            bottom_chunk_global_inds[end] = 1
+        end
+    else
+        top_chunk_global_inds = top_chunk_slice
+        bottom_chunk_global_inds = bottom_chunk_slice
+    end
+    function assemble_M(M)
+        if periodic
+            # Need to add up values from duplicated entries
+            if shared_rank ==0 && distributed_rank == 0
+                A_intermediate = A[:,1:end-n_other_dims]
+                @views A_intermediate[:,1:n_other_dims] .+= A[:,end-n_other_dims+1:end]
+                A_assembled = A_intermediate[1:end-n_other_dims,:]
+                @views A_assembled[1:n_other_dims,:] .+= A_intermediate[end-n_other_dims+1:end,:]
+
+                B_intermediate = B[:,1:end-1]
+                @views B_intermediate[:,1] .+= B[:,end]
+                B_assembled = B_intermediate[1:end-n_other_dims,:]
+                @views B_assembled[1:n_other_dims,:] .+= B_intermediate[end-n_other_dims+1:end,:]
+
+                C_intermediate = C[:,1:end-n_other_dims]
+                @views C_intermediate[:,1:n_other_dims] .+= C[:,end-n_other_dims+1:end]
+                C_assembled = C_intermediate[1:end-1,:]
+                @views C_assembled[1,:] .+= C_intermediate[end,:]
+
+                D_intermediate = D[:,1:end-1]
+                @views D_intermediate[:,1] .+= D[:,end]
+                D_assembled = D_intermediate[1:end-1,:]
+                @views D_assembled[1,:] .+= D_intermediate[end,:]
+
+                M_assembled = hvcat(2, A_assembled, B_assembled, C_assembled, D_assembled)
+            else
+                M_assembled = nothing
+            end
+        else
+            M_assembled = M
+        end
+        return M_assembled
+    end
+    function assemble_b(b)
+        if periodic
+            # Need to add up values from duplicated entries
+            if shared_rank ==0 && distributed_rank == 0
+                u_assembled = @view u[1:end-n_other_dims]
+                v_assembled = @view v[1:end-1]
+                b_assembled = vcat(u_assembled, v_assembled)
+            else
+                b_assembled = nothing
+            end
+        else
+            b_assembled = b
+        end
+        return b_assembled
+    end
+
     bottom_vec_buffer = similar(y)
     global_y = similar(y)
 
-    Alu = @views FakeMPILU(local_A, top_chunk_slice, top_chunk_slice;
+    Alu = @views FakeMPILU(local_A, top_chunk_global_inds, top_chunk_global_inds;
                            comm=distributed_comm, shared_comm=shared_comm)
 
-    sc = mpi_schur_complement(Alu, local_B, local_C, local_D, top_chunk_slice,
-                              bottom_chunk_slice; distributed_comm=distributed_comm,
+    sc = mpi_schur_complement(Alu, local_B, local_C, local_D, top_chunk_global_inds,
+                              bottom_chunk_global_inds; distributed_comm=distributed_comm,
                               shared_comm=shared_comm, allocate_array=allocate_array,
                               separate_Ainv_B=separate_Ainv_B)
 
-    function test_once()
+    function test_once(M_assembled)
         ldiv!(local_x, local_y, sc, local_u, local_v)
         shared_comm !== nothing && MPI.Barrier(shared_comm)
+
+        b_assembled = assemble_b(b)
 
         if shared_rank == 0
             if distributed_rank == 0
@@ -364,14 +444,35 @@ function finite_element_1D1V_test(n1, n2, tol; n_shared=1, separate_Ainv_B=false
 
             # Check if solution does give back original right-hand-side
             if distributed_rank == 0
-                @test isapprox(M * z, b; atol=tol)
+                if periodic
+                    M_times_z = M * z
+                    upper_check = @view M_times_z[1:top_block_total_size]
+                    lower_check = @view M_times_z[top_block_total_size+1:end]
+                    upper_assembled = upper_check[1:end-n_other_dims]
+                    @views upper_assembled[1:n_other_dims] .+= upper_check[end-n_other_dims+1:end]
+                    lower_assembled = lower_check[1:end-1]
+                    lower_assembled[1] += lower_check[end]
+                    M_times_z_assembled = vcat(upper_assembled, lower_assembled)
 
-                lu_sol = M \ b
+                    x_check = @view z[1:top_block_total_size]
+                    y_check = @view z[top_block_total_size+1:end]
+                    x_assembled = x_check[1:end-n_other_dims]
+                    @test x_assembled[1:n_other_dims] == x_check[end-n_other_dims+1:end]
+                    y_assembled = y_check[1:end-1]
+                    @test y_assembled[1] == y_check[end]
+                    z_assembled = vcat(x_assembled, y_assembled)
+                else
+                    M_times_z_assembled = M * z
+                    z_assembled = z
+                end
+                @test isapprox(M_times_z_assembled, b_assembled; atol=tol)
+
+                lu_sol = M_assembled \ b_assembled
                 # Sanity check that tolerance is appropriate by testing solution from
                 # LinearAlgebra's LU factorization.
-                @test isapprox(M * lu_sol, b; atol=tol)
+                @test isapprox(M_assembled * lu_sol, b_assembled; atol=tol)
                 # Compare our solution to the one from LinearAlgebra's LU factorization.
-                @test isapprox(z, lu_sol; rtol=tol)
+                @test isapprox(z_assembled, lu_sol; rtol=tol)
             end
 
             z .= 0.0
@@ -379,8 +480,10 @@ function finite_element_1D1V_test(n1, n2, tol; n_shared=1, separate_Ainv_B=false
         shared_comm !== nothing && MPI.Barrier(shared_comm)
     end
 
+    M_assembled = assemble_M(M)
+
     @testset "solve" begin
-        test_once()
+        test_once(M_assembled)
     end
 
     @testset "change b" begin
@@ -391,8 +494,11 @@ function finite_element_1D1V_test(n1, n2, tol; n_shared=1, separate_Ainv_B=false
             end
             MPI.Bcast!(b, distributed_comm; root=0)
         end
+        if periodic
+            enforce_rhs_periodicity()
+        end
         shared_comm !== nothing && MPI.Barrier(shared_comm)
-        test_once()
+        test_once(M_assembled)
     end
 
     @testset "change M" begin
@@ -400,17 +506,27 @@ function finite_element_1D1V_test(n1, n2, tol; n_shared=1, separate_Ainv_B=false
         M, _, _ = get_fe_like_matrix(n1, n2; allocate_array=allocate_array,
                                      rng=rng, distributed_comm=distributed_comm,
                                      shared_comm=shared_comm)
+        A = @view M[1:top_block_total_size,1:top_block_total_size]
+        B = @view M[1:top_block_total_size,top_block_total_size+1:end]
+        C = @view M[top_block_total_size+1:end,1:top_block_total_size]
+        D = @view M[top_block_total_size+1:end,top_block_total_size+1:end]
+
+        M_assembled = assemble_M(M)
+
         if shared_rank == 0
             if distributed_rank == 0
                 b .= rand(rng, n)
             end
             MPI.Bcast!(b, distributed_comm; root=0)
         end
+        if periodic
+            enforce_rhs_periodicity()
+        end
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         local_A, local_B, local_C, local_D, _, _, _, _ = get_local_slices(M)
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         update_schur_complement!(sc, local_A, local_B, local_C, local_D)
-        test_once()
+        test_once(M_assembled)
     end
 
     @testset "change M, change b" begin
@@ -421,8 +537,11 @@ function finite_element_1D1V_test(n1, n2, tol; n_shared=1, separate_Ainv_B=false
             end
             MPI.Bcast!(b, distributed_comm; root=0)
         end
+        if periodic
+            enforce_rhs_periodicity()
+        end
         shared_comm !== nothing && MPI.Barrier(shared_comm)
-        test_once()
+        test_once(M_assembled)
     end
     if local_win_store !== nothing
         # Free the MPI.Win objects, because if they are free'd by the garbage collector
@@ -434,7 +553,8 @@ function finite_element_1D1V_test(n1, n2, tol; n_shared=1, separate_Ainv_B=false
     end
 end
 
-function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, separate_Ainv_B=false)
+function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, periodic=false,
+                                  separate_Ainv_B=false)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
         shared_rank, allocate_array, local_win_store = get_comms(n_shared)
 
@@ -477,7 +597,7 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, separate_Ainv_B=f
         this_D = @view this_M[top_block_total_size+1:top_block_total_size+bottom_block_total_size,
                               top_block_total_size+1:top_block_total_size+bottom_block_total_size]
 
-        # Split first dimension among distributed ranks.
+        # Split first two dimensions among distributed ranks.
         top_chunks, top_chunk_lower_boundaries, top_chunk_upper_boundaries =
             get_distributed_slices([first_dim_distributed_nproc,
                                     second_dim_distributed_nproc],
@@ -556,10 +676,37 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, separate_Ainv_B=f
                this_bottom_chunk, top_chunks, bottom_chunks
     end
 
+    A = @view M[1:top_block_total_size,1:top_block_total_size]
+    B = @view M[1:top_block_total_size,top_block_total_size+1:end]
+    C = @view M[top_block_total_size+1:end,1:top_block_total_size]
+    D = @view M[top_block_total_size+1:end,top_block_total_size+1:end]
     u = @view b[1:top_block_total_size]
     v = @view b[top_block_total_size+1:end]
     x = @view z[1:top_block_total_size]
     y = @view z[top_block_total_size+1:end]
+
+    if periodic
+        top_block_sizes, _ = get_fe_sizes(n1, n2, n3)
+        n_first_dim = top_block_sizes[1]
+        n_second_dim = top_block_sizes[2]
+        n_third_dim = top_block_sizes[3]
+        # Make RHS vectors periodic in the first two dimensions.
+        function enforce_rhs_periodicity()
+            if shared_rank == 0
+                # Periodicity in first dimension.
+                @views u[end-n_third_dim*n_second_dim+1:end] .= u[1:n_third_dim*n_second_dim]
+                @views v[end-n_second_dim+1:end] .= v[1:n_second_dim]
+                # Periodicity in second dimension.
+                for i_other ∈ 1:n_third_dim
+                    @views u[n_third_dim*(n_second_dim-1)+i_other:n_third_dim*n_second_dim:end] .=
+                        u[i_other:n_third_dim*n_second_dim:end]
+                end
+                @views v[n_second_dim:n_second_dim:end] .= v[1:n_second_dim:end]
+            end
+            shared_comm !== nothing && MPI.Barrier(shared_comm)
+        end
+        enforce_rhs_periodicity()
+    end
 
     # This process owns the rows/columns corresponding to top_chunk_slice and
     # bottom_chunk_slice.
@@ -570,20 +717,170 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, separate_Ainv_B=f
     local_x = @view x[top_chunk_slice]
     local_y = @view y[bottom_chunk_slice]
 
+    if periodic
+        periodic_top_vector_global_inds = collect(1:top_block_total_size)
+        periodic_bottom_vector_global_inds = collect(1:bottom_block_total_size)
+        # Periodicity in first dimension.
+        @views periodic_top_vector_global_inds[end-n_third_dim*n_second_dim+1:end] .=
+            periodic_top_vector_global_inds[1:n_third_dim*n_second_dim]
+        @views periodic_bottom_vector_global_inds[end-n_second_dim+1:end] .=
+            periodic_bottom_vector_global_inds[1:n_second_dim]
+        # Periodicity in second dimension.
+        for i_other ∈ 1:n_third_dim
+            @views periodic_top_vector_global_inds[n_third_dim*(n_second_dim-1)+i_other:n_third_dim*n_second_dim:end] .=
+                periodic_top_vector_global_inds[i_other:n_third_dim*n_second_dim:end]
+        end
+        @views periodic_bottom_vector_global_inds[n_second_dim:n_second_dim:end] .=
+            periodic_bottom_vector_global_inds[1:n_second_dim:end]
+        # Periodicity in third dimension.
+        for i_first ∈ 1:n_first_dim, i_second ∈ 1:n_second_dim
+            offset = (i_first - 1) * n_second_dim * n_third_dim + (i_second - 1) * n_third_dim
+            periodic_top_vector_global_inds[offset + n_third_dim] = periodic_top_vector_global_inds[offset + 1]
+        end
+
+        # The first occurence of any repeated index will always be the lower-boundary
+        # point, which is the one we will want to keep in the 'assembled' matrices/vectors
+        # below. The first occurence is the one kept by `unique()`, with the order of
+        # entries otherwise maintained.
+        unique_top_vector_global_inds = unique(periodic_top_vector_global_inds)
+        unique_bottom_vector_global_inds = unique(periodic_bottom_vector_global_inds)
+
+        top_chunk_global_inds = periodic_top_vector_global_inds[top_chunk_slice]
+        bottom_chunk_global_inds = periodic_bottom_vector_global_inds[bottom_chunk_slice]
+
+        if shared_rank == 0 && distributed_rank == 0
+            top_vector_unique_inds = Int64[]
+            for (i, inds) ∈ enumerate(CartesianIndices((n_third_dim, n_second_dim, n_first_dim)))
+                if inds[3] == n_first_dim || inds[2] == n_second_dim
+                    continue
+                end
+                push!(top_vector_unique_inds, i)
+            end
+            bottom_vector_unique_inds = Int64[]
+            for (i, inds) ∈ enumerate(CartesianIndices((n_second_dim, n_first_dim)))
+                if inds[2] == n_first_dim || inds[1] == n_second_dim
+                    continue
+                end
+                push!(bottom_vector_unique_inds, i)
+            end
+        end
+    else
+        top_chunk_global_inds = top_chunk_slice
+        bottom_chunk_global_inds = bottom_chunk_slice
+    end
+    function assemble_M(M)
+        if periodic
+            # Add all the upper-boundary entries (for every periodic dimension) to the
+            # lower-boundary entries, then select the sub-array with the upper-boundary
+            # points excluded.
+            if shared_rank == 0 && distributed_rank == 0
+                function add_periodic_row_entries!(x, idim, dim_sizes...)
+                    for (i, inds) ∈ enumerate(CartesianIndices(dim_sizes))
+                        if inds[idim] == 1
+                            # Get global ind of upper boundary
+                            iend = (dim_sizes[idim] - 1) * prod(dim_sizes[1:idim-1]; init=1)
+                            for d ∈ 1:length(dim_sizes)
+                                if d != idim
+                                    iend += (inds[d] - 1) * prod(dim_sizes[1:d-1]; init=1)
+                                end
+                            end
+                            iend += 1
+                            @views x[i,:] .+= x[iend,:]
+                        end
+                    end
+                end
+                function add_periodic_column_entries!(x, idim, dim_sizes...)
+                    for (i, inds) ∈ enumerate(CartesianIndices(dim_sizes))
+                        if inds[idim] == 1
+                            # Get global ind of upper boundary
+                            iend = (dim_sizes[idim] - 1) * prod(dim_sizes[1:idim-1]; init=1)
+                            for d ∈ 1:length(dim_sizes)
+                                if d != idim
+                                    iend += (inds[d] - 1) * prod(dim_sizes[1:d-1]; init=1)
+                                end
+                            end
+                            iend += 1
+                            @views x[:,i] .+= x[:,iend]
+                        end
+                    end
+                end
+                A_intermediate = copy(A)
+                add_periodic_row_entries!(A_intermediate, 1, n_third_dim, n_second_dim, n_first_dim)
+                add_periodic_row_entries!(A_intermediate, 2, n_third_dim, n_second_dim, n_first_dim)
+                add_periodic_row_entries!(A_intermediate, 3, n_third_dim, n_second_dim, n_first_dim)
+                A_intermediate = @view A_intermediate[unique_top_vector_global_inds,:]
+                add_periodic_column_entries!(A_intermediate, 1, n_third_dim, n_second_dim, n_first_dim)
+                add_periodic_column_entries!(A_intermediate, 2, n_third_dim, n_second_dim, n_first_dim)
+                add_periodic_column_entries!(A_intermediate, 3, n_third_dim, n_second_dim, n_first_dim)
+                A_assembled = @view A_intermediate[:,unique_top_vector_global_inds]
+
+                B_intermediate = copy(B)
+                add_periodic_row_entries!(B_intermediate, 1, n_third_dim, n_second_dim, n_first_dim)
+                add_periodic_row_entries!(B_intermediate, 2, n_third_dim, n_second_dim, n_first_dim)
+                add_periodic_row_entries!(B_intermediate, 3, n_third_dim, n_second_dim, n_first_dim)
+                B_intermediate = @view B_intermediate[unique_top_vector_global_inds,:]
+                add_periodic_column_entries!(B_intermediate, 1, n_second_dim, n_first_dim)
+                add_periodic_column_entries!(B_intermediate, 2, n_second_dim, n_first_dim)
+                B_assembled = @view B_intermediate[:,unique_bottom_vector_global_inds]
+
+                C_intermediate = copy(C)
+                add_periodic_row_entries!(C_intermediate, 1, n_second_dim, n_first_dim)
+                add_periodic_row_entries!(C_intermediate, 2, n_second_dim, n_first_dim)
+                C_intermediate = @view C_intermediate[unique_bottom_vector_global_inds,:]
+                add_periodic_column_entries!(C_intermediate, 1, n_third_dim, n_second_dim, n_first_dim)
+                add_periodic_column_entries!(C_intermediate, 2, n_third_dim, n_second_dim, n_first_dim)
+                add_periodic_column_entries!(C_intermediate, 3, n_third_dim, n_second_dim, n_first_dim)
+                C_assembled = @view C_intermediate[:,unique_top_vector_global_inds]
+
+                D_intermediate = copy(D)
+                add_periodic_row_entries!(D_intermediate, 1, n_second_dim, n_first_dim)
+                add_periodic_row_entries!(D_intermediate, 2, n_second_dim, n_first_dim)
+                D_intermediate = @view D_intermediate[unique_bottom_vector_global_inds,:]
+                add_periodic_column_entries!(D_intermediate, 1, n_second_dim, n_first_dim)
+                add_periodic_column_entries!(D_intermediate, 2, n_second_dim, n_first_dim)
+                D_assembled = @view D_intermediate[:,unique_bottom_vector_global_inds]
+
+                M_assembled = hvcat(2, A_assembled, B_assembled, C_assembled, D_assembled)
+            else
+                M_assembled = nothing
+            end
+        else
+            M_assembled = M
+        end
+        return M_assembled
+    end
+    function assemble_b(b)
+        if periodic
+            # Need to add up values from duplicated entries
+            if shared_rank ==0 && distributed_rank == 0
+                u_assembled = @view u[unique_top_vector_global_inds]
+                v_assembled = @view v[unique_bottom_vector_global_inds]
+                b_assembled = vcat(u_assembled, v_assembled)
+            else
+                b_assembled = nothing
+            end
+        else
+            b_assembled = b
+        end
+        return b_assembled
+    end
+
     bottom_vec_buffer = similar(y)
     global_y = similar(y)
 
-    Alu = @views FakeMPILU(local_A, top_chunk_slice, top_chunk_slice;
+    Alu = @views FakeMPILU(local_A, top_chunk_global_inds, top_chunk_global_inds;
                            comm=distributed_comm, shared_comm=shared_comm)
 
-    sc = mpi_schur_complement(Alu, local_B, local_C, local_D, top_chunk_slice,
-                              bottom_chunk_slice; distributed_comm=distributed_comm,
+    sc = mpi_schur_complement(Alu, local_B, local_C, local_D, top_chunk_global_inds,
+                              bottom_chunk_global_inds; distributed_comm=distributed_comm,
                               shared_comm=shared_comm, allocate_array=allocate_array,
                               separate_Ainv_B=separate_Ainv_B)
 
-    function test_once()
+    function test_once(M_assembled)
         ldiv!(local_x, local_y, sc, local_u, local_v)
         shared_comm !== nothing && MPI.Barrier(shared_comm)
+
+        b_assembled = assemble_b(b)
 
         if shared_rank == 0
             buffer_x = similar(local_x)
@@ -606,14 +903,51 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, separate_Ainv_B=f
 
             # Check if solution does give back original right-hand-side
             if distributed_rank == 0
-                @test isapprox(M * z, b; atol=tol)
+                if periodic
+                    function add_periodic_vector_entries!(x, idim, dim_sizes...)
+                        for (i, inds) ∈ enumerate(CartesianIndices(dim_sizes))
+                            if inds[idim] == 1
+                                # Get global ind of upper boundary
+                                iend = (dim_sizes[idim] - 1) * prod(dim_sizes[1:idim-1]; init=1)
+                                for d ∈ 1:length(dim_sizes)
+                                    if d != idim
+                                        iend += (inds[d] - 1) * prod(dim_sizes[1:d-1]; init=1)
+                                    end
+                                end
+                                iend += 1
+                                x[i] += x[iend]
+                            end
+                        end
+                    end
+                    M_times_z = M * z
+                    upper_check = @view M_times_z[1:top_block_total_size]
+                    lower_check = @view M_times_z[top_block_total_size+1:end]
+                    add_periodic_vector_entries!(upper_check, 1, n_third_dim, n_second_dim, n_first_dim)
+                    add_periodic_vector_entries!(upper_check, 2, n_third_dim, n_second_dim, n_first_dim)
+                    add_periodic_vector_entries!(upper_check, 3, n_third_dim, n_second_dim, n_first_dim)
+                    upper_assembled = upper_check[unique_top_vector_global_inds]
+                    add_periodic_vector_entries!(lower_check, 1, n_second_dim, n_first_dim)
+                    add_periodic_vector_entries!(lower_check, 2, n_second_dim, n_first_dim)
+                    lower_assembled = lower_check[unique_bottom_vector_global_inds]
+                    M_times_z_assembled = vcat(upper_assembled, lower_assembled)
 
-                lu_sol = M \ b
+                    x_check = @view z[1:top_block_total_size]
+                    y_check = @view z[top_block_total_size+1:end]
+                    x_assembled = x_check[unique_top_vector_global_inds]
+                    y_assembled = y_check[unique_bottom_vector_global_inds]
+                    z_assembled = vcat(x_assembled, y_assembled)
+                else
+                    M_times_z_assembled = M * z
+                    z_assembled = z
+                end
+                @test isapprox(M_times_z_assembled, b_assembled; atol=tol)
+
+                lu_sol = M_assembled \ b_assembled
                 # Sanity check that tolerance is appropriate by testing solution from
                 # LinearAlgebra's LU factorization.
-                @test isapprox(M * lu_sol, b; atol=tol)
+                @test isapprox(M_assembled * lu_sol, b_assembled; atol=tol)
                 # Compare our solution to the one from LinearAlgebra's LU factorization.
-                @test isapprox(z, lu_sol; rtol=tol)
+                @test isapprox(z_assembled, lu_sol; rtol=tol)
             end
 
             z .= 0.0
@@ -621,8 +955,10 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, separate_Ainv_B=f
         shared_comm !== nothing && MPI.Barrier(shared_comm)
     end
 
+    M_assembled = assemble_M(M)
+
     @testset "solve" begin
-        test_once()
+        test_once(M_assembled)
     end
 
     @testset "change b" begin
@@ -633,8 +969,11 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, separate_Ainv_B=f
             end
             MPI.Bcast!(b, distributed_comm; root=0)
         end
+        if periodic
+            enforce_rhs_periodicity()
+        end
         shared_comm !== nothing && MPI.Barrier(shared_comm)
-        test_once()
+        test_once(M_assembled)
     end
 
     @testset "change M" begin
@@ -642,17 +981,27 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, separate_Ainv_B=f
         M, _, _ = get_fe_like_matrix(n1, n2, n3; allocate_array=allocate_array, rng=rng,
                                      distributed_comm=distributed_comm,
                                      shared_comm=shared_comm, bottom_block_ndims=2)
+        A = @view M[1:top_block_total_size,1:top_block_total_size]
+        B = @view M[1:top_block_total_size,top_block_total_size+1:end]
+        C = @view M[top_block_total_size+1:end,1:top_block_total_size]
+        D = @view M[top_block_total_size+1:end,top_block_total_size+1:end]
+
+        M_assembled = assemble_M(M)
+
         if shared_rank == 0
             if distributed_rank == 0
                 b .= rand(rng, n)
             end
             MPI.Bcast!(b, distributed_comm; root=0)
         end
+        if periodic
+            enforce_rhs_periodicity()
+        end
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         local_A, local_B, local_C, local_D, _, _, _, _ = get_local_slices(M)
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         update_schur_complement!(sc, local_A, local_B, local_C, local_D)
-        test_once()
+        test_once(M_assembled)
     end
 
     @testset "change M, change b" begin
@@ -663,8 +1012,11 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, separate_Ainv_B=f
             end
             MPI.Bcast!(b, distributed_comm; root=0)
         end
+        if periodic
+            enforce_rhs_periodicity()
+        end
         shared_comm !== nothing && MPI.Barrier(shared_comm)
-        test_once()
+        test_once(M_assembled)
     end
     if local_win_store !== nothing
         # Free the MPI.Win objects, because if they are free'd by the garbage collector
@@ -680,7 +1032,8 @@ end
 # smaller coupled variable. Instead, the 'bottom vector' is chosen to be some entries that
 # make the remainder of the matrix block-diagonal parts (i.e. split into disconnected
 # parts).
-function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv_B=false)
+function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, periodic=false,
+                                      separate_Ainv_B=false)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
         shared_rank, allocate_array, local_win_store = get_comms(n_shared)
 
@@ -776,14 +1129,13 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
 
         # Make copy here so that we do not modify the original matrix.
         this_local_M = allocate_array(local_n, local_n)
-        this_local_M .= @view this_M[this_chunk,this_chunk]
-
         this_local_A = @view this_local_M[local_top_vector_local_inds,local_top_vector_local_inds]
         this_local_B = @view this_local_M[local_top_vector_local_inds,local_bottom_vector_local_inds]
         this_local_C = @view this_local_M[local_bottom_vector_local_inds,local_top_vector_local_inds]
         this_local_D = @view this_local_M[local_bottom_vector_local_inds,local_bottom_vector_local_inds]
 
         if shared_rank == 0
+            this_local_M .= @view this_M[this_chunk,this_chunk]
 
             # Overlap at top-left corners.
             if distributed_rank ÷ second_dim_distributed_nproc > 0
@@ -809,9 +1161,7 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
             check_M[local_bottom_vector_global_inds,local_top_vector_global_inds] .= this_local_C
             check_M[local_bottom_vector_global_inds,local_bottom_vector_global_inds] .= this_local_D
             MPI.Allreduce!(check_M, +, distributed_comm)
-            if !isapprox(M, check_M; atol=1.0e-15)
-                error("M and split/reassembled M differ. Extrema: $(extrema(M .- check_M))")
-            end
+            @test isapprox(M, check_M; atol=1.0e-15)
         end
 
         return this_local_A, this_local_B, this_local_C, this_local_D,
@@ -824,6 +1174,55 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
     x = @view z[top_vector_inds]
     y = @view z[bottom_vector_inds]
 
+    if periodic
+        block_sizes, _ = get_fe_sizes(nelement_list...)
+        n_first_dim = block_sizes[1]
+        n_second_dim = block_sizes[2]
+        n_third_dim = block_sizes[3]
+        # Make RHS vectors periodic in the first two dimensions.
+        function enforce_rhs_periodicity()
+            if shared_rank == 0
+                # Periodicity in first dimension.
+                @views b[end-n_third_dim*n_second_dim+1:end] .= b[1:n_third_dim*n_second_dim]
+                # Periodicity in second dimension.
+                for i_other ∈ 1:n_third_dim
+                    @views b[n_third_dim*(n_second_dim-1)+i_other:n_third_dim*n_second_dim:end] .=
+                        b[i_other:n_third_dim*n_second_dim:end]
+                end
+            end
+            shared_comm !== nothing && MPI.Barrier(shared_comm)
+        end
+        enforce_rhs_periodicity()
+
+        periodic_global_inds = collect(1:n)
+        # Periodicity in first dimension.
+        @views periodic_global_inds[end-n_third_dim*n_second_dim+1:end] .=
+            periodic_global_inds[1:n_third_dim*n_second_dim]
+        # Periodicity in second dimension.
+        for i_other ∈ 1:n_third_dim
+            @views periodic_global_inds[n_third_dim*(n_second_dim-1)+i_other:n_third_dim*n_second_dim:end] .=
+                periodic_global_inds[i_other:n_third_dim*n_second_dim:end]
+        end
+        # Periodicity in third dimension.
+        for i_first ∈ 1:n_first_dim, i_second ∈ 1:n_second_dim
+            offset = (i_first - 1) * n_second_dim * n_third_dim + (i_second - 1) * n_third_dim
+            periodic_global_inds[offset + n_third_dim] = periodic_global_inds[offset + 1]
+        end
+
+        # The first occurence of any repeated index will always be the lower-boundary
+        # point, which is the one we will want to keep in the 'assembled' matrices/vectors
+        # below. The first occurence is the one kept by `unique()`, with the order of
+        # entries otherwise maintained.
+        unique_global_inds = unique(periodic_global_inds)
+
+        periodic_top_vector_inds = periodic_global_inds[top_vector_inds]
+        periodic_bottom_vector_inds = periodic_global_inds[bottom_vector_inds]
+    else
+        periodic_global_inds = 1:n
+        periodic_top_vector_inds = top_vector_inds
+        periodic_bottom_vector_inds = bottom_vector_inds
+    end
+
     # This process owns the rows/columns corresponding to top_chunk_slice and
     # bottom_chunk_slice.
     # Note in this test it is more convenient to slice the local chunks of u/v/x/y
@@ -835,50 +1234,149 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
     local_x = @view z[top_chunk_slice]
     local_y = @view z[bottom_chunk_slice]
 
+    function assemble_M(M)
+        if periodic
+            # Add all the upper-boundary entries (for every periodic dimension) to the
+            # lower-boundary entries, then select the sub-array with the upper-boundary
+            # points excluded.
+            if shared_rank == 0 && distributed_rank == 0
+                function add_periodic_row_entries!(x, idim, dim_sizes...)
+                    for (i, inds) ∈ enumerate(CartesianIndices(dim_sizes))
+                        if inds[idim] == 1
+                            # Get global ind of upper boundary
+                            iend = (dim_sizes[idim] - 1) * prod(dim_sizes[1:idim-1]; init=1)
+                            for d ∈ 1:length(dim_sizes)
+                                if d != idim
+                                    iend += (inds[d] - 1) * prod(dim_sizes[1:d-1]; init=1)
+                                end
+                            end
+                            iend += 1
+                            @views x[i,:] .+= x[iend,:]
+                        end
+                    end
+                end
+                function add_periodic_column_entries!(x, idim, dim_sizes...)
+                    for (i, inds) ∈ enumerate(CartesianIndices(dim_sizes))
+                        if inds[idim] == 1
+                            # Get global ind of upper boundary
+                            iend = (dim_sizes[idim] - 1) * prod(dim_sizes[1:idim-1]; init=1)
+                            for d ∈ 1:length(dim_sizes)
+                                if d != idim
+                                    iend += (inds[d] - 1) * prod(dim_sizes[1:d-1]; init=1)
+                                end
+                            end
+                            iend += 1
+                            @views x[:,i] .+= x[:,iend]
+                        end
+                    end
+                end
+                M_intermediate = copy(M)
+                add_periodic_row_entries!(M_intermediate, 1, n_third_dim, n_second_dim, n_first_dim)
+                add_periodic_row_entries!(M_intermediate, 2, n_third_dim, n_second_dim, n_first_dim)
+                add_periodic_row_entries!(M_intermediate, 3, n_third_dim, n_second_dim, n_first_dim)
+                M_intermediate = @view M_intermediate[unique_global_inds,:]
+                add_periodic_column_entries!(M_intermediate, 1, n_third_dim, n_second_dim, n_first_dim)
+                add_periodic_column_entries!(M_intermediate, 2, n_third_dim, n_second_dim, n_first_dim)
+                add_periodic_column_entries!(M_intermediate, 3, n_third_dim, n_second_dim, n_first_dim)
+                M_assembled = @view M_intermediate[:,unique_global_inds]
+            else
+                M_assembled = nothing
+            end
+        else
+            M_assembled = M
+        end
+        return M_assembled
+    end
+    function assemble_b(b)
+        if periodic
+            # Need to add up values from duplicated entries
+            if shared_rank ==0 && distributed_rank == 0
+                b_assembled = @view b[unique_global_inds]
+            else
+                b_assembled = nothing
+            end
+        else
+            b_assembled = b
+        end
+        return b_assembled
+    end
+
     bottom_vec_buffer = similar(y)
     global_y = similar(y)
 
-    Alu = @views FakeMPILU(local_A, top_chunk_slice, top_chunk_slice;
-                           comm=distributed_comm, shared_comm=shared_comm)
+    Alu = FakeMPILU(local_A, periodic_global_inds[top_chunk_slice],
+                    periodic_global_inds[top_chunk_slice]; comm=distributed_comm,
+                    shared_comm=shared_comm)
 
-    sc = mpi_schur_complement(Alu, local_B, local_C, local_D, top_chunk_slice,
-                              bottom_chunk_slice; distributed_comm=distributed_comm,
-                              shared_comm=shared_comm, allocate_array=allocate_array,
+    sc = mpi_schur_complement(Alu, local_B, local_C, local_D,
+                              periodic_global_inds[top_chunk_slice],
+                              periodic_global_inds[bottom_chunk_slice];
+                              distributed_comm=distributed_comm, shared_comm=shared_comm,
+                              allocate_array=allocate_array,
                               separate_Ainv_B=separate_Ainv_B)
 
-    function test_once()
+    function test_once(M_assembled)
         ldiv!(local_x, local_y, sc, local_u, local_v)
         shared_comm !== nothing && MPI.Barrier(shared_comm)
 
+        b_assembled = assemble_b(b)
+
         if shared_rank == 0
-            buffer_x = similar(local_x)
-            buffer_y = similar(local_y)
             if distributed_rank == 0
                 for iproc ∈ 2:distributed_nproc
+                    buffer_x = similar(local_x, size(all_top_chunks[iproc])...)
+                    buffer_y = similar(local_y, size(all_bottom_chunks[iproc])...)
                     @views MPI.Recv!(buffer_x, distributed_comm;
                                      source=iproc-1)
-                    x[all_top_chunks[iproc]] .= buffer_x
+                    z[all_top_chunks[iproc]] .= buffer_x
                     @views MPI.Recv!(buffer_y, distributed_comm;
                                      source=iproc-1)
-                    y[all_bottom_chunks[iproc]] .= buffer_y
+                    z[all_bottom_chunks[iproc]] .= buffer_y
                 end
             else
-                buffer_x .= local_x
+                buffer_x = Vector(local_x)
                 @views MPI.Send(buffer_x, distributed_comm; dest=0)
-                buffer_y .= local_y
+                buffer_y = Vector(local_y)
                 @views MPI.Send(buffer_y, distributed_comm; dest=0)
             end
 
             # Check if solution does give back original right-hand-side
             if distributed_rank == 0
-                @test isapprox(M * z, b; atol=tol)
+                if periodic
+                    function add_periodic_vector_entries!(x, idim, dim_sizes...)
+                        for (i, inds) ∈ enumerate(CartesianIndices(dim_sizes))
+                            if inds[idim] == 1
+                                # Get global ind of upper boundary
+                                iend = (dim_sizes[idim] - 1) * prod(dim_sizes[1:idim-1]; init=1)
+                                for d ∈ 1:length(dim_sizes)
+                                    if d != idim
+                                        iend += (inds[d] - 1) * prod(dim_sizes[1:d-1]; init=1)
+                                    end
+                                end
+                                iend += 1
+                                x[i] += x[iend]
+                            end
+                        end
+                    end
+                    M_times_z = M * z
+                    add_periodic_vector_entries!(M_times_z, 1, n_third_dim, n_second_dim, n_first_dim)
+                    add_periodic_vector_entries!(M_times_z, 2, n_third_dim, n_second_dim, n_first_dim)
+                    add_periodic_vector_entries!(M_times_z, 3, n_third_dim, n_second_dim, n_first_dim)
+                    M_times_z_assembled = M_times_z[unique_global_inds]
 
-                lu_sol = M \ b
+                    z_assembled = z[unique_global_inds]
+                else
+                    M_times_z_assembled = M * z
+                    z_assembled = z
+                end
+                @test isapprox(M_times_z_assembled, b_assembled; atol=tol)
+
+                lu_sol = M_assembled \ b_assembled
                 # Sanity check that tolerance is appropriate by testing solution from
                 # LinearAlgebra's LU factorization.
-                @test isapprox(M * lu_sol, b; atol=tol)
+                @test isapprox(M_assembled * lu_sol, b_assembled; atol=tol)
                 # Compare our solution to the one from LinearAlgebra's LU factorization.
-                @test isapprox(z, lu_sol; rtol=tol)
+                @test isapprox(z_assembled, lu_sol; rtol=tol)
             end
 
             z .= 0.0
@@ -886,8 +1384,10 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
         shared_comm !== nothing && MPI.Barrier(shared_comm)
     end
 
+    M_assembled = assemble_M(M)
+
     @testset "solve" begin
-        test_once()
+        test_once(M_assembled)
     end
 
     @testset "change b" begin
@@ -898,8 +1398,11 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
             end
             MPI.Bcast!(b, distributed_comm; root=0)
         end
+        if periodic
+            enforce_rhs_periodicity()
+        end
         shared_comm !== nothing && MPI.Barrier(shared_comm)
-        test_once()
+        test_once(M_assembled)
     end
 
     @testset "change M" begin
@@ -907,17 +1410,23 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
         M, _, _ = get_fe_like_matrix(nelement_list...; allocate_array=allocate_array,
                                      rng=rng, distributed_comm=distributed_comm,
                                      shared_comm=shared_comm, bottom_block_ndims=nothing)
+
+        M_assembled = assemble_M(M)
+
         if shared_rank == 0
             if distributed_rank == 0
                 b .= rand(rng, n)
             end
             MPI.Bcast!(b, distributed_comm; root=0)
         end
+        if periodic
+            enforce_rhs_periodicity()
+        end
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         local_A, local_B, local_C, local_D, _, _, _, _ = get_local_slices(M)
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         update_schur_complement!(sc, local_A, local_B, local_C, local_D)
-        test_once()
+        test_once(M_assembled)
     end
 
     @testset "change M, change b" begin
@@ -928,8 +1437,11 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, separate_Ainv
             end
             MPI.Bcast!(b, distributed_comm; root=0)
         end
+        if periodic
+            enforce_rhs_periodicity()
+        end
         shared_comm !== nothing && MPI.Barrier(shared_comm)
-        test_once()
+        test_once(M_assembled)
     end
     if local_win_store !== nothing
         # Free the MPI.Win objects, because if they are free'd by the garbage collector
@@ -948,15 +1460,16 @@ function finite_element_tests()
             n_shared = 1
             while n_shared ≤ nproc
                 n_distributed = nproc ÷ n_shared
-                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, separate_Ainv_B=$separate_Ainv_B" for (n1,n2,tol) ∈ (
-                        (max(2, n_distributed), max(2, n_distributed), 1.0e-11),
+                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B" for (n1,n2,tol) ∈ (
+                        (max(2, n_distributed), max(2, n_distributed), 3.0e-11),
                         (16, 8, 1.0e-9),
                         (24, 32, 3.0e-8),
-                       ), separate_Ainv_B ∈ (true, false)
+                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true)
                     # Note that here n1 and n2 are numbers of elements, not total grid sizes.
                     # Total grid sizes are
                     # (n1*(ngrid-1)+1)*(n2*(ngrid-1)+1)=(n1*2+1)*(n2*2+1).
                     finite_element_1D1V_test(n1, n2, tol; n_shared=n_shared,
+                                             periodic=periodic,
                                              separate_Ainv_B=separate_Ainv_B)
                 end
                 n_shared *= 2
@@ -966,12 +1479,13 @@ function finite_element_tests()
             n_shared = 1
             while n_shared ≤ nproc
                 n_distributed = nproc ÷ n_shared
-                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, separate_Ainv_B=$separate_Ainv_B" for (n1,n2,tol) ∈ (
-                        (max(2, n_distributed), max(2, n_distributed), 3.0e-9),
+                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B" for (n1,n2,tol) ∈ (
+                        (max(2, n_distributed), max(2, n_distributed), 2.0e-8),
                         (8, 4, 3.0e-8),
-                        (4, 12, 1.0e-9),
-                       ), separate_Ainv_B ∈ (false, true)
+                        (4, 12, 5.0e-9),
+                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true)
                     finite_element_2D1V_test(n1, n2, 3, tol; n_shared=n_shared,
+                                             periodic=periodic,
                                              separate_Ainv_B=separate_Ainv_B)
                 end
                 n_shared *= 2
@@ -981,8 +1495,8 @@ function finite_element_tests()
             n_shared = 1
             while n_shared ≤ nproc
                 n_distributed = nproc ÷ n_shared
-                tol = 1.0e-11
-                @testset "n_shared=$n_shared ($s1,$s2,$s3), separate_Ainv_B=$separate_Ainv_B" for (s1,s2,s3) ∈ (
+                tol = 3.0e-9
+                @testset "n_shared=$n_shared ($s1,$s2,$s3), periodic=$periodic, separate_Ainv_B=$separate_Ainv_B" for (s1,s2,s3) ∈ (
                         (1, 1, 2),
                         (1, 1, 4),
                         (1, 2, 1),
@@ -1009,8 +1523,9 @@ function finite_element_tests()
                         (4, 4, 1),
                         (4, 4, 2),
                         (4, 4, 4),
-                       ), separate_Ainv_B ∈ (false, true)
+                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true)
                     finite_element_3D_split_test(s1, s2, s3, tol; n_shared=n_shared,
+                                                 periodic=periodic,
                                                  separate_Ainv_B=separate_Ainv_B)
                 end
                 n_shared *= 2
