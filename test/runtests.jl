@@ -9,8 +9,8 @@ using StableRNGs
 using Test
 
 using MPISchurComplements
+using MPISchurComplements.FakeMPILUs
 
-include("FakeMPILUs.jl")
 include("utils.jl")
 include("simple_matrix.jl")
 include("finite_element.jl")
