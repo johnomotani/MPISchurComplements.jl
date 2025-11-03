@@ -57,7 +57,7 @@ mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,
     top_vec_global_size::Int64
     bottom_vec_global_size::Int64
     owned_top_vector_entries::Trange
-    local_top_vector_range::Trange
+    local_top_vector_range::UnitRange{Int64}
     local_top_vector_overlaps::Vector{Trange}
     local_top_vector_repeats::Matrix{Int64}
     B_overlap_buffers_send::TBob
@@ -67,7 +67,7 @@ mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,
     unique_bottom_vector_entries::Trange
     global_bottom_vector_range::Trange
     global_bottom_vector_entries_no_overlap::Trange
-    local_bottom_vector_range::Trange
+    local_bottom_vector_range::UnitRange{Int64}
     local_bottom_vector_entries_no_overlap::Trangeno
     local_bottom_vector_unique_entries::Vector{Int64}
     local_bottom_vector_repeats::Matrix{Int64}
@@ -594,9 +594,9 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     if shared_comm === nothing
         synchronize_shared = ()->nothing
         schur_complement_local_range = collect(1:bottom_vec_global_size)
-        local_top_vector_range = collect(1:top_vec_local_size)
+        local_top_vector_range = 1:top_vec_local_size
         global_bottom_vector_range = owned_bottom_vector_entries
-        local_bottom_vector_range = collect(1:bottom_vec_local_size)
+        local_bottom_vector_range = 1:bottom_vec_local_size
         global_bottom_vector_entries_no_overlap = owned_bottom_vector_entries_no_overlap
         local_bottom_vector_entries_no_overlap =
             find_local_vector_inds(owned_bottom_vector_entries_no_overlap,
@@ -648,9 +648,9 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
         _, schur_complement_local_range = get_shared_ranges(collect(1:bottom_vec_global_size),
                                                             collect(1:bottom_vec_global_size))
         _, local_top_vector_range = get_shared_ranges(owned_top_vector_entries,
-                                                      collect(1:top_vec_local_size))
+                                                      1:top_vec_local_size)
         global_bottom_vector_range, local_bottom_vector_range =
-            get_shared_ranges(owned_bottom_vector_entries, collect(1:bottom_vec_local_size))
+            get_shared_ranges(owned_bottom_vector_entries, 1:bottom_vec_local_size)
         global_bottom_vector_entries_no_overlap, local_bottom_vector_entries_no_overlap =
             get_shared_partial_entries(owned_bottom_vector_entries_no_overlap,
                                        find_local_vector_inds(owned_bottom_vector_entries_no_overlap,
