@@ -1,5 +1,5 @@
 # MPISchurComplements.jl
 
 ```@autodocs
-Modules = [MPISchurComplements]
+Modules = [MPISchurComplements, MPISchurComplements.FakeMPILUs]
 ```
