@@ -1129,6 +1129,11 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
 
     return nothing
 end
+# Due to the use of intermediate buffer arrays, there is no chance of aliasing errors when
+# returning the result in the input vectors, so just forward to the 5-argument function.
+function ldiv!(sc::MPISchurComplement, u::AbstractVector, v::AbstractVector)
+    return ldiv!(u, v, sc, u, v)
+end
 
 # Import FakeMPILUs to make it available for prototyping/testing in other packages.
 # Not exported as part of public interface because it shouldn't be used in 'production'.

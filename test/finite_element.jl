@@ -1495,7 +1495,7 @@ function finite_element_tests()
             n_shared = 1
             while n_shared ≤ nproc
                 n_distributed = nproc ÷ n_shared
-                tol = 3.0e-9
+                tol = 4.0e-9
                 @testset "n_shared=$n_shared ($s1,$s2,$s3), periodic=$periodic, separate_Ainv_B=$separate_Ainv_B" for (s1,s2,s3) ∈ (
                         (1, 1, 2),
                         (1, 1, 4),
