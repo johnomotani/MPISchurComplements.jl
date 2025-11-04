@@ -315,6 +315,11 @@ multiplying by the dense `Ainv_dot_B`. If `separate_Ainv_B=true` is passed, this
 done (requires `use_sparse=true`). There is no saving in setup time because `Ainv_dot_B`
 still has to be calculated, to be multiplied by `C` when calculating `schur_complement`.
 There is also no memory saving as a dense B-sized buffer array is needed.
+
+`skip_factorization=true` can be passed to create an MPISchurComplement instance without
+calculating the factorization corresponding to the input matrices. `ldiv!()` called with
+this instance will give incorrect results unless `update_schur_complement!()` is called
+first.
 """
 function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMatrix,
                               D::AbstractMatrix,
@@ -327,7 +332,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                               shared_comm::Union{MPI.Comm,Nothing}=nothing,
                               allocate_array::Union{Function,Nothing}=nothing,
                               synchronize_shared::Union{Function,Nothing}=nothing,
-                              use_sparse=true, separate_Ainv_B=false)
+                              use_sparse=true, separate_Ainv_B=false,
+                              skip_factorization=false)
 
     data_type = eltype(D)
 
@@ -785,7 +791,9 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                                           shared_rank, synchronize_shared, use_sparse,
                                           separate_Ainv_B)
 
-    update_schur_complement!(sc_factorization, missing, B, C, D)
+    if !skip_factorization
+        update_schur_complement!(sc_factorization, missing, B, C, D)
+    end
 
     return sc_factorization
 end

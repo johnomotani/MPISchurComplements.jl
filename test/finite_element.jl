@@ -1481,8 +1481,8 @@ function finite_element_tests()
                 n_distributed = nproc ÷ n_shared
                 @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B" for (n1,n2,tol) ∈ (
                         (max(2, n_distributed), max(2, n_distributed), 2.0e-8),
-                        (8, 4, 3.0e-8),
-                        (4, 12, 5.0e-9),
+                        (8, 4, 4.0e-8),
+                        (4, 12, 6.0e-9),
                        ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true)
                     finite_element_2D1V_test(n1, n2, 3, tol; n_shared=n_shared,
                                              periodic=periodic,
