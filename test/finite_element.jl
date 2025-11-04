@@ -457,10 +457,9 @@ function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
                     x_check = @view z[1:top_block_total_size]
                     y_check = @view z[top_block_total_size+1:end]
                     x_assembled = x_check[1:end-n_other_dims]
-                    @test isapprox(x_assembled[1:n_other_dims],
-                                   x_check[end-n_other_dims+1:end]; atol=1.0e-12)
+                    @test x_assembled[1:n_other_dims] == x_check[end-n_other_dims+1:end]
                     y_assembled = y_check[1:end-1]
-                    @test isapprox(y_assembled[1], y_check[end]; atol=1.0e-13)
+                    @test y_assembled[1] == y_check[end]
                     z_assembled = vcat(x_assembled, y_assembled)
                 else
                     M_times_z_assembled = M * z

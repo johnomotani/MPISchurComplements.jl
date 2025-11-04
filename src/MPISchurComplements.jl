@@ -58,6 +58,7 @@ mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,
     bottom_vec_global_size::Int64
     owned_top_vector_entries::Trange
     local_top_vector_range::UnitRange{Int64}
+    local_top_vector_unique_entries::Trange
     local_top_vector_overlaps::Vector{Trange}
     local_top_vector_repeats::Matrix{Int64}
     B_overlap_buffers_send::TBob
@@ -445,6 +446,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     else
         top_vec_global_size = nothing
         bottom_vec_global_size = nothing
+        unique_top_vector_entries = nothing
+        local_top_vector_unique_entries = nothing
         local_top_vector_overlaps = Trange[]
         local_top_vector_repeats = nothing
         overlap_ranks = Int64[]
@@ -498,6 +501,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
         local_top_vector_repeats = shared_broadcast_matrix(local_top_vector_repeats)
         bottom_vec_global_size = shared_broadcast_int(bottom_vec_global_size)
         owned_top_vector_entries = shared_broadcast_range(owned_top_vector_entries)
+        unique_top_vector_entries = shared_broadcast_range(unique_top_vector_entries)
+        local_top_vector_unique_entries = shared_broadcast_range(local_top_vector_unique_entries)
         owned_bottom_vector_entries = shared_broadcast_range(owned_bottom_vector_entries)
         owned_bottom_vector_entries_no_overlap = shared_broadcast_range(owned_bottom_vector_entries_no_overlap)
         unique_bottom_vector_entries = shared_broadcast_range(unique_bottom_vector_entries)
@@ -649,6 +654,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                                                             collect(1:bottom_vec_global_size))
         _, local_top_vector_range = get_shared_ranges(owned_top_vector_entries,
                                                       1:top_vec_local_size)
+        _, local_top_vector_unique_entries = get_shared_ranges(unique_top_vector_entries,
+                                                               local_top_vector_unique_entries)
         global_bottom_vector_range, local_bottom_vector_range =
             get_shared_ranges(owned_bottom_vector_entries, 1:bottom_vec_local_size)
         global_bottom_vector_entries_no_overlap, local_bottom_vector_entries_no_overlap =
@@ -669,7 +676,9 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     else
         # Store the chunk of Ainv_dot_B needed by this shared-memory process as a contiguous
         # array.
-        Ainv_dot_B_local = Matrix{data_type}(undef, length(local_top_vector_range), bottom_vec_global_size)
+        Ainv_dot_B_local = Matrix{data_type}(undef,
+                                             length(local_top_vector_unique_entries),
+                                             bottom_vec_global_size)
         B_local = nothing
     end
     Ainv_dot_u = allocate_array(top_vec_local_size)
@@ -704,6 +713,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                                           bottom_vec_global_size,
                                           owned_top_vector_entries,
                                           local_top_vector_range,
+                                          local_top_vector_unique_entries,
                                           local_top_vector_overlaps,
                                           local_top_vector_repeats,
                                           B_overlap_buffers_send, B_overlap_buffers_recv,
@@ -766,6 +776,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
     local_bottom_vector_unique_entries = sc.local_bottom_vector_unique_entries
     local_bottom_vector_repeats = sc.local_bottom_vector_repeats
     local_top_vector_range = sc.local_top_vector_range
+    local_top_vector_unique_entries = sc.local_top_vector_unique_entries
     local_top_vector_overlaps = sc.local_top_vector_overlaps
     B_overlap_buffers_send = sc.B_overlap_buffers_send
     B_overlap_buffers_recv = sc.B_overlap_buffers_recv
@@ -842,7 +853,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
 
     # At this point `Ainv_dot_B` contains the dense array of `B`.
     if separate_Ainv_B
-        sc.B = @views sparse(Ainv_dot_B[local_top_vector_range,:])
+        sc.B = @views sparse(Ainv_dot_B[local_top_vector_unique_entries,:])
         synchronize_shared()
     end
     ldiv!(A_factorization, Ainv_dot_B)
@@ -881,7 +892,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
     # Read out the local entries of `Ainv_dot_B` here, rather than just after `Ainv_dot_B`
     # is calculated, in order to avoid adding another `synchronize_shared()` call.
     if !separate_Ainv_B
-        Ainv_dot_B_local .= Ainv_dot_B[local_top_vector_range,:]
+        @views Ainv_dot_B_local .= Ainv_dot_B[local_top_vector_unique_entries,:]
     end
 
     # We store locally all columns in `Ainv_dot_B` (only local rows) and all rows of `C`
@@ -990,6 +1001,8 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
     Ainv_dot_u = sc.Ainv_dot_u
     top_vec_buffer = sc.top_vec_buffer
     local_top_vector_range = sc.local_top_vector_range
+    local_top_vector_unique_entries = sc.local_top_vector_unique_entries
+    local_top_vector_repeats = sc.local_top_vector_repeats
     bottom_vec_buffer = sc.bottom_vec_buffer
     global_bottom_vector_range = sc.global_bottom_vector_range
     global_bottom_vector_entries_no_overlap = sc.global_bottom_vector_entries_no_overlap
@@ -1031,13 +1044,31 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
     if sc.separate_Ainv_B
         # B_local is a sparse matrix, so this might sometimes be numerically cheaper than
         # multiplying by a dense, precomputed Ainv_dot_B_local`.
-        @views mul!(top_vec_buffer[local_top_vector_range], sc.B, global_y)
+        @views mul!(top_vec_buffer[local_top_vector_unique_entries], sc.B, global_y)
         synchronize_shared()
+
+        # Fill in any repeated entries in `top_vec_buffer`. 'to' and 'from' are kinda
+        # back-to-front here because most of the time `vector_repeats` (and similar) are
+        # used to gather the repeats from the 'from' entries into the 'to' entries, but
+        # here we scatter them back in the other direction.
+        for (to, from) ∈ eachcol(local_top_vector_repeats)
+            top_vec_buffer[from] = top_vec_buffer[to]
+        end
+        synchronize_shared()
+
         ldiv!(A_factorization, top_vec_buffer)
-        synchronize_shared()
     else
-        @views mul!(top_vec_buffer[local_top_vector_range], Ainv_dot_B_local, global_y)
+        @views mul!(top_vec_buffer[local_top_vector_unique_entries], Ainv_dot_B_local, global_y)
+
+        # Fill in any repeated entries in `top_vec_buffer`. 'to' and 'from' are kinda
+        # back-to-front here because most of the time `vector_repeats` (and similar) are
+        # used to gather the repeats from the 'from' entries into the 'to' entries, but
+        # here we scatter them back in the other direction.
+        for (to, from) ∈ eachcol(local_top_vector_repeats)
+            top_vec_buffer[from] = top_vec_buffer[to]
+        end
     end
+    synchronize_shared()
     @views @. x[local_top_vector_range] = Ainv_dot_u[local_top_vector_range] - top_vec_buffer[local_top_vector_range]
 
     @views @. y[local_bottom_vector_range] = global_y[global_bottom_vector_range]
