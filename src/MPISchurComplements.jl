@@ -40,8 +40,8 @@ macro sc_timeit(timer, name, expr)
     end
 end
 
-mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,TBob,
-                                  Trangeno,Tscomm,Tsync,Ttimer}
+mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,TCAiu,TAiBy,Ttv,Tbv,
+                                  Tgy,TBob,Trangeno,Tscomm,Tsync,Ttimer}
     A_factorization::TA
     Ainv_dot_B::TAiB
     Ainv_dot_B_local::TAiBl
@@ -63,6 +63,8 @@ mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,
     schur_complement_factorization::TSCF
     schur_complement_local_range_partial::Trange
     Ainv_dot_u::TAiu
+    C_dot_Ainv_dot_u::TCAiu
+    Ainv_dot_B_dot_y::TAiBy
     top_vec_buffer::Ttv
     top_vec_local_size::Int64
     bottom_vec_buffer::Tbv
@@ -755,6 +757,9 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
         B_local = nothing
     end
     Ainv_dot_u = allocate_array(top_vec_local_size)
+    # C_dot_Ainv_dot_u is a purely local buffer.
+    C_dot_Ainv_dot_u = Vector{data_type}(undef, length(C_global_row_range))
+    Ainv_dot_B_dot_y = Vector{data_type}(undef, length(local_top_vector_unique_entries))
     schur_complement = allocate_array(bottom_vec_global_size, bottom_vec_global_size)
     top_vec_buffer = allocate_array(top_vec_local_size)
     bottom_vec_buffer = allocate_array(bottom_vec_global_size)
@@ -785,7 +790,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                                           schur_complement,
                                           schur_complement_factorization,
                                           schur_complement_local_range_partial,
-                                          Ainv_dot_u, top_vec_buffer, top_vec_local_size,
+                                          Ainv_dot_u, C_dot_Ainv_dot_u, Ainv_dot_B_dot_y,
+                                          top_vec_buffer, top_vec_local_size,
                                           bottom_vec_buffer, bottom_vec_local_size,
                                           global_y, top_vec_global_size,
                                           bottom_vec_global_size,
@@ -1085,6 +1091,8 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
         Ainv_dot_B_local = sc.Ainv_dot_B_local
         schur_complement_factorization = sc.schur_complement_factorization
         Ainv_dot_u = sc.Ainv_dot_u
+        C_dot_Ainv_dot_u = sc.C_dot_Ainv_dot_u
+        Ainv_dot_B_dot_y = sc.Ainv_dot_B_dot_y
         top_vec_buffer = sc.top_vec_buffer
         local_top_vector_range_partial = sc.local_top_vector_range_partial
         local_top_vector_unique_entries_partial = sc.local_top_vector_unique_entries_partial
@@ -1109,7 +1117,8 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
             bottom_vec_buffer[schur_complement_local_range_partial] .= 0.0
             synchronize_shared()
             # Need all rows of C, but only the local columns - this is all that is stored in sc.C.
-            @views mul!(bottom_vec_buffer[sc.C_global_row_range_partial], sc.C, Ainv_dot_u, -1.0, 0.0)
+            mul!(C_dot_Ainv_dot_u, sc.C, Ainv_dot_u, -1.0, 0.0)
+            @views bottom_vec_buffer[sc.C_global_row_range_partial] .= C_dot_Ainv_dot_u
             synchronize_shared()
 
             # Only have the local entries of v, so add those to the local entries in
@@ -1139,7 +1148,8 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
             if sc.separate_Ainv_B
                 # B_local is a sparse matrix, so this might sometimes be numerically cheaper than
                 # multiplying by a dense, precomputed Ainv_dot_B_local`.
-                @views mul!(top_vec_buffer[local_top_vector_unique_entries_partial], sc.B, global_y)
+                mul!(Ainv_dot_B_dot_y, sc.B, global_y)
+                @views top_vec_buffer[local_top_vector_unique_entries_partial] .= Ainv_dot_B_dot_y
 
                 # Fill in any repeated entries in `top_vec_buffer`. 'to' and 'from' are kinda
                 # back-to-front here because most of the time `vector_repeats` (and similar) are
@@ -1155,7 +1165,8 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
 
                 ldiv!(A_factorization, top_vec_buffer)
             else
-                @views mul!(top_vec_buffer[local_top_vector_unique_entries_partial], Ainv_dot_B_local, global_y)
+                @views mul!(Ainv_dot_B_dot_y, Ainv_dot_B_local, global_y)
+                @views top_vec_buffer[local_top_vector_unique_entries_partial] .= Ainv_dot_B_dot_y
 
                 # Fill in any repeated entries in `top_vec_buffer`. 'to' and 'from' are kinda
                 # back-to-front here because most of the time `vector_repeats` (and similar) are
