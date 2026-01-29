@@ -39,15 +39,15 @@ mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,
     B_local_column_range::Trange
     B_local_column_repeats::Matrix{Int64}
     C::TC
-    C_global_row_range::Trange
-    C_local_row_range::Trange
+    C_global_row_range_partial::Trange
+    C_local_row_range_partial::Trange
     C_local_row_repeats::Matrix{Int64}
-    D_global_column_range::Trange
-    D_local_column_range::Trange
+    D_global_column_range_partial::Trange
+    D_local_column_range_partial::Trange
     D_local_column_repeats::Matrix{Int64}
     schur_complement::TSC
     schur_complement_factorization::TSCF
-    schur_complement_local_range::Trange
+    schur_complement_local_range_partial::Trange
     Ainv_dot_u::TAiu
     top_vec_buffer::Ttv
     top_vec_local_size::Int64
@@ -57,7 +57,7 @@ mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,
     top_vec_global_size::Int64
     bottom_vec_global_size::Int64
     owned_top_vector_entries::Trange
-    local_top_vector_range::UnitRange{Int64}
+    local_top_vector_range_partial::UnitRange{Int64}
     local_top_vector_overlaps::Vector{Trange}
     local_top_vector_repeats::Matrix{Int64}
     B_overlap_buffers_send::TBob
@@ -65,10 +65,10 @@ mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,Ttv,Tbv,Tgy,
     overlap_ranks::Vector{Int64}
     owned_bottom_vector_entries::Trange
     unique_bottom_vector_entries::Trange
-    global_bottom_vector_range::Trange
-    global_bottom_vector_entries_no_overlap::Trange
-    local_bottom_vector_range::UnitRange{Int64}
-    local_bottom_vector_entries_no_overlap::Trangeno
+    global_bottom_vector_range_partial::Trange
+    global_bottom_vector_entries_no_overlap_partial::Trange
+    local_bottom_vector_range_partial::UnitRange{Int64}
+    local_bottom_vector_entries_no_overlap_partial::Trangeno
     local_bottom_vector_unique_entries::Vector{Int64}
     local_bottom_vector_repeats::Matrix{Int64}
     distributed_comm::MPI.Comm
@@ -593,12 +593,17 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     # operations.
     if shared_comm === nothing
         synchronize_shared = ()->nothing
-        schur_complement_local_range = collect(1:bottom_vec_global_size)
-        local_top_vector_range = 1:top_vec_local_size
-        global_bottom_vector_range = owned_bottom_vector_entries
-        local_bottom_vector_range = 1:bottom_vec_local_size
-        global_bottom_vector_entries_no_overlap = owned_bottom_vector_entries_no_overlap
-        local_bottom_vector_entries_no_overlap =
+        C_global_row_range_partial= C_global_row_range
+        C_local_row_range_partial = C_local_row_range
+        D_global_column_range_partial = D_global_column_range
+        D_local_column_range_partial = D_local_column_range
+        schur_complement_local_range_partial = collect(1:bottom_vec_global_size)
+        local_top_vector_range_partial = 1:top_vec_local_size
+        local_top_vector_unique_entries_partial = local_top_vector_unique_entries
+        global_bottom_vector_range_partial = owned_bottom_vector_entries
+        local_bottom_vector_range_partial = 1:bottom_vec_local_size
+        global_bottom_vector_entries_no_overlap_partial = owned_bottom_vector_entries_no_overlap
+        local_bottom_vector_entries_no_overlap_partial =
             find_local_vector_inds(owned_bottom_vector_entries_no_overlap,
                                    owned_bottom_vector_entries)
     else
@@ -606,8 +611,15 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
             synchronize_shared = ()->MPI.Barrier(shared_comm)
         end
 
-        function get_shared_ranges(global_range, local_range)
-            # Select a subset of global_range that will be handled locally.
+        function get_shared_partial_ranges(global_range, local_range)
+            # Select a subset of global_range and local_range that will be handled
+            # locally.
+            if length(global_range) != length(local_range)
+                error("expected global_range and local_range to have the same lengths. "
+                      * "Got length(global_range)=$(length(global_range)), "
+                      * "length(local_range)=$(length(local_range)).")
+            end
+
             n = length(global_range)
             local_n_list = fill(n ÷ shared_nproc, shared_nproc)
             n_missing = n - sum(local_n_list)
@@ -641,17 +653,20 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
             return global_entries[imin:imax], local_entries[imin:imax]
         end
 
-        C_global_row_range, C_local_row_range = get_shared_ranges(C_global_row_range,
-                                                                  C_local_row_range)
-        D_global_column_range, D_local_column_range =
-            get_shared_ranges(D_global_column_range, D_local_column_range)
-        _, schur_complement_local_range = get_shared_ranges(collect(1:bottom_vec_global_size),
-                                                            collect(1:bottom_vec_global_size))
-        _, local_top_vector_range = get_shared_ranges(owned_top_vector_entries,
-                                                      1:top_vec_local_size)
-        global_bottom_vector_range, local_bottom_vector_range =
-            get_shared_ranges(owned_bottom_vector_entries, 1:bottom_vec_local_size)
-        global_bottom_vector_entries_no_overlap, local_bottom_vector_entries_no_overlap =
+        C_global_row_range_partial, C_local_row_range_partial =
+            get_shared_partial_ranges(C_global_row_range, C_local_row_range)
+        D_global_column_range_partial, D_local_column_range_partial =
+            get_shared_partial_ranges(D_global_column_range, D_local_column_range)
+        _, schur_complement_local_range_partial =
+            get_shared_partial_ranges(collect(1:bottom_vec_global_size),
+                                      collect(1:bottom_vec_global_size))
+        _, local_top_vector_range_partial =
+            get_shared_partial_ranges(owned_top_vector_entries, 1:top_vec_local_size)
+        global_bottom_vector_range_partial, local_bottom_vector_range_partial =
+            get_shared_partial_ranges(owned_bottom_vector_entries,
+                                      1:bottom_vec_local_size)
+        global_bottom_vector_entries_no_overlap_partial,
+        local_bottom_vector_entries_no_overlap_partial =
             get_shared_partial_entries(owned_bottom_vector_entries_no_overlap,
                                        find_local_vector_inds(owned_bottom_vector_entries_no_overlap,
                                                               owned_bottom_vector_entries))
@@ -669,7 +684,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     else
         # Store the chunk of Ainv_dot_B needed by this shared-memory process as a contiguous
         # array.
-        Ainv_dot_B_local = Matrix{data_type}(undef, length(local_top_vector_range), bottom_vec_global_size)
+        Ainv_dot_B_local = Matrix{data_type}(undef, length(local_top_vector_range_partial), bottom_vec_global_size)
         B_local = nothing
     end
     Ainv_dot_u = allocate_array(top_vec_local_size)
@@ -692,27 +707,28 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     sc_factorization = MPISchurComplement(A_factorization, Ainv_dot_B, Ainv_dot_B_local,
                                           B_local, B_global_column_range,
                                           B_local_column_range, B_local_column_repeats,
-                                          fake_C, C_global_row_range, C_local_row_range,
-                                          C_local_row_repeats, D_global_column_range,
-                                          D_local_column_range, D_local_column_repeats,
-                                          schur_complement,
+                                          fake_C, C_global_row_range_partial,
+                                          C_local_row_range_partial, C_local_row_repeats,
+                                          D_global_column_range_partial,
+                                          D_local_column_range_partial,
+                                          D_local_column_repeats, schur_complement,
                                           schur_complement_factorization,
-                                          schur_complement_local_range, Ainv_dot_u,
-                                          top_vec_buffer, top_vec_local_size,
+                                          schur_complement_local_range_partial,
+                                          Ainv_dot_u, top_vec_buffer, top_vec_local_size,
                                           bottom_vec_buffer, bottom_vec_local_size,
                                           global_y, top_vec_global_size,
                                           bottom_vec_global_size,
                                           owned_top_vector_entries,
-                                          local_top_vector_range,
+                                          local_top_vector_range_partial,
                                           local_top_vector_overlaps,
                                           local_top_vector_repeats,
                                           B_overlap_buffers_send, B_overlap_buffers_recv,
                                           overlap_ranks, owned_bottom_vector_entries,
                                           unique_bottom_vector_entries,
-                                          global_bottom_vector_range,
-                                          global_bottom_vector_entries_no_overlap,
-                                          local_bottom_vector_range,
-                                          local_bottom_vector_entries_no_overlap,
+                                          global_bottom_vector_range_partial,
+                                          global_bottom_vector_entries_no_overlap_partial,
+                                          local_bottom_vector_range_partial,
+                                          local_bottom_vector_entries_no_overlap_partial,
                                           local_bottom_vector_unique_entries,
                                           local_bottom_vector_repeats, distributed_comm,
                                           distributed_rank, shared_comm, shared_rank,
@@ -742,10 +758,10 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
     @boundscheck size(sc.Ainv_dot_B, 1) == size(B, 1) || error(BoundsError, " Number of rows in B does not match number of rows in original Ainv_dot_B")
     @boundscheck length(sc.B_local_column_range) + size(sc.B_local_column_repeats, 2) == size(B, 2) || error(BoundsError, " Number of columns in B does not match number of columns in original B")
     # Don't check size(C, 1) because we don't store the full row range. There will be an
-    # out of bounds error from indexing by sc.C_local_row_range if C is too small.
+    # out of bounds error from indexing by sc.C_local_row_range_partial if C is too small.
     @boundscheck sc.top_vec_local_size == size(C, 2) || error(BoundsError, " Number of columns in C does not match original C")
     @boundscheck length(sc.owned_bottom_vector_entries) == size(D, 1) || error(BoundsError, " Number of rows in D does not match number of locally owned bottom_vector_entries")
-    @boundscheck length(sc.D_local_column_range) == 0 || maximum(sc.D_local_column_range) ≤ size(D, 2) || error(BoundsError, " Number of columns in D is smaller than the largest index in D_local_column_range")
+    @boundscheck length(sc.D_local_column_range_partial) == 0 || maximum(sc.D_local_column_range_partial) ≤ size(D, 2) || error(BoundsError, " Number of columns in D is smaller than the largest index in D_local_column_range")
 
     A_factorization = sc.A_factorization
     Ainv_dot_B = sc.Ainv_dot_B
@@ -753,19 +769,19 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
     B_global_column_range = sc.B_global_column_range
     B_local_column_range = sc.B_local_column_range
     B_local_column_repeats = sc.B_local_column_repeats
-    C_global_row_range = sc.C_global_row_range
-    C_local_row_range = sc.C_local_row_range
+    C_global_row_range_partial = sc.C_global_row_range_partial
+    C_local_row_range_partial = sc.C_local_row_range_partial
     C_local_row_repeats = sc.C_local_row_repeats
-    D_global_column_range = sc.D_global_column_range
-    D_local_column_range = sc.D_local_column_range
+    D_global_column_range_partial = sc.D_global_column_range_partial
+    D_local_column_range_partial = sc.D_local_column_range_partial
     D_local_column_repeats = sc.D_local_column_repeats
     schur_complement = sc.schur_complement
-    schur_complement_local_range = sc.schur_complement_local_range
+    schur_complement_local_range_partial = sc.schur_complement_local_range_partial
     local_top_vector_repeats = sc.local_top_vector_repeats
     unique_bottom_vector_entries = sc.unique_bottom_vector_entries
     local_bottom_vector_unique_entries = sc.local_bottom_vector_unique_entries
     local_bottom_vector_repeats = sc.local_bottom_vector_repeats
-    local_top_vector_range = sc.local_top_vector_range
+    local_top_vector_range_partial = sc.local_top_vector_range_partial
     local_top_vector_overlaps = sc.local_top_vector_overlaps
     B_overlap_buffers_send = sc.B_overlap_buffers_send
     B_overlap_buffers_recv = sc.B_overlap_buffers_recv
@@ -806,9 +822,9 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
         end
         synchronize_shared()
     end
-    Ainv_dot_B[local_top_vector_range,:] .= 0
-    @views Ainv_dot_B[local_top_vector_range,B_global_column_range] .=
-        B[local_top_vector_range,B_local_column_range]
+    Ainv_dot_B[local_top_vector_range_partial,:] .= 0
+    @views Ainv_dot_B[local_top_vector_range_partial,B_global_column_range] .=
+        B[local_top_vector_range_partial,B_local_column_range]
     synchronize_shared()
     # Add up the rows of B that overlap between different subdomains (temporarily stored
     # in `Ainv_dot_B`).  Note only non-repeated points in the overlaps are communicated,
@@ -842,7 +858,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
 
     # At this point `Ainv_dot_B` contains the dense array of `B`.
     if separate_Ainv_B
-        sc.B = @views sparse(Ainv_dot_B[local_top_vector_range,:])
+        sc.B = @views sparse(Ainv_dot_B[local_top_vector_range_partial,:])
         synchronize_shared()
     end
     ldiv!(A_factorization, Ainv_dot_B)
@@ -850,7 +866,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
     # A representation of C is stored where no rows are repeated, so need to add up all
     # contributions from repeated row indices into a single row (that will then be
     # included in the stored `sc.C`, i.e. the 'to' rows are included in
-    # `sc.C_local_row_range` while the 'from' rows are not).
+    # `sc.C_local_row_range_partial` while the 'from' rows are not).
     if length(C_local_row_repeats) > 0
         if shared_rank == 0
             # Handle repeated columns in serial for now. Look at this again if it becomes a
@@ -863,32 +879,32 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
     end
     # When using shared memory, only store the slice of C that this process needs.
     if use_sparse
-        C = @view C[sc.C_local_row_range,:]
+        C = @view C[sc.C_local_row_range_partial,:]
         C = sparse(C)
     else
-        # Make a copy because C_local_row_range might not be a contiguous range of
+        # Make a copy because C_local_row_range_partial might not be a contiguous range of
         # indices, but performance will be better if `C` is a contiguously-allocated
         # array.
-        C = C[sc.C_local_row_range,:]
+        C = C[sc.C_local_row_range_partial,:]
     end
     sc.C = C
 
     # Initialise `schur_complement` to zero, because when `C` does not include all rows,
     # the matrix multiplication below would not initialise all elements.
-    schur_complement[:,schur_complement_local_range] .= 0.0
+    schur_complement[:,schur_complement_local_range_partial] .= 0.0
     synchronize_shared()
 
     # Read out the local entries of `Ainv_dot_B` here, rather than just after `Ainv_dot_B`
     # is calculated, in order to avoid adding another `synchronize_shared()` call.
     if !separate_Ainv_B
-        Ainv_dot_B_local .= Ainv_dot_B[local_top_vector_range,:]
+        Ainv_dot_B_local .= Ainv_dot_B[local_top_vector_range_partial,:]
     end
 
     # We store locally all columns in `Ainv_dot_B` (only local rows) and all rows of `C`
     # (only local columns). Therefore we can take the matrix product `Ainv_dot_B*C` with
     # the local chunks, then do a sum-reduce to get the final result. The
     # `schur_complement` buffer is full size on every rank.
-    @views mul!(schur_complement[C_global_row_range,:], C, Ainv_dot_B, -1.0, 0.0)
+    @views mul!(schur_complement[C_global_row_range_partial,:], C, Ainv_dot_B, -1.0, 0.0)
     synchronize_shared()
     # Only get the local rows for D, so just add these to the local rows of
     # `schur_complement`.
@@ -918,8 +934,8 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
         end
         synchronize_shared()
     end
-    @views @. schur_complement[unique_bottom_vector_entries,D_global_column_range] +=
-        D[local_bottom_vector_unique_entries,D_local_column_range]
+    @views @. schur_complement[unique_bottom_vector_entries,D_global_column_range_partial] +=
+        D[local_bottom_vector_unique_entries,D_local_column_range_partial]
     synchronize_shared()
     if shared_rank == 0
         MPI.Reduce!(schur_complement, +, distributed_comm; root=0)
@@ -989,29 +1005,29 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
     schur_complement_factorization = sc.schur_complement_factorization
     Ainv_dot_u = sc.Ainv_dot_u
     top_vec_buffer = sc.top_vec_buffer
-    local_top_vector_range = sc.local_top_vector_range
+    local_top_vector_range_partial = sc.local_top_vector_range_partial
     bottom_vec_buffer = sc.bottom_vec_buffer
-    global_bottom_vector_range = sc.global_bottom_vector_range
-    global_bottom_vector_entries_no_overlap = sc.global_bottom_vector_entries_no_overlap
-    local_bottom_vector_range = sc.local_bottom_vector_range
-    local_bottom_vector_entries_no_overlap = sc.local_bottom_vector_entries_no_overlap
-    schur_complement_local_range = sc.schur_complement_local_range
+    global_bottom_vector_range_partial = sc.global_bottom_vector_range_partial
+    global_bottom_vector_entries_no_overlap_partial = sc.global_bottom_vector_entries_no_overlap_partial
+    local_bottom_vector_range_partial = sc.local_bottom_vector_range_partial
+    local_bottom_vector_entries_no_overlap_partial = sc.local_bottom_vector_entries_no_overlap_partial
+    schur_complement_local_range_partial = sc.schur_complement_local_range_partial
     synchronize_shared = sc.synchronize_shared
 
     ldiv!(Ainv_dot_u, A_factorization, u)
 
     # Initialise to zero, because when C does not include all rows, the matrix
     # multiplication below would not initialise all elements.
-    bottom_vec_buffer[schur_complement_local_range] .= 0.0
+    bottom_vec_buffer[schur_complement_local_range_partial] .= 0.0
     synchronize_shared()
     # Need all rows of C, but only the local columns - this is all that is stored in sc.C.
-    @views mul!(bottom_vec_buffer[sc.C_global_row_range], sc.C, Ainv_dot_u, -1.0, 0.0)
+    @views mul!(bottom_vec_buffer[sc.C_global_row_range_partial], sc.C, Ainv_dot_u, -1.0, 0.0)
     synchronize_shared()
 
     # Only have the local entries of v, so add those to the local entries in
     # bottom_vec_buffer before recducing.
     # Need to avoid double counting of any overlapping entries in `v`.
-    @views @. bottom_vec_buffer[global_bottom_vector_entries_no_overlap] += v[local_bottom_vector_entries_no_overlap]
+    @views @. bottom_vec_buffer[global_bottom_vector_entries_no_overlap_partial] += v[local_bottom_vector_entries_no_overlap_partial]
     synchronize_shared()
 
     # `global_y` is solved in serial on the global rank-0 process, and then communicated
@@ -1031,16 +1047,16 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
     if sc.separate_Ainv_B
         # B_local is a sparse matrix, so this might sometimes be numerically cheaper than
         # multiplying by a dense, precomputed Ainv_dot_B_local`.
-        @views mul!(top_vec_buffer[local_top_vector_range], sc.B, global_y)
+        @views mul!(top_vec_buffer[local_top_vector_range_partial], sc.B, global_y)
         synchronize_shared()
         ldiv!(A_factorization, top_vec_buffer)
         synchronize_shared()
     else
-        @views mul!(top_vec_buffer[local_top_vector_range], Ainv_dot_B_local, global_y)
+        @views mul!(top_vec_buffer[local_top_vector_range_partial], Ainv_dot_B_local, global_y)
     end
-    @views @. x[local_top_vector_range] = Ainv_dot_u[local_top_vector_range] - top_vec_buffer[local_top_vector_range]
+    @views @. x[local_top_vector_range_partial] = Ainv_dot_u[local_top_vector_range_partial] - top_vec_buffer[local_top_vector_range_partial]
 
-    @views @. y[local_bottom_vector_range] = global_y[global_bottom_vector_range]
+    @views @. y[local_bottom_vector_range_partial] = global_y[global_bottom_vector_range_partial]
     synchronize_shared()
 
     return nothing
