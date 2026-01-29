@@ -764,7 +764,11 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     C_dot_Ainv_dot_u = Vector{data_type}(undef, length(C_global_row_range))
     C_dot_Ainv_dot_B = Matrix{data_type}(undef, length(C_global_row_range_partial),
                                          bottom_vec_global_size)
-    Ainv_dot_B_dot_y = Vector{data_type}(undef, length(local_top_vector_unique_entries))
+    if separate_Ainv_B
+        Ainv_dot_B_dot_y = Vector{data_type}(undef, length(local_top_vector_unique_entries))
+    else
+        Ainv_dot_B_dot_y = nothing
+    end
     schur_complement = allocate_array(bottom_vec_global_size, bottom_vec_global_size)
     top_vec_buffer = allocate_array(top_vec_local_size)
     bottom_vec_buffer = allocate_array(bottom_vec_global_size)
@@ -1158,12 +1162,8 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
             if sc.separate_Ainv_B
                 # B_local is a sparse matrix, so this might sometimes be numerically cheaper than
                 # multiplying by a dense, precomputed Ainv_dot_B_local`.
-                # See comments in `else` branch.
-                #mul!(Ainv_dot_B_dot_y, sc.B, global_y)
-                #top_vec_buffer[local_top_vector_unique_entries_partial] .= Ainv_dot_B_dot_y
-                for i ∈ local_top_vector_unique_entries_partial
-                    top_vec_buffer[i] = @views dot(Ainv_dot_B_local[:,i], global_y)
-                end
+                mul!(Ainv_dot_B_dot_y, sc.B, global_y)
+                top_vec_buffer[local_top_vector_unique_entries_partial] .= Ainv_dot_B_dot_y
 
                 # Fill in any repeated entries in `top_vec_buffer`. 'to' and 'from' are kinda
                 # back-to-front here because most of the time `vector_repeats` (and similar) are
@@ -1194,8 +1194,8 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
                 # memory), but should produce exactly consistent results for identical
                 # row/RHS inputs. The results then do not need to be communicated, which
                 # should more than compensate for any loss in performance of this step.
-                for i ∈ local_top_vector_unique_entries_partial
-                    top_vec_buffer[i] = @views dot(Ainv_dot_B_local[:,i], global_y)
+                for (count, i) ∈ enumerate(local_top_vector_unique_entries_partial)
+                    top_vec_buffer[i] = @views dot(Ainv_dot_B_local[:,count], global_y)
                 end
 
                 # Fill in any repeated entries in `top_vec_buffer`. 'to' and 'from' are kinda
