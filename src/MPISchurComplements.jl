@@ -761,11 +761,11 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     end
     Ainv_dot_u = allocate_array(top_vec_local_size)
     # C_dot_Ainv_dot_u and C_dot_Ainv_dot_B are purely local buffers.
-    C_dot_Ainv_dot_u = Vector{data_type}(undef, length(C_global_row_range))
+    C_dot_Ainv_dot_u = Vector{data_type}(undef, length(C_global_row_range_partial))
     C_dot_Ainv_dot_B = Matrix{data_type}(undef, length(C_global_row_range_partial),
                                          bottom_vec_global_size)
     if separate_Ainv_B
-        Ainv_dot_B_dot_y = Vector{data_type}(undef, length(local_top_vector_unique_entries))
+        Ainv_dot_B_dot_y = Vector{data_type}(undef, length(local_top_vector_unique_entries_partial))
     else
         Ainv_dot_B_dot_y = nothing
     end
