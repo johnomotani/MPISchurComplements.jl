@@ -230,7 +230,7 @@ function find_local_vector_inds(global_inds::AbstractArray, owned_global_inds)
     for (i, gind) ∈ enumerate(global_inds)
         # `owned_global_inds` is not necessarily sorted, so no obvious way to optimise
         # this.
-        local_inds[i] = @views findfirst(i->i==gind, owned_global_inds)
+        local_inds[i] = findfirst(i->i==gind, owned_global_inds)
     end
     return local_inds
 end
@@ -763,9 +763,11 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     else
         # Store the chunk of Ainv_dot_B needed by this shared-memory process as a contiguous
         # array.
-        Ainv_dot_B_local = Matrix{data_type}(undef,
-                                             length(local_top_vector_unique_entries_partial),
-                                             bottom_vec_global_size)
+        # Note that we need to transpose Ainv_dot_B_local for the slightly hacked
+        # matrix-vector multiply implementation used in `ldiv!()` to ensure consistency of
+        # results.
+        Ainv_dot_B_local = Matrix{data_type}(undef, bottom_vec_global_size,
+                                             length(local_top_vector_unique_entries_partial))
         B_local = nothing
     end
     Ainv_dot_u = allocate_array(top_vec_local_size)
@@ -773,7 +775,11 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     C_dot_Ainv_dot_u = Vector{data_type}(undef, length(C_global_row_range_partial))
     C_dot_Ainv_dot_B = Matrix{data_type}(undef, length(C_global_row_range_partial),
                                          bottom_vec_global_size)
-    Ainv_dot_B_dot_y = Vector{data_type}(undef, length(local_top_vector_unique_entries_partial))
+    if separate_Ainv_B
+        Ainv_dot_B_dot_y = Vector{data_type}(undef, length(local_top_vector_unique_entries_partial))
+    else
+        Ainv_dot_B_dot_y = nothing
+    end
     schur_complement = allocate_array(bottom_vec_global_size, bottom_vec_global_size)
     top_vec_buffer = allocate_array(top_vec_local_size)
     bottom_vec_buffer = allocate_array(bottom_vec_global_size)
@@ -1014,7 +1020,10 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             # Read out the local entries of `Ainv_dot_B` here, rather than just after `Ainv_dot_B`
             # is calculated, in order to avoid adding another `synchronize_shared()` call.
             if !separate_Ainv_B
-                @views Ainv_dot_B_local .= Ainv_dot_B[local_top_vector_unique_entries_partial,:]
+                # Note that we need to transpose Ainv_dot_B_local for the slightly hacked
+                # matrix-vector multiply implementation used in `ldiv!()` to ensure
+                # consistency of results.
+                @views Ainv_dot_B_local .= transpose(Ainv_dot_B[local_top_vector_unique_entries_partial,:])
             end
 
             # We store locally all columns in `Ainv_dot_B` (only local rows) and all rows of `C`
@@ -1144,7 +1153,7 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
             synchronize_shared()
             # Need all rows of C, but only the local columns - this is all that is stored in sc.C.
             mul!(C_dot_Ainv_dot_u, sc.C, Ainv_dot_u, -1.0, 0.0)
-            @views bottom_vec_buffer[sc.C_global_row_range_partial] .= C_dot_Ainv_dot_u
+            bottom_vec_buffer[sc.C_global_row_range_partial] .= C_dot_Ainv_dot_u
             synchronize_shared()
 
             # Only have the local entries of v, so add those to the local entries in
@@ -1175,7 +1184,7 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
                 # B_local is a sparse matrix, so this might sometimes be numerically cheaper than
                 # multiplying by a dense, precomputed Ainv_dot_B_local`.
                 mul!(Ainv_dot_B_dot_y, sc.B, global_y)
-                @views top_vec_buffer[local_top_vector_unique_entries_partial] .= Ainv_dot_B_dot_y
+                top_vec_buffer[local_top_vector_unique_entries_partial] .= Ainv_dot_B_dot_y
 
                 # Fill in any repeated entries in `top_vec_buffer`. 'to' and 'from' are kinda
                 # back-to-front here because most of the time `vector_repeats` (and similar) are
@@ -1191,8 +1200,24 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
 
                 ldiv!(A_factorization, top_vec_buffer)
             else
-                @views mul!(Ainv_dot_B_dot_y, Ainv_dot_B_local, global_y)
-                @views top_vec_buffer[local_top_vector_unique_entries_partial] .= Ainv_dot_B_dot_y
+                # This commented-out implementation should probably be the most
+                # performant, but may result in inconsistent floating-point errors in
+                # results that should be identical (i.e. identical rows and RHS, but the
+                # rows are in a different place in the matrix). This would mean that
+                # downstream code might have to communicate to ensure exact consistency of
+                # the results.
+                #mul!(Ainv_dot_B_dot_y, Ainv_dot_B_local, global_y)
+                #top_vec_buffer[local_top_vector_unique_entries_partial] .= Ainv_dot_B_dot_y
+                # The following implementation might be slightly less performant (although
+                # on a quick check in serial the difference is negligible - note that we
+                # have transposed Ainv_dot_B_local for this version for efficiency, so
+                # that the slice Ainv_dot_B_local[:,i] that we need is contiguous in
+                # memory), but should produce exactly consistent results for identical
+                # row/RHS inputs. The results then do not need to be communicated, which
+                # should more than compensate for any loss in performance of this step.
+                for (count, i) ∈ enumerate(local_top_vector_unique_entries_partial)
+                    top_vec_buffer[i] = @views dot(Ainv_dot_B_local[:,count], global_y)
+                end
 
                 # Fill in any repeated entries in `top_vec_buffer`. 'to' and 'from' are kinda
                 # back-to-front here because most of the time `vector_repeats` (and similar) are
