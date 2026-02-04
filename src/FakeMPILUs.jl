@@ -132,7 +132,8 @@ mutable struct FakeMPILU{T,TLU}
                        global_row_range::Union{UnitRange{Int64},Vector{Int64},Nothing}=nothing,
                        global_column_range::Union{UnitRange{Int64},Vector{Int64},Nothing}=nothing;
                        comm::MPI.Comm=MPI.COMM_WORLD,
-                       shared_comm::Union{MPI.Comm,Nothing}=nothing, use_sparse=false)
+                       shared_comm::Union{MPI.Comm,Nothing}=nothing, use_sparse=false,
+                       skip_factorization=false)
 
         if isa(global_row_range, UnitRange)
             global_row_range = collect(global_row_range)
@@ -165,9 +166,17 @@ mutable struct FakeMPILU{T,TLU}
                 gather_A(A_local, global_row_range, global_column_range, comm)
 
             if use_sparse
-                Alu = lu(sparse(A))
+                if skip_factorization
+                    Alu = lu(sparse(ones(1,1)))
+                else
+                    Alu = lu(sparse(A))
+                end
             else
-                Alu = lu(A)
+                if skip_factorization
+                    Alu = lu(ones(1,1))
+                else
+                    Alu = lu(A)
+                end
             end
 
             n, m = size(A)

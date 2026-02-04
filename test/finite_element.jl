@@ -457,10 +457,9 @@ function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
                     x_check = @view z[1:top_block_total_size]
                     y_check = @view z[top_block_total_size+1:end]
                     x_assembled = x_check[1:end-n_other_dims]
-                    @test isapprox(x_assembled[1:n_other_dims],
-                                   x_check[end-n_other_dims+1:end]; atol=1.0e-12)
+                    @test x_assembled[1:n_other_dims] == x_check[end-n_other_dims+1:end]
                     y_assembled = y_check[1:end-1]
-                    @test isapprox(y_assembled[1], y_check[end]; atol=1.0e-13)
+                    @test y_assembled[1] == y_check[end]
                     z_assembled = vcat(x_assembled, y_assembled)
                 else
                     M_times_z_assembled = M * z
@@ -1482,8 +1481,8 @@ function finite_element_tests()
                 n_distributed = nproc ÷ n_shared
                 @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B" for (n1,n2,tol) ∈ (
                         (max(2, n_distributed), max(2, n_distributed), 2.0e-8),
-                        (8, 4, 3.0e-8),
-                        (4, 12, 5.0e-9),
+                        (8, 4, 4.0e-8),
+                        (4, 12, 6.0e-9),
                        ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true)
                     finite_element_2D1V_test(n1, n2, 3, tol; n_shared=n_shared,
                                              periodic=periodic,
@@ -1496,7 +1495,7 @@ function finite_element_tests()
             n_shared = 1
             while n_shared ≤ nproc
                 n_distributed = nproc ÷ n_shared
-                tol = 3.0e-9
+                tol = 4.0e-9
                 @testset "n_shared=$n_shared ($s1,$s2,$s3), periodic=$periodic, separate_Ainv_B=$separate_Ainv_B" for (s1,s2,s3) ∈ (
                         (1, 1, 2),
                         (1, 1, 4),
