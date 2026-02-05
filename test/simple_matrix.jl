@@ -1,7 +1,8 @@
 function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=true,
                            separate_Ainv_B=false, use_unitrange=true)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array, local_win_store = get_comms(n_shared, with_comm)
+        shared_rank, allocate_array_float, allocate_array_int, local_win_store_float,
+        local_win_store_int = get_comms(n_shared, with_comm)
 
     if use_unitrange
         convert_range = identity
@@ -22,9 +23,9 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=
     local_bottom_vec_range = (distributed_rank * local_n2 + 1):(distributed_rank + 1)*local_n2
 
     # Broadcast arrays from distributed_rank-0 so that all processes work with the same data.
-    M = allocate_array(n, n)
-    b = allocate_array(n)
-    z = allocate_array(n)
+    M = allocate_array_float(n, n)
+    b = allocate_array_float(n)
+    z = allocate_array_float(n)
     if distributed_rank == 0 && shared_rank == 0
         rng = StableRNG(2001)
 
@@ -74,7 +75,7 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=
                               C_global_row_range=convert_range(1:n2),
                               D_global_column_range=convert_range(1:n2),
                               distributed_comm=distributed_comm, shared_comm=shared_comm,
-                              allocate_array=allocate_array, use_sparse=use_sparse,
+                              allocate_array=allocate_array_float, use_sparse=use_sparse,
                               separate_Ainv_B=separate_Ainv_B)
 
     function test_once()
@@ -144,20 +145,29 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         test_once()
     end
-    if local_win_store !== nothing
+    if local_win_store_float !== nothing
         # Free the MPI.Win objects, because if they are free'd by the garbage collector
         # it may cause an MPI error or hang.
-        for w ∈ local_win_store
+        for w ∈ local_win_store_float
             MPI.free(w)
         end
-        resize!(local_win_store, 0)
+        resize!(local_win_store_float, 0)
+    end
+    if local_win_store_int !== nothing
+        # Free the MPI.Win objects, because if they are free'd by the garbage collector
+        # it may cause an MPI error or hang.
+        for w ∈ local_win_store_int
+            MPI.free(w)
+        end
+        resize!(local_win_store_int, 0)
     end
 end
 
 function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=true,
                             separate_Ainv_B=false, use_unitrange=true)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array, local_win_store = get_comms(n_shared, with_comm)
+        shared_rank, allocate_array_float, allocate_array_int, local_win_store_float,
+        local_win_store_int = get_comms(n_shared, with_comm)
 
     if use_unitrange
         convert_range = identity
@@ -210,9 +220,9 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse
     end
 
     # Broadcast arrays from distributed_rank-0 so that all processes work with the same data.
-    M = allocate_array(n, n)
-    b = allocate_array(n)
-    z = allocate_array(n)
+    M = allocate_array_float(n, n)
+    b = allocate_array_float(n)
+    z = allocate_array_float(n)
     if distributed_rank == 0 && shared_rank == 0
         rng = StableRNG(2002)
 
@@ -293,7 +303,7 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse
                               C_global_row_range=convert_range(local_bottom_irange),
                               D_global_column_range=convert_range(D_local_irange),
                               distributed_comm=distributed_comm, shared_comm=shared_comm,
-                              allocate_array=allocate_array, use_sparse=use_sparse,
+                              allocate_array=allocate_array_float, use_sparse=use_sparse,
                               separate_Ainv_B=separate_Ainv_B)
 
     function test_once()
@@ -366,13 +376,21 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         test_once()
     end
-    if local_win_store !== nothing
+    if local_win_store_float !== nothing
         # Free the MPI.Win objects, because if they are free'd by the garbage collector
         # it may cause an MPI error or hang.
-        for w ∈ local_win_store
+        for w ∈ local_win_store_float
             MPI.free(w)
         end
-        resize!(local_win_store, 0)
+        resize!(local_win_store_float, 0)
+    end
+    if local_win_store_int !== nothing
+        # Free the MPI.Win objects, because if they are free'd by the garbage collector
+        # it may cause an MPI error or hang.
+        for w ∈ local_win_store_int
+            MPI.free(w)
+        end
+        resize!(local_win_store_int, 0)
     end
 end
 
@@ -380,7 +398,8 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
                              use_sparse=true, separate_Ainv_B=false, use_unitrange=true,
                              add_index_gap=false)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array, local_win_store = get_comms(n_shared, with_comm)
+        shared_rank, allocate_array_float, allocate_array_int, local_win_store_float,
+        local_win_store_int = get_comms(n_shared, with_comm)
 
     if use_unitrange
         convert_range = identity
@@ -440,10 +459,10 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
         # Make copies here so that we do not modify the original matrix.
         local_ntop = length(local_top_vec_range)
         local_nbottom = length(local_bottom_vec_range)
-        this_local_A = allocate_array(local_ntop,local_ntop)
-        this_local_B = allocate_array(local_ntop,local_nbottom)
-        this_local_C = allocate_array(local_nbottom,local_ntop)
-        this_local_D = allocate_array(local_nbottom,local_nbottom)
+        this_local_A = allocate_array_float(local_ntop,local_ntop)
+        this_local_B = allocate_array_float(local_ntop,local_nbottom)
+        this_local_C = allocate_array_float(local_nbottom,local_ntop)
+        this_local_D = allocate_array_float(local_nbottom,local_nbottom)
 
         if shared_rank == 0
             this_local_A .= this_A[local_top_vec_range,local_top_vec_range]
@@ -472,9 +491,9 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
     end
 
     # Broadcast arrays from distributed_rank-0 so that all processes work with the same data.
-    M = allocate_array(n, n)
-    b = allocate_array(n)
-    z = allocate_array(n)
+    M = allocate_array_float(n, n)
+    b = allocate_array_float(n)
+    z = allocate_array_float(n)
     if distributed_rank == 0 && shared_rank == 0
         initialize_M!(M)
         b .= rand(rng, n)
@@ -515,7 +534,7 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
                               convert_range(nominal_local_top_vec_range),
                               convert_range(nominal_local_bottom_vec_range);
                               distributed_comm=distributed_comm, shared_comm=shared_comm,
-                              allocate_array=allocate_array, use_sparse=use_sparse,
+                              allocate_array=allocate_array_float, use_sparse=use_sparse,
                               separate_Ainv_B=separate_Ainv_B)
 
     function test_once()
@@ -593,13 +612,21 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         test_once()
     end
-    if local_win_store !== nothing
+    if local_win_store_float !== nothing
         # Free the MPI.Win objects, because if they are free'd by the garbage collector
         # it may cause an MPI error or hang.
-        for w ∈ local_win_store
+        for w ∈ local_win_store_float
             MPI.free(w)
         end
-        resize!(local_win_store, 0)
+        resize!(local_win_store_float, 0)
+    end
+    if local_win_store_int !== nothing
+        # Free the MPI.Win objects, because if they are free'd by the garbage collector
+        # it may cause an MPI error or hang.
+        for w ∈ local_win_store_int
+            MPI.free(w)
+        end
+        resize!(local_win_store_int, 0)
     end
 end
 

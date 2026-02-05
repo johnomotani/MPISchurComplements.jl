@@ -40,6 +40,8 @@ macro sc_timeit(timer, name, expr)
     end
 end
 
+include("DenseLUs.jl")
+
 mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,
                                   Tbv,Tgy,TBob,Trangeno,Tscomm,Tsync,Ttimer}
     A_factorization::TA
