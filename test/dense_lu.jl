@@ -12,6 +12,7 @@ function dense_lu_tests()
     @testset "dense_lu" begin
         @testset "m=$m, tile_size=$tile_size" for m ∈ (32, 33, 100, 128, 1009, 1024),
                                                   tile_size ∈ (2, 3, 25, 32, 90, 128)
+            println("dense_lu m=$m, tile_size=$tile_size")
             if tile_size > m + 5
                 # If tile_size is bigger than m, the actual value of tile_size does not
                 # matter, so skip what would (mostly?) be identical repeated tests.

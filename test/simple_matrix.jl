@@ -644,6 +644,7 @@ function simple_matrix_tests()
                 if !use_sparse && separate_Ainv_B
                     continue
                 end
+                println("simple_matrix ($n1,$n2), tol=$tol with_comm=$with_comm, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B, use_unitrange=$use_unitrange")
                 @testset "dense" begin
                     dense_matrix_test(n1, n2, tol; with_comm=with_comm,
                                       use_sparse=use_sparse,
@@ -685,6 +686,7 @@ function simple_matrix_tests()
                     if !use_sparse && separate_Ainv_B
                         continue
                     end
+                    println("simple_matrix n_shared=$n_shared ($n1,$n2), tol=$tol, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B, use_unitrange=$use_unitrange")
                     @testset "dense" begin
                         dense_matrix_test(n1, n2, tol; n_shared=n_shared,
                                           use_sparse=use_sparse,

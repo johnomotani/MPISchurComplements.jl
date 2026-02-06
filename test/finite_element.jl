@@ -1500,6 +1500,7 @@ function finite_element_tests()
                         (16, 8, 1.0e-9),
                         (24, 32, 3.0e-8),
                        ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true)
+                    println("finite element 1D1V n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B")
                     # Note that here n1 and n2 are numbers of elements, not total grid sizes.
                     # Total grid sizes are
                     # (n1*(ngrid-1)+1)*(n2*(ngrid-1)+1)=(n1*2+1)*(n2*2+1).
@@ -1519,6 +1520,7 @@ function finite_element_tests()
                         (8, 4, 4.0e-8),
                         (4, 12, 6.0e-9),
                        ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true)
+                    println("finite element 2D1V n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B")
                     finite_element_2D1V_test(n1, n2, 3, tol; n_shared=n_shared,
                                              periodic=periodic,
                                              separate_Ainv_B=separate_Ainv_B)
@@ -1559,6 +1561,7 @@ function finite_element_tests()
                         (4, 4, 2),
                         (4, 4, 4),
                        ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true)
+                    println("finite element 3D split n_shared=$n_shared ($s1,$s2,$s3), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B")
                     finite_element_3D_split_test(s1, s2, s3, tol; n_shared=n_shared,
                                                  periodic=periodic,
                                                  separate_Ainv_B=separate_Ainv_B)
