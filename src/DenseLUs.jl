@@ -64,23 +64,11 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
     # L_solve!() and U_solve!(). The list will be executed in steps. At each step each
     # process will have either one or zero units of work to do, and there will be a
     # synchronize_shared() call after each step.
-    # Store the columns in off_diagonal_tiles in reverse order so that we can pop!() them
-    # efficiently from the ends of the Vectors.
     n_steps_max = (n_tiles * (n_tiles + 1)) ÷ 2 # This is the number of steps if the tiles
                                                 # were handled in serial.
     if shared_comm_rank == 0
-        # Non-zero entries in off_diagonal_tiles are still to be assigned to the 'task
-        # list' on some rank.
         diagonal_tiles = fill(-1, n_steps_max)
-        # Note that off_diagonal_tiles is transposed so that column indices are the first
-        # index and row indices are the second index, to make accesses later more
-        # efficient.
-        off_diagonal_tiles = zeros(Int64, n_tiles, n_tiles)
-        for column ∈ 1:n_tiles
-            for row ∈ column+1:n_tiles
-                off_diagonal_tiles[column,row] = column
-            end
-        end
+        first_unhandled_column_in_row = ones(Int64, n_tiles)
         # The pairs of entries in `tiles_for_rank` are the (row,column) of a tile. We
         # build up a list of these Tuples for each rank, indicating the tile that that
         # rank should work on on each step.
@@ -92,21 +80,22 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
         first_incomplete_column = 1
         while next_diagonal_tile ≤ n_tiles
             this_diagonal_tile = next_diagonal_tile
-            if sum(@view off_diagonal_tiles[1:this_diagonal_tile-1,this_diagonal_tile]) == 0
+            if first_unhandled_column_in_row[this_diagonal_tile] == this_diagonal_tile
                 # All the off-diagonal tiles in this row have been handled already, so we can
                 # do the solve using the triangular element from the block-diagonal.
                 diagonal_tiles[step] = this_diagonal_tile
                 # As the root of shared_comm is solving a diagonal tile, do not give it an
                 # off-diagonal tile on this step.
                 next_diagonal_tile += 1
+                first_unhandled_column_in_row[this_diagonal_tile] += 1
             else
                 # Cannot operate on a diagonal element on this step.
                 # Instead, the root of shared_comm works on tiles from the
                 # this_diagonal_tile row.
                 tiles_for_rank[1,step,1] = this_diagonal_tile
-                this_column = findfirst((x)->x>0, @view off_diagonal_tiles[1:this_diagonal_tile-1,this_diagonal_tile])
+                this_column = first_unhandled_column_in_row[this_diagonal_tile]
+                first_unhandled_column_in_row[this_diagonal_tile] += 1
                 tiles_for_rank[2,step,1] = this_column
-                off_diagonal_tiles[this_column,this_diagonal_tile] = 0
             end
 
             # Assign the other ranks tiles each from a different row, so that they will write
@@ -120,31 +109,26 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
             # Exclude all columns ≥this_diagonal_tile, as they cannot be processed yet.
             # The first remaining element in each row has the largest 'diagonal distince'
             # of all entries in the row, so only need to check that one.
-            function set_row_maximum!(irow, off_diagonal_tiles, first_incomplete_column,
-                                      this_diagonal_tile, diagonal_distances_row_maxima,
-                                      n_tiles)
-                # Only include the part of the row less than this_diagonal_tile which
-                # is available to be processed at this step.
-                row = @view off_diagonal_tiles[first_incomplete_column:this_diagonal_tile-1,irow]
-                icolumn = findfirst((x)->x>0, row)
+            function set_row_maximum!(irow, first_unhandled_column_in_row,
+                                      first_incomplete_column, this_diagonal_tile,
+                                      diagonal_distances_row_maxima, n_tiles)
+                icolumn = first_unhandled_column_in_row[irow]
                 break_loop = false
-                if isnothing(icolumn)
+                if icolumn ≥ this_diagonal_tile
                     diagonal_distances_row_maxima[irow] = typemin(Int64)
-                elseif icolumn == 1
+                elseif icolumn == first_incomplete_column
                     # Remaining rows all have the minimum in this column.
-                    icolumn += first_incomplete_column - 1
                     for jrow ∈ irow:n_tiles
                         diagonal_distances_row_maxima[jrow] = 2 * this_diagonal_tile - jrow - icolumn
                     end
                     break_loop = true
                 else
-                    icolumn += first_incomplete_column - 1
                     diagonal_distances_row_maxima[irow] = 2 * this_diagonal_tile - irow - icolumn
                 end
                 return break_loop
             end
             for irow ∈ this_diagonal_tile+1:n_tiles
-                break_loop = set_row_maximum!(irow, off_diagonal_tiles,
+                break_loop = set_row_maximum!(irow, first_unhandled_column_in_row,
                                               first_incomplete_column, this_diagonal_tile,
                                               diagonal_distances_row_maxima, n_tiles)
                 if break_loop
@@ -161,9 +145,9 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
                         rowmax = diagonal_distances_row_maxima[irow]
                         if rowmax == max_distance && !(irow ∈ rows_with_tasks)
                             tiles_for_rank[1,step,rank] = irow
-                            icolumn = findfirst((x)->x>0, @view off_diagonal_tiles[1:this_diagonal_tile-1,irow])
+                            icolumn = first_unhandled_column_in_row[irow]
                             tiles_for_rank[2,step,rank] = icolumn
-                            off_diagonal_tiles[icolumn,irow] = 0
+                            first_unhandled_column_in_row[irow] += 1
                             rows_with_tasks[rank] = irow
                             if icolumn == n_tiles
                                 first_incomplete_column = icolumn
@@ -171,7 +155,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
 
                             # Re-calculate diagonal_distances_row_maxima[irow] because we
                             # just removed the maximum-distance entry from this row.
-                            set_row_maximum!(irow, off_diagonal_tiles,
+                            set_row_maximum!(irow, first_unhandled_column_in_row,
                                              first_incomplete_column, this_diagonal_tile,
                                              diagonal_distances_row_maxima, n_tiles)
 
