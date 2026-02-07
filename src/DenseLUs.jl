@@ -66,9 +66,9 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
     # synchronize_shared() call after each step.
     # Store the columns in off_diagonal_tiles in reverse order so that we can pop!() them
     # efficiently from the ends of the Vectors.
-    off_diagonal_tiles = [[column for column ∈ row-1:-1:1] for row ∈ 1:n_tiles]
     diagonal_tiles = Int64[]
     if shared_comm_rank == 0
+        off_diagonal_tiles = [[column for column ∈ row-1:-1:1] for row ∈ 1:n_tiles]
         sizehint!(diagonal_tiles, n_tiles)
         # The Tuples in `tiles_for_rank` are the (row,column) of a tile. We build up a
         # list of these Tuples for each rank, indicating the tile that that rank should work
@@ -79,40 +79,40 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
         end
         next_diagonal_tile = 1
         while next_diagonal_tile ≤ n_tiles
-            if isempty(off_diagonal_tiles[next_diagonal_tile])
+            this_diagonal_tile = next_diagonal_tile
+            if isempty(off_diagonal_tiles[this_diagonal_tile])
                 # All the off-diagonal tiles in this row have been handled already, so we can
                 # do the solve using the triangular element from the block-diagonal.
-                push!(diagonal_tiles, next_diagonal_tile)
+                push!(diagonal_tiles, this_diagonal_tile)
                 # As the root of shared_comm is solving a diagonal tile, do not give it an
                 # off-diagonal tile on this step.
                 push!(tiles_for_rank[1], [-1,-1])
-                increment_next_diagonal_tile = true
+                next_diagonal_tile += 1
             else
                 # Cannot operate on a diagonal element on this step.
                 push!(diagonal_tiles, -1)
                 # Instead, the root of shared_comm works on tiles from the
-                # next_diagonal_tile row.
-                push!(tiles_for_rank[1], [next_diagonal_tile,
-                                          pop!(off_diagonal_tiles[next_diagonal_tile])])
-                increment_next_diagonal_tile = false
+                # this_diagonal_tile row.
+                push!(tiles_for_rank[1], [this_diagonal_tile,
+                                          pop!(off_diagonal_tiles[this_diagonal_tile])])
             end
 
             # Assign the other ranks tiles each from a different row, so that they will write
             # to distinct elements of the RHS vector. Pick the tile that is furthest from the
-            # diagonal crossing `next_diagonal_tile`. Hopefully this gives a balance between
+            # diagonal crossing `this_diagonal_tile`. Hopefully this gives a balance between
             # filling rows and filling columns, to minimize the number of tasks that have no
             # work to do.
             # Note using one-based indexing of ranks for convenience here, so `rank`
             # corresponds to `shared_comm_rank+1`.
-            rows_with_tasks = [next_diagonal_tile]
+            rows_with_tasks = [this_diagonal_tile]
             sizehint!(rows_with_tasks, shared_comm_size)
             for rank ∈ 2:shared_comm_size
-                # Exclude all columns ≥next_diagonal_tile, as they cannot be processed yet.
+                # Exclude all columns ≥this_diagonal_tile, as they cannot be processed yet.
                 # The first remaining element in each row has the largest 'diagonal distince'
                 # of all entries in the row, so only need to check that one.
-                diagonal_distances_row_maxima = [isempty(row) || row[end] ≥ next_diagonal_tile || (next_diagonal_tile + irow_offset) ∈ rows_with_tasks ?
-                                                 typemin(Int64) : 2 * next_diagonal_tile - (next_diagonal_tile + irow_offset) - row[1]
-                                                 for (irow_offset, row) ∈ enumerate(@view(off_diagonal_tiles[next_diagonal_tile+1:end]))]
+                diagonal_distances_row_maxima = [isempty(row) || row[end] ≥ this_diagonal_tile || (this_diagonal_tile + irow_offset) ∈ rows_with_tasks ?
+                                                 typemin(Int64) : 2 * this_diagonal_tile - (this_diagonal_tile + irow_offset) - row[1]
+                                                 for (irow_offset, row) ∈ enumerate(@view(off_diagonal_tiles[this_diagonal_tile+1:end]))]
                 if all(diagonal_distances_row_maxima .== typemin(Int64))
                     # No work available.
                     push!(tiles_for_rank[rank], [-1, -1])
@@ -120,7 +120,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
                     max_distance = maximum(diagonal_distances_row_maxima)
                     found_max = false
                     for (irow_offset, rowmax) ∈ enumerate(diagonal_distances_row_maxima)
-                        irow = next_diagonal_tile + irow_offset
+                        irow = this_diagonal_tile + irow_offset
                         if rowmax == max_distance && !(irow ∈ rows_with_tasks)
                             found_max = true
                             push!(tiles_for_rank[rank], [irow, pop!(off_diagonal_tiles[irow])])
@@ -134,16 +134,13 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
                 end
             end
 
-            if increment_next_diagonal_tile
-                next_diagonal_tile += 1
-            end
         end
 
         n_steps = Ref(length(tiles_for_rank[1]))
         MPI.Bcast!(n_steps, shared_comm; root=0)
 
         reqs = MPI.Request[]
-        send_data = [hcat(x...) for x ∈ tiles_for_rank]
+        send_data = Matrix{Int64}[hcat(x...) for x ∈ tiles_for_rank]
         for rank ∈ 1:shared_comm_size-1
             push!(reqs, MPI.Isend(send_data[rank+1], shared_comm; dest=rank))
         end
