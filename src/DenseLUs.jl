@@ -64,7 +64,9 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
     # L_solve!() and U_solve!(). The list will be executed in steps. At each step each
     # process will have either one or zero units of work to do, and there will be a
     # synchronize_shared() call after each step.
-    off_diagonal_tiles = [[column for column ∈ 1:row-1] for row ∈ 1:n_tiles]
+    # Store the columns in off_diagonal_tiles in reverse order so that we can pop!() them
+    # efficiently from the ends of the Vectors.
+    off_diagonal_tiles = [[column for column ∈ row-1:-1:1] for row ∈ 1:n_tiles]
     diagonal_tiles = Int64[]
     sizehint!(diagonal_tiles, n_tiles)
     # The Tuples in `tiles_for_rank` are the (row,column) of a tile. We build up a
@@ -90,7 +92,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
             # Instead, the root of shared_comm works on tiles from the
             # next_diagonal_tile row.
             push!(tiles_for_rank[1], (next_diagonal_tile,
-                                      popfirst!(off_diagonal_tiles[next_diagonal_tile])))
+                                      pop!(off_diagonal_tiles[next_diagonal_tile])))
             increment_next_diagonal_tile = false
         end
 
@@ -107,17 +109,20 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
             # Exclude all columns ≥next_diagonal_tile, as they cannot be processed yet.
             # The first remaining element in each row has the largest 'diagonal distince'
             # of all entries in the row, so only need to check that one.
-            diagonal_distances_row_maxima = [isempty(row) || row[1] ≥ next_diagonal_tile || irow ∈ rows_with_tasks ? typemin(Int64) : 2 * next_diagonal_tile - irow - row[1] for (irow, row) ∈ enumerate(off_diagonal_tiles)]
+            diagonal_distances_row_maxima = [isempty(row) || row[end] ≥ next_diagonal_tile || (next_diagonal_tile + irow_offset) ∈ rows_with_tasks ?
+                                             typemin(Int64) : 2 * next_diagonal_tile - (next_diagonal_tile + irow_offset) - row[1]
+                                             for (irow_offset, row) ∈ enumerate(@view(off_diagonal_tiles[next_diagonal_tile+1:end]))]
             if all(diagonal_distances_row_maxima .== typemin(Int64))
                 # No work available.
                 push!(tiles_for_rank[rank], (-1, -1))
             else
                 max_distance = maximum(diagonal_distances_row_maxima)
                 found_max = false
-                for (irow, rowmax) ∈ enumerate(diagonal_distances_row_maxima)
+                for (irow_offset, rowmax) ∈ enumerate(diagonal_distances_row_maxima)
+                    irow = next_diagonal_tile + irow_offset
                     if rowmax == max_distance && !(irow ∈ rows_with_tasks)
                         found_max = true
-                        push!(tiles_for_rank[rank], (irow, popfirst!(off_diagonal_tiles[irow])))
+                        push!(tiles_for_rank[rank], (irow, pop!(off_diagonal_tiles[irow])))
                         push!(rows_with_tasks, irow)
                         break
                     end
@@ -138,9 +143,15 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
         return (itile-1)*tile_size+1:min(itile*tile_size,m)
     end
     diagonal_L_tiles = Matrix{datatype}[]
+    if shared_comm_rank == 0
+        sizehint!(diagonal_L_tiles, n_steps[])
+    end
     my_L_tiles = Matrix{datatype}[]
+    sizehint!(my_L_tiles, n_steps[])
     my_L_tile_row_ranges = UnitRange{Int64}[]
+    sizehint!(my_L_tile_row_ranges, n_steps[])
     my_L_tile_col_ranges = UnitRange{Int64}[]
+    sizehint!(my_L_tile_col_ranges, n_steps[])
     if shared_comm_rank == 0
         for (diagonal_tile, off_diagonal_tile) ∈ zip(diagonal_tiles, tiles_for_rank[1])
             if diagonal_tile == -1
@@ -189,9 +200,15 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
         return max(m-itile*tile_size+1,1):m-(itile-1)*tile_size
     end
     diagonal_U_tiles = Matrix{datatype}[]
+    if shared_comm_rank == 0
+        sizehint!(diagonal_U_tiles, n_steps[])
+    end
     my_U_tiles = Matrix{datatype}[]
+    sizehint!(my_U_tiles, n_steps[])
     my_U_tile_row_ranges = UnitRange{Int64}[]
+    sizehint!(my_U_tile_row_ranges, n_steps[])
     my_U_tile_col_ranges = UnitRange{Int64}[]
+    sizehint!(my_U_tile_col_ranges, n_steps[])
     if shared_comm_rank == 0
         for (diagonal_tile, off_diagonal_tile) ∈ zip(diagonal_tiles, tiles_for_rank[1])
             if diagonal_tile == -1
