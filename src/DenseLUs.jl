@@ -335,13 +335,10 @@ function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
 
     if A_lu.shared_comm_rank == 0
         # Factorize in serial for now. Could look at implementing a parallel version of
-        # this later.
+        # this later. Could maybe borrow algorithms from
+        # https://github.com/JuliaLinearAlgebra/RecursiveFactorization.jl/ ?
         factorization = lu!(A)
 
-        # The following is not the most efficient, as factorization.L and factorization.U
-        # both allocate new intermediate matrices. Only actually need to copy the
-        # lower-triangular elements of factorization.factors into L, and diagonal and
-        # upper-triangular elements into U.  Optimise later!
         A_lu.factors .= factorization.factors
         A_lu.row_permutation .= factorization.p
     end
