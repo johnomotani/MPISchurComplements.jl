@@ -33,7 +33,7 @@ end
 
 function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
                   allocate_shared_float::Function, allocate_shared_int::Function;
-                  synchronize_shared=nothing)
+                  synchronize_shared=nothing, skip_factorization=false)
     datatype = eltype(A)
 
     if synchronize_shared === nothing
@@ -313,7 +313,9 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
                     vec_buffer2, tile_size, n_tiles, shared_comm, shared_comm_rank,
                     shared_comm_size, synchronize_shared)
 
-    lu!(A_lu, A)
+    if !skip_factorization
+        lu!(A_lu, A)
+    end
 
     synchronize_shared()
 
