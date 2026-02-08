@@ -1,6 +1,6 @@
 module DenseLUs
 
-export dense_lu
+export DenseLU, dense_lu
 
 using LinearAlgebra
 using LinearAlgebra.BLAS: trsv!, gemm!
@@ -31,10 +31,15 @@ struct DenseLU{T,Tmat,Tvec,Tsync}
     synchronize_shared::Tsync
 end
 
-function dense_lu(A::AbstractMatrix, tile_size::Int64, shared_comm::MPI.Comm,
-                  allocate_shared_float::Function, allocate_shared_int::Function;
-                  synchronize_shared=nothing, skip_factorization=false)
+function dense_lu(A::AbstractMatrix, tile_size::Int64,
+                  shared_comm::Union{MPI.Comm,Nothing}, allocate_shared_float::Function,
+                  allocate_shared_int::Function; synchronize_shared=nothing,
+                  skip_factorization=false)
     datatype = eltype(A)
+
+    if shared_comm === nothing
+        shared_comm = MPI.COMM_SELF
+    end
 
     if synchronize_shared === nothing
         synchronize_shared = ()->MPI.Barrier(shared_comm)
