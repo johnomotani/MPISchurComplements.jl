@@ -43,8 +43,8 @@ end
 include("DenseLUs.jl")
 using .DenseLUs
 
-mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,
-                                  Tbv,Tgy,TBob,Trangeno,Tscomm,Tsync,Ttimer}
+struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,Tbv,Tgy,
+                          TBob,Trangeno,Tscomm,Tsync,Ttimer}
     A_factorization::TA
     Ainv_dot_B::TAiB
     Ainv_dot_B_local::TAiBl
@@ -237,6 +237,30 @@ function find_local_vector_inds(global_inds::AbstractArray, owned_global_inds)
         local_inds[i] = findfirst(i->i==gind, owned_global_inds)
     end
     return local_inds
+end
+
+"""
+    update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
+                          new_A::SparseMatrixCSC{Tf,Ti}) where {Tf,Ti}
+
+Update the values of `A` in-place to the values of `new_A`. May not be ideally efficient
+because it requires resizing Vectors.
+"""
+function update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
+                               new_A::SparseMatrixCSC{Tf,Ti}) where {Tf,Ti}
+    colptr = A.colptr
+    rowval = A.rowval
+    nzval = A.nzval
+    new_colptr = new_A.colptr
+    new_rowval = new_A.rowval
+    new_nzval = new_A.nzval
+    resize!(colptr, length(new_colptr))
+    colptr .= new_colptr
+    resize!(rowval, length(new_rowval))
+    rowval .= new_rowval
+    resize!(nzval, length(new_nzval))
+    nzval .= new_nzval
+    return nothing
 end
 
 """
@@ -786,7 +810,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                   * "`use_sparse=false`.")
         end
         Ainv_dot_B_local = nothing
-        B_local = sparse(zeros(data_type, 1, 1))
+        B_local = sparse(zeros(data_type, length(local_top_vector_unique_entries_partial),
+                               bottom_vec_global_size))
     else
         # Store the chunk of Ainv_dot_B needed by this shared-memory process as a contiguous
         # array.
@@ -812,7 +837,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     bottom_vec_buffer = allocate_shared_float(bottom_vec_global_size)
     global_y = allocate_shared_float(bottom_vec_global_size)
 
-    fake_C = zeros(data_type, 1, 1)
+    fake_C = zeros(data_type, length(C_local_row_range_partial), top_vec_local_size)
     if use_sparse
         fake_C = sparse(fake_C)
     end
@@ -832,7 +857,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
         end
     else
         if shared_rank == 0 && distributed_rank == 0
-            schur_complement_factorization = lu!(ones(data_type, 1, 1))
+            schur_complement_factorization =
+                lu!(Matrix{data_type}(I, bottom_vec_global_size, bottom_vec_global_size))
         else
             schur_complement_factorization = nothing
         end
@@ -1022,7 +1048,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
 
             # At this point `Ainv_dot_B` contains the dense array of `B`.
             if separate_Ainv_B
-                sc.B = @views sparse(Ainv_dot_B[local_top_vector_unique_entries_partial,:])
+                update_sparse_matrix!(sc.B, sparse(@view Ainv_dot_B[local_top_vector_unique_entries_partial,:]))
                 synchronize_shared()
             end
             ldiv!(A_factorization, Ainv_dot_B)
@@ -1044,13 +1070,14 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             if use_sparse
                 C = @view C[sc.C_local_row_range_partial,:]
                 C = sparse(C)
+                update_sparse_matrix!(sc.C, C)
             else
                 # Make a copy because C_local_row_range_partial might not be a contiguous range of
                 # indices, but performance will be better if `C` is a contiguously-allocated
                 # array.
-                C = C[sc.C_local_row_range_partial,:]
+                C = @view C[sc.C_local_row_range_partial,:]
+                sc.C .= C
             end
-            sc.C = C
         end
 
         @sc_timeit timer "schur_complement" begin
@@ -1118,7 +1145,10 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             else
                 if shared_rank == 0
                     if distributed_rank == 0
-                        sc.schur_complement_factorization = lu!(schur_complement)
+                        new_lu = lu!(schur_complement)
+                        schur_complement_factorization = sc.schur_complement_factorization
+                        schur_complement_factorization.factors .= new_lu.factors
+                        schur_complement_factorization.ipiv .= new_lu.ipiv
                     end
                 end
             end
