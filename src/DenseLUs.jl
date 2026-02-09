@@ -13,14 +13,13 @@ struct DenseLU{T,Tmat,Tvec,Tsync}
     n::Int64
     factors::Tmat
     row_permutation::Vector{Int64}
-    diagonal_L_tiles::Vector{Matrix{T}}
-    my_L_tiles::Vector{Matrix{T}}
+    my_L_tiles::Array{T,3}
     my_L_tile_row_ranges::Vector{UnitRange{Int64}}
     my_L_tile_col_ranges::Vector{UnitRange{Int64}}
-    diagonal_U_tiles::Vector{Matrix{T}}
-    my_U_tiles::Vector{Matrix{T}}
+    my_U_tiles::Array{T,3}
     my_U_tile_row_ranges::Vector{UnitRange{Int64}}
     my_U_tile_col_ranges::Vector{UnitRange{Int64}}
+    is_diagonal::Vector{Bool}
     vec_buffer1::Tvec
     vec_buffer2::Tvec
     tile_size::Int64
@@ -72,6 +71,11 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
     n_steps_max = (n_tiles * (n_tiles + 1)) ÷ 2 # This is the number of steps if the tiles
                                                 # were handled in serial.
     if shared_comm_rank == 0
+        is_diagonal = fill(false, n_steps_max)
+    else
+        is_diagonal = Bool[]
+    end
+    if shared_comm_rank == 0
         diagonal_tiles = fill(-1, n_steps_max)
         first_unhandled_column_in_row = ones(Int64, n_tiles)
         # The pairs of entries in `tiles_for_rank` are the (row,column) of a tile. We
@@ -88,11 +92,13 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
             if first_unhandled_column_in_row[this_diagonal_tile] == this_diagonal_tile
                 # All the off-diagonal tiles in this row have been handled already, so we can
                 # do the solve using the triangular element from the block-diagonal.
-                diagonal_tiles[step] = this_diagonal_tile
+                tiles_for_rank[1,step,1] = this_diagonal_tile
+                tiles_for_rank[2,step,1] = this_diagonal_tile
                 # As the root of shared_comm is solving a diagonal tile, do not give it an
                 # off-diagonal tile on this step.
                 next_diagonal_tile += 1
                 first_unhandled_column_in_row[this_diagonal_tile] += 1
+                is_diagonal[step] = true
             else
                 # Cannot operate on a diagonal element on this step.
                 # Instead, the root of shared_comm works on tiles from the
@@ -174,8 +180,8 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         end
 
         n_steps = Ref(step - 1)
-        diagonal_tiles = diagonal_tiles[1:n_steps[]]
         tiles_for_rank = tiles_for_rank[:,1:n_steps[],:]
+        is_diagonal = is_diagonal[1:n_steps[]]
 
         MPI.Bcast!(n_steps, shared_comm; root=0)
 
@@ -195,131 +201,48 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
 
     # Store the tiles that will be handled by this process in contiguous arrays.
     function get_L_tile_index_range(itile)
-        return (itile-1)*tile_size+1:min(itile*tile_size,m)
-    end
-    diagonal_L_tiles = Matrix{datatype}[]
-    if shared_comm_rank == 0
-        sizehint!(diagonal_L_tiles, n_steps[])
-    end
-    my_L_tiles = Matrix{datatype}[]
-    sizehint!(my_L_tiles, n_steps[])
-    my_L_tile_row_ranges = UnitRange{Int64}[]
-    sizehint!(my_L_tile_row_ranges, n_steps[])
-    my_L_tile_col_ranges = UnitRange{Int64}[]
-    sizehint!(my_L_tile_col_ranges, n_steps[])
-    if shared_comm_rank == 0
-        for i ∈ 1:n_steps[]
-            diagonal_tile = diagonal_tiles[i]
-            off_diagonal_tile = @view my_tiles_for_rank[:,i]
-            if diagonal_tile == -1
-                push!(diagonal_L_tiles, zeros(datatype, 0, 0))
-                if off_diagonal_tile == (-1, -1)
-                    error("Expected off diagonal tile on root when there is no diagonal "
-                          * "tile.")
-                end
-                row_range = get_L_tile_index_range(off_diagonal_tile[1])
-                col_range = get_L_tile_index_range(off_diagonal_tile[2])
-                push!(my_L_tiles, zeros(datatype, length(row_range), length(col_range)))
-                push!(my_L_tile_row_ranges, row_range)
-                push!(my_L_tile_col_ranges, col_range)
-            else
-                push!(my_L_tiles, zeros(datatype, 0, 0))
-                if off_diagonal_tile != [-1, -1]
-                    error("Expected no off diagonal tile on root when there is a "
-                          * "diagonal tile.")
-                end
-                row_range = get_L_tile_index_range(diagonal_tile)
-                col_range = get_L_tile_index_range(diagonal_tile)
-                push!(diagonal_L_tiles, zeros(datatype, length(row_range), length(col_range)))
-                push!(my_L_tile_row_ranges, row_range)
-                push!(my_L_tile_col_ranges, col_range)
-            end
+        if itile == -1
+            return 1:0
+        else
+            return (itile-1)*tile_size+1:min(itile*tile_size,m)
         end
-    else
-        for i ∈ 1:n_steps[]
-            off_diagonal_tile = @view my_tiles_for_rank[:,i]
-            if off_diagonal_tile == [-1, -1]
-                push!(my_L_tiles, zeros(datatype, 0, 0))
-                push!(my_L_tile_row_ranges, 1:0)
-                push!(my_L_tile_col_ranges, 1:0)
-            else
-                row_range = get_L_tile_index_range(off_diagonal_tile[1])
-                col_range = get_L_tile_index_range(off_diagonal_tile[2])
-                push!(my_L_tiles, zeros(datatype, length(row_range), length(col_range)))
-                push!(my_L_tile_row_ranges, row_range)
-                push!(my_L_tile_col_ranges, col_range)
-            end
-        end
+    end
+    my_L_tiles = fill(datatype(NaN), tile_size, tile_size, n_steps[])
+    my_L_tile_row_ranges = Vector{UnitRange{Int64}}(undef, n_steps[])
+    my_L_tile_col_ranges = Vector{UnitRange{Int64}}(undef, n_steps[])
+    for i ∈ 1:n_steps[]
+        tile = @view my_tiles_for_rank[:,i]
+        my_L_tile_row_ranges[i] = get_L_tile_index_range(tile[1])
+        my_L_tile_col_ranges[i] = get_L_tile_index_range(tile[2])
     end
 
     # When dealing with the upper-triangular 'U' matrix, we count the tiles from the
     # bottom-right corner, so bottom-to-top for rows, and right-to-left for columns.
     function get_U_tile_index_range(itile)
-        return max(m-itile*tile_size+1,1):m-(itile-1)*tile_size
-    end
-    diagonal_U_tiles = Matrix{datatype}[]
-    if shared_comm_rank == 0
-        sizehint!(diagonal_U_tiles, n_steps[])
-    end
-    my_U_tiles = Matrix{datatype}[]
-    sizehint!(my_U_tiles, n_steps[])
-    my_U_tile_row_ranges = UnitRange{Int64}[]
-    sizehint!(my_U_tile_row_ranges, n_steps[])
-    my_U_tile_col_ranges = UnitRange{Int64}[]
-    sizehint!(my_U_tile_col_ranges, n_steps[])
-    if shared_comm_rank == 0
-        for i ∈ 1:n_steps[]
-            diagonal_tile = diagonal_tiles[i]
-            off_diagonal_tile = @view my_tiles_for_rank[:,i]
-            if diagonal_tile == -1
-                push!(diagonal_U_tiles, zeros(datatype, 0, 0))
-                if off_diagonal_tile == [-1, -1]
-                    error("Expected off diagonal tile on root when there is no diagonal "
-                          * "tile.")
-                end
-                row_range = get_U_tile_index_range(off_diagonal_tile[1])
-                col_range = get_U_tile_index_range(off_diagonal_tile[2])
-                push!(my_U_tiles, zeros(datatype, length(row_range), length(col_range)))
-                push!(my_U_tile_row_ranges, row_range)
-                push!(my_U_tile_col_ranges, col_range)
-            else
-                push!(my_U_tiles, zeros(datatype, 0, 0))
-                if off_diagonal_tile != [-1, -1]
-                    error("Expected no off diagonal tile on root when there is a "
-                          * "diagonal tile.")
-                end
-                row_range = get_U_tile_index_range(diagonal_tile)
-                col_range = get_U_tile_index_range(diagonal_tile)
-                push!(diagonal_U_tiles, zeros(datatype, length(row_range), length(col_range)))
-                push!(my_U_tile_row_ranges, row_range)
-                push!(my_U_tile_col_ranges, col_range)
-            end
+        if itile == -1
+            return 1:0
+        else
+            return max(m-itile*tile_size+1,1):m-(itile-1)*tile_size
         end
-    else
-        for i ∈ 1:n_steps[]
-            off_diagonal_tile = @view my_tiles_for_rank[:,i]
-            if off_diagonal_tile == [-1, -1]
-                push!(my_U_tiles, zeros(datatype, 0, 0))
-                push!(my_U_tile_row_ranges, 1:0)
-                push!(my_U_tile_col_ranges, 1:0)
-            else
-                row_range = get_U_tile_index_range(off_diagonal_tile[1])
-                col_range = get_U_tile_index_range(off_diagonal_tile[2])
-                push!(my_U_tiles, zeros(datatype, length(row_range), length(col_range)))
-                push!(my_U_tile_row_ranges, row_range)
-                push!(my_U_tile_col_ranges, col_range)
-            end
-        end
+    end
+    my_U_tiles = fill(datatype(NaN), tile_size, tile_size, n_steps[])
+    my_U_tile_row_ranges = Vector{UnitRange{Int64}}(undef, n_steps[])
+    my_U_tile_col_ranges = Vector{UnitRange{Int64}}(undef, n_steps[])
+    for i ∈ 1:n_steps[]
+        tile = @view my_tiles_for_rank[:,i]
+        my_U_tile_row_ranges[i] = get_U_tile_index_range(tile[1])
+        my_U_tile_col_ranges[i] = get_U_tile_index_range(tile[2])
     end
 
-    A_lu =  DenseLU(m, n, factors, row_permutation, diagonal_L_tiles, my_L_tiles,
-                    my_L_tile_row_ranges, my_L_tile_col_ranges, diagonal_U_tiles,
-                    my_U_tiles, my_U_tile_row_ranges, my_U_tile_col_ranges, vec_buffer1,
-                    vec_buffer2, tile_size, n_tiles, shared_comm, shared_comm_rank,
-                    shared_comm_size, synchronize_shared)
+    A_lu =  DenseLU(m, n, factors, row_permutation, my_L_tiles, my_L_tile_row_ranges,
+                    my_L_tile_col_ranges, my_U_tiles, my_U_tile_row_ranges,
+                    my_U_tile_col_ranges, is_diagonal, vec_buffer1, vec_buffer2,
+                    tile_size, n_tiles, shared_comm, shared_comm_rank, shared_comm_size,
+                    synchronize_shared)
 
     if !skip_factorization
-        lu!(A_lu, A)
+        @time lu!(A_lu, A)
+        println("done lu!")
     end
 
     synchronize_shared()
@@ -329,11 +252,9 @@ end
 
 function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
     factors = A_lu.factors
-    diagonal_L_tiles = A_lu.diagonal_L_tiles
     my_L_tiles = A_lu.my_L_tiles
     my_L_tile_row_ranges = A_lu.my_L_tile_row_ranges
     my_L_tile_col_ranges = A_lu.my_L_tile_col_ranges
-    diagonal_U_tiles = A_lu.diagonal_U_tiles
     my_U_tiles = A_lu.my_U_tiles
     my_U_tile_row_ranges = A_lu.my_U_tile_row_ranges
     my_U_tile_col_ranges = A_lu.my_U_tile_col_ranges
@@ -351,37 +272,17 @@ function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
     end
     synchronize_shared()
 
-    if shared_comm_rank == 0
-        for (diagonal_tile, off_diagonal_tile, row_range, col_range) ∈
-                zip(diagonal_L_tiles, my_L_tiles, my_L_tile_row_ranges,
-                    my_L_tile_col_ranges)
-            if isempty(diagonal_tile)
-                @views off_diagonal_tile .= factors[row_range, col_range]
-            else
-                @views diagonal_tile .= factors[row_range, col_range]
-            end
-        end
-    else
-        for (off_diagonal_tile, row_range, col_range) ∈
-                zip(my_L_tiles, my_L_tile_row_ranges, my_L_tile_col_ranges)
-            @views off_diagonal_tile .= factors[row_range, col_range]
+    for (step, (row_range, col_range)) ∈ enumerate(zip(my_L_tile_row_ranges,
+                                                       my_L_tile_col_ranges))
+        if !isempty(row_range)
+            @views my_L_tiles[1:length(row_range),1:length(col_range),step] .= factors[row_range, col_range]
         end
     end
 
-    if shared_comm_rank == 0
-        for (diagonal_tile, off_diagonal_tile, row_range, col_range) ∈
-                zip(diagonal_U_tiles, my_U_tiles, my_U_tile_row_ranges,
-                    my_U_tile_col_ranges)
-            if isempty(diagonal_tile)
-                @views off_diagonal_tile .= factors[row_range, col_range]
-            else
-                @views diagonal_tile .= factors[row_range, col_range]
-            end
-        end
-    else
-        for (off_diagonal_tile, row_range, col_range) ∈
-                zip(my_U_tiles, my_U_tile_row_ranges, my_U_tile_col_ranges)
-            @views off_diagonal_tile .= factors[row_range, col_range]
+    for (step, (row_range, col_range)) ∈ enumerate(zip(my_U_tile_row_ranges,
+                                                       my_U_tile_col_ranges))
+        if !isempty(row_range)
+            @views my_U_tiles[1:length(row_range),1:length(col_range),step] .= factors[row_range, col_range]
         end
     end
 
@@ -415,70 +316,102 @@ function ldiv!(x::AbstractVector{T}, A_lu::DenseLU{T}, b::AbstractVector{T}) whe
 end
 
 function L_solve!(y, A_lu::DenseLU{T}, b) where T
-    diagonal_L_tiles = A_lu.diagonal_L_tiles
     my_L_tiles = A_lu.my_L_tiles
     my_L_tile_row_ranges = A_lu.my_L_tile_row_ranges
     my_L_tile_col_ranges = A_lu.my_L_tile_col_ranges
+    is_diagonal = A_lu.is_diagonal
     shared_comm_rank = A_lu.shared_comm_rank
     synchronize_shared = A_lu.synchronize_shared
 
-    for itask ∈ 1:length(my_L_tiles)
-        row_range = my_L_tile_row_ranges[itask]
-        col_range = my_L_tile_col_ranges[itask]
-        if shared_comm_rank == 0
-            diagonal_tile = diagonal_L_tiles[itask]
-            if isempty(diagonal_tile)
-                @views gemm!('N', 'N', -one(T), my_L_tiles[itask], y[col_range], one(T), b[row_range])
-            else
+    if shared_comm_rank == 0
+        for step ∈ 1:length(my_L_tile_row_ranges)
+            row_range = my_L_tile_row_ranges[step]
+            col_range = my_L_tile_col_ranges[step]
+            if is_diagonal[step]
                 # shared_comm_rank=0 always wrote to b[tile_range] on the previous step, so no
                 # need to synchronize before this calculation.
                 @views y[col_range] .= b[col_range]
-                @views trsv!('L', 'N', 'U', diagonal_tile, y[col_range])
+                # Need the [1:length(row_range),1:length(col_range)] selection, even
+                # though for most tiles this is just the full range, because the last row
+                # and column may have a different size
+                @views trsv!('L', 'N', 'U',
+                             my_L_tiles[1:length(row_range),1:length(col_range),step],
+                             y[col_range])
+            else
+                # Need the [1:length(row_range)] selection, even though for most tiles
+                # this is just the full range, because the last row may have a different
+                # size
+                @views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                             y[col_range], one(T), b[row_range])
             end
-        else
-            tile = my_L_tiles[itask]
-            if !isempty(tile)
-                @views gemm!('N', 'N', -one(T), tile, y[col_range], one(T), b[row_range])
-            end
+            # Synchronize to avoid race conditions.
+            synchronize_shared()
         end
-
-        # Synchronize to avoid race conditions.
-        synchronize_shared()
+    else
+        for step ∈ 1:length(my_L_tile_row_ranges)
+            row_range = my_L_tile_row_ranges[step]
+            col_range = my_L_tile_col_ranges[step]
+            if !isempty(row_range)
+                # Need the [1:length(row_range)] selection, even though for most tiles
+                # this is just the full range, because the last row may have a different
+                # size
+                @views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                             y[col_range], one(T), b[row_range])
+            end
+            # Synchronize to avoid race conditions.
+            synchronize_shared()
+        end
     end
 
     return nothing
 end
 
 function U_solve!(x, A_lu::DenseLU{T}, y) where T
-    diagonal_U_tiles = A_lu.diagonal_U_tiles
     my_U_tiles = A_lu.my_U_tiles
     my_U_tile_row_ranges = A_lu.my_U_tile_row_ranges
     my_U_tile_col_ranges = A_lu.my_U_tile_col_ranges
+    is_diagonal = A_lu.is_diagonal
     shared_comm_rank = A_lu.shared_comm_rank
     synchronize_shared = A_lu.synchronize_shared
 
-    for itask ∈ 1:length(my_U_tiles)
-        row_range = my_U_tile_row_ranges[itask]
-        col_range = my_U_tile_col_ranges[itask]
-        if shared_comm_rank == 0
-            diagonal_tile = diagonal_U_tiles[itask]
-            if isempty(diagonal_tile)
-                @views gemm!('N', 'N', -one(T), my_U_tiles[itask], x[col_range], one(T), y[row_range])
-            else
+    if shared_comm_rank == 0
+        for step ∈ 1:length(my_U_tile_row_ranges)
+            row_range = my_U_tile_row_ranges[step]
+            col_range = my_U_tile_col_ranges[step]
+            if is_diagonal[step]
                 # shared_comm_rank=0 always wrote to b[tile_range] on the previous step, so no
                 # need to synchronize before this calculation.
                 @views x[col_range] .= y[col_range]
-                @views trsv!('U', 'N', 'N', diagonal_tile, x[col_range])
+                # Need the [1:length(row_range),1:length(col_range)] selection, even
+                # though for most tiles this is just the full range, because the last row
+                # and column may have a different size
+                @views trsv!('U', 'N', 'N',
+                             my_U_tiles[1:length(row_range),1:length(col_range),step],
+                             x[col_range])
+            else
+                # Need the [1:length(row_range)] selection, even though for most tiles
+                # this is just the full range, because the last row may have a different
+                # size
+                @views gemm!('N', 'N', -one(T), my_U_tiles[1:length(row_range),:,step],
+                             x[col_range], one(T), y[row_range])
             end
-        else
-            tile = my_U_tiles[itask]
-            if !isempty(tile)
-                @views gemm!('N', 'N', -one(T), tile, x[col_range], one(T), y[row_range])
-            end
+            # Synchronize to avoid race conditions.
+            synchronize_shared()
         end
-
-        # Synchronize to avoid race conditions.
-        synchronize_shared()
+    else
+        for step ∈ 1:length(my_U_tile_row_ranges)
+            row_range = my_U_tile_row_ranges[step]
+            col_range = my_U_tile_col_ranges[step]
+            if !isempty(row_range)
+                # Need the [1:length(row_range)] selection, even though for most tiles
+                # this is just the full range, because the last row may have a different
+                # size
+                @views gemm!('N', 'N', -one(T), my_U_tiles[1:length(row_range),:,step],
+                             x[col_range], one(T), y[row_range])
+            end
+            # Synchronize to avoid race conditions.
+            synchronize_shared()
+        end
     end
 
     return nothing
