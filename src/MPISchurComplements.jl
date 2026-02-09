@@ -1,24 +1,5 @@
-"""
-Use the Schur complement technique to solve a block-2x2 matrix system, parallelised with
-MPI.
-
-Solve the matrix system
-```math
-\\left(\\begin{array}{cc}
-A & B\\\\
-C & D
-\\end{array}\\right)
-\\cdot\\left(\\begin{array}{c}
-x\\\\
-y
-\\end{array}\\right)
-=\\left(\\begin{array}{c}
-u\\\\
-v
-\\end{array}\\right)
-```
-"""
 module MPISchurComplements
+@doc read(joinpath(dirname(@__DIR__), "README.md"), String) MPISchurComplements
 
 export MPISchurComplement, mpi_schur_complement, update_schur_complement!, ldiv!
 
