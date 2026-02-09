@@ -1,24 +1,5 @@
-"""
-Use the Schur complement technique to solve a block-2x2 matrix system, parallelised with
-MPI.
-
-Solve the matrix system
-```math
-\\left(\\begin{array}{cc}
-A & B\\\\
-C & D
-\\end{array}\\right)
-\\cdot\\left(\\begin{array}{c}
-x\\\\
-y
-\\end{array}\\right)
-=\\left(\\begin{array}{c}
-u\\\\
-v
-\\end{array}\\right)
-```
-"""
 module MPISchurComplements
+@doc read(joinpath(dirname(@__DIR__), "README.md"), String) MPISchurComplements
 
 export MPISchurComplement, mpi_schur_complement, update_schur_complement!, ldiv!
 
@@ -265,8 +246,9 @@ function update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
 end
 
 """
-    mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMatrix,
-                         D::AbstractMatrix,
+    mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,Type},
+                         C::Union{AbstractMatrix,Nothing,Type},
+                         D::Union{AbstractMatrix,Nothing,Type},
                          owned_top_vector_entries::Union{UnitRange{Int64},Vector{Int64}},
                          owned_bottom_vector_entries::Union{UnitRange{Int64},Vector{Int64}};
                          B_global_column_range::Union{UnitRange{Int64},Vector{Int64},Nothing}=nothing,
@@ -275,10 +257,11 @@ end
                          comm::MPI.Comm=MPI.COMM_WORLD,
                          shared_comm::MPI.Comm=MPI.COMM_SELF,
                          distributed_comm::Union{MPI.Comm,Nothing}=nothing,
-                         allocate_array::Union{Function,Nothing}=nothing,
+                         allocate_shared_float::Union{Function,Nothing}=nothing,
+                         allocate_shared_int::Union{Function,Nothing}=nothing,
                          synchronize_shared::Union{Function,Nothing}=nothing,
                          use_sparse=true, separate_Ainv_B=false,
-                         parallel_schur=shared_comm!=MPI.COMM_SELF,
+                         parallel_schur=(distributed_comm!==nothing || shared_comm!==nothing),
                          schur_tile_size=nothing, skip_factorization=false,
                          check_lu::Bool=true,
                          timer::Union{TimerOutput,Nothing}=nothing)
