@@ -40,8 +40,11 @@ macro sc_timeit(timer, name, expr)
     end
 end
 
-mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,
-                                  Tbv,Tgy,TBob,Trangeno,Tscomm,Tsync,Ttimer}
+include("DenseLUs.jl")
+using .DenseLUs
+
+struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,Tbv,Tgy,
+                          TBob,Trangeno,Tscomm,Tsync,Ttimer}
     A_factorization::TA
     Ainv_dot_B::TAiB
     Ainv_dot_B_local::TAiBl
@@ -101,6 +104,7 @@ mutable struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,TCAiB,TCAiu,
     synchronize_shared::Tsync
     use_sparse::Bool
     separate_Ainv_B::Bool
+    parallel_schur::Bool
     timer::Ttimer
 end
 
@@ -236,6 +240,30 @@ function find_local_vector_inds(global_inds::AbstractArray, owned_global_inds)
 end
 
 """
+    update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
+                          new_A::SparseMatrixCSC{Tf,Ti}) where {Tf,Ti}
+
+Update the values of `A` in-place to the values of `new_A`. May not be ideally efficient
+because it requires resizing Vectors.
+"""
+function update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
+                               new_A::SparseMatrixCSC{Tf,Ti}) where {Tf,Ti}
+    colptr = A.colptr
+    rowval = A.rowval
+    nzval = A.nzval
+    new_colptr = new_A.colptr
+    new_rowval = new_A.rowval
+    new_nzval = new_A.nzval
+    resize!(colptr, length(new_colptr))
+    colptr .= new_colptr
+    resize!(rowval, length(new_rowval))
+    rowval .= new_rowval
+    resize!(nzval, length(new_nzval))
+    nzval .= new_nzval
+    return nothing
+end
+
+"""
     mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMatrix,
                          D::AbstractMatrix,
                          owned_top_vector_entries::Union{UnitRange{Int64},Vector{Int64}},
@@ -248,6 +276,7 @@ end
                          allocate_array::Union{Function,Nothing}=nothing,
                          synchronize_shared::Union{Function,Nothing}=nothing,
                          use_sparse=true, separate_Ainv_B=false,
+                         parallel_schur=shared_comm!==nothing,
                          skip_factorization=false,
                          timer::Union{TimerOutput,Nothing}=nothing)
 
@@ -316,12 +345,14 @@ distributed rank add up to the full value).
 `distributed_comm` and `shared_comm` are the MPI communicators to use for
 distributed-memory and shared-memory communications.
 
-`allocate_array` is required when `shared_comm` is passed. It should be passed a function
-that will be used to allocate various buffer arrays. It should return arrays with the same
-element type as `A_factorization`, `B`, `C`, and `D`. This is necessary as the MPI
-shared-memory 'windows' (`MPI.Win`) have to be stored and (eventually) freed. The
-'windows' must be managed externally, as if they are freed by garbage collection, the
-freeing is not synchronized between different processes, causing errors.
+`allocate_shared_float` and `allocate_shared_int` must be passed when `shared_comm` is
+passed. They should be passed functions that will be used to allocate various buffer
+arrays. `allocate_shared_float` should return arrays with the same element type as
+`A_factorization`, `B`, `C`, and `D`, while `allocate_shared_int` should return arrays
+with element type `Int64`. This is necessary as the MPI shared-memory 'windows'
+(`MPI.Win`) have to be stored and (eventually) freed. The 'windows' must be managed
+externally, as if they are freed by garbage collection, the freeing is not synchronized
+between different processes, causing errors.
 
 `synchronize_shared` can be passed a function that synchronizes all processes in
 `shared_comm`. This may be useful if a custom synchronization is required for debugging,
@@ -335,6 +366,16 @@ multiplying by the dense `Ainv_dot_B`. If `separate_Ainv_B=true` is passed, this
 done (requires `use_sparse=true`). There is no saving in setup time because `Ainv_dot_B`
 still has to be calculated, to be multiplied by `C` when calculating `schur_complement`.
 There is also no memory saving as a dense B-sized buffer array is needed.
+
+By default, when `shared_comm` is passed the DenseLUs module provided as part of
+MPISchurComplements.jl is used to factorize/solve the Schur complement matrix (which is
+dense) using a shared-memory parallel implementation (at present only the solve
+(`ldiv!()`) phase is parallelised, not the factorization (`lu!`)) and when `shared_comm`
+is not passed the serial implementation from LinearAlgebra (which uses LAPACK/BLAS) is
+used.  `parallel_schur` can be passed to force use of the serial (`false`) or parallel
+DenseLUs (`true`) implementations. When using DenseLUs, `schur_tile_size` can be used to
+set the `tile_size` argument to `dense_lu()`; the default is to use the smaller of 256 and
+the largest 2^n smaller than half of the size of the global 'bottom vector'.
 
 `skip_factorization=true` can be passed to create an MPISchurComplement instance without
 calculating the factorization corresponding to the input matrices. `ldiv!()` called with
@@ -353,10 +394,12 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                               D_global_column_range::Union{UnitRange{Int64},Vector{Int64},Nothing}=nothing,
                               distributed_comm::MPI.Comm=MPI.COMM_SELF,
                               shared_comm::Union{MPI.Comm,Nothing}=nothing,
-                              allocate_array::Union{Function,Nothing}=nothing,
+                              allocate_shared_float::Union{Function,Nothing}=nothing,
+                              allocate_shared_int::Union{Function,Nothing}=nothing,
                               synchronize_shared::Union{Function,Nothing}=nothing,
                               use_sparse=true, separate_Ainv_B=false,
-                              skip_factorization=false,
+                              parallel_schur=shared_comm!==nothing,
+                              schur_tile_size=nothing, skip_factorization=false,
                               timer::Union{TimerOutput,Nothing}=nothing)
 
     data_type = eltype(D)
@@ -543,6 +586,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
             end
         end
 
+        distributed_rank = shared_broadcast_int(distributed_rank)
+        distributed_nproc = shared_broadcast_int(distributed_nproc)
         top_vec_global_size = shared_broadcast_int(top_vec_global_size)
         local_top_vector_repeats = shared_broadcast_matrix(local_top_vector_repeats)
         bottom_vec_global_size = shared_broadcast_int(bottom_vec_global_size)
@@ -631,13 +676,19 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     @boundscheck size(D, 1) == bottom_vec_local_size || error(BoundsError, " Rows in D do not match locally-owned 'bottom vector' entries.")
     @boundscheck size(D, 2) == length(D_local_column_range) + size(D_local_column_repeats, 2) || error(BoundsError, " Columns in D do not match index ranges.")
 
-    if shared_comm !== nothing && allocate_array === nothing
-        error("when `shared_comm` is passed, `allocate_array` argument is required, "
-              * "because it is necessary to manage the MPI.Win objects to ensure they "
-              * "are not garbage collected, because garbage collection is not "
-              * "necessarily synchronized between different processes.")
-    elseif allocate_array === nothing
-        allocate_array = (args...) -> zeros(data_type, args...)
+    if shared_comm !== nothing && (allocate_shared_float === nothing
+                                   || allocate_shared_int === nothing)
+        error("when `shared_comm` is passed, `allocate_shared_float` and "
+              * "`allocate_shared_int` arguments are required, because it is necessary "
+              * "to manage the MPI.Win objects to ensure they are not garbage collected, "
+              * "because garbage collection is not necessarily synchronized between "
+              * "different processes.")
+    end
+    if allocate_shared_float === nothing
+        allocate_shared_float = (args...) -> zeros(data_type, args...)
+    end
+    if allocate_shared_int === nothing
+        allocate_shared_int = (args...) -> zeros(Int64, args...)
     end
 
     # Define indices that will be handled by this process in shared-memory-parallelised
@@ -752,14 +803,15 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     end
 
     # Allocate buffer arrays
-    Ainv_dot_B = allocate_array(top_vec_local_size, bottom_vec_global_size)
+    Ainv_dot_B = allocate_shared_float(top_vec_local_size, bottom_vec_global_size)
     if separate_Ainv_B
         if !use_sparse
             error("It will always be more expensive to use `separate_Ainv_B` when "
                   * "`use_sparse=false`.")
         end
         Ainv_dot_B_local = nothing
-        B_local = sparse(zeros(data_type, 1, 1))
+        B_local = sparse(zeros(data_type, length(local_top_vector_unique_entries_partial),
+                               bottom_vec_global_size))
     else
         # Store the chunk of Ainv_dot_B needed by this shared-memory process as a contiguous
         # array.
@@ -770,7 +822,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                                              length(local_top_vector_unique_entries_partial))
         B_local = nothing
     end
-    Ainv_dot_u = allocate_array(top_vec_local_size)
+    Ainv_dot_u = allocate_shared_float(top_vec_local_size)
     # C_dot_Ainv_dot_u and C_dot_Ainv_dot_B are purely local buffers.
     C_dot_Ainv_dot_u = Vector{data_type}(undef, length(C_global_row_range_partial))
     C_dot_Ainv_dot_B = Matrix{data_type}(undef, length(C_global_row_range_partial),
@@ -780,20 +832,36 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     else
         Ainv_dot_B_dot_y = nothing
     end
-    schur_complement = allocate_array(bottom_vec_global_size, bottom_vec_global_size)
-    top_vec_buffer = allocate_array(top_vec_local_size)
-    bottom_vec_buffer = allocate_array(bottom_vec_global_size)
-    global_y = allocate_array(bottom_vec_global_size)
+    schur_complement = allocate_shared_float(bottom_vec_global_size, bottom_vec_global_size)
+    top_vec_buffer = allocate_shared_float(top_vec_local_size)
+    bottom_vec_buffer = allocate_shared_float(bottom_vec_global_size)
+    global_y = allocate_shared_float(bottom_vec_global_size)
 
-    fake_C = zeros(data_type, 1, 1)
+    fake_C = zeros(data_type, length(C_local_row_range_partial), top_vec_local_size)
     if use_sparse
         fake_C = sparse(fake_C)
     end
 
-    if shared_rank == 0 && distributed_rank == 0
-        schur_complement_factorization = lu!(ones(data_type, 1, 1))
+    if parallel_schur
+        if distributed_rank == 0
+            if schur_tile_size === nothing
+                power_of_2 = floor(Int64, log2(bottom_vec_global_size / 2))
+                schur_tile_size = min(256, 2^power_of_2)
+            end
+            schur_complement_factorization =
+                dense_lu(schur_complement, schur_tile_size, shared_comm,
+                         allocate_shared_float, allocate_shared_int;
+                         synchronize_shared=synchronize_shared, skip_factorization=true)
+        else
+            schur_complement_factorization = nothing
+        end
     else
-        schur_complement_factorization = nothing
+        if shared_rank == 0 && distributed_rank == 0
+            schur_complement_factorization =
+                lu!(Matrix{data_type}(I, bottom_vec_global_size, bottom_vec_global_size))
+        else
+            schur_complement_factorization = nothing
+        end
     end
 
     sc_factorization = MPISchurComplement(A_factorization, Ainv_dot_B, Ainv_dot_B_local,
@@ -837,7 +905,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                                           local_bottom_vector_repeats_partial,
                                           distributed_comm, distributed_rank, shared_comm,
                                           shared_rank, synchronize_shared, use_sparse,
-                                          separate_Ainv_B, timer)
+                                          separate_Ainv_B, parallel_schur, timer)
 
     if !skip_factorization
         update_schur_complement!(sc_factorization, missing, B, C, D)
@@ -980,7 +1048,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
 
             # At this point `Ainv_dot_B` contains the dense array of `B`.
             if separate_Ainv_B
-                sc.B = @views sparse(Ainv_dot_B[local_top_vector_unique_entries_partial,:])
+                update_sparse_matrix!(sc.B, sparse(@view Ainv_dot_B[local_top_vector_unique_entries_partial,:]))
                 synchronize_shared()
             end
             ldiv!(A_factorization, Ainv_dot_B)
@@ -1002,13 +1070,14 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             if use_sparse
                 C = @view C[sc.C_local_row_range_partial,:]
                 C = sparse(C)
+                update_sparse_matrix!(sc.C, C)
             else
                 # Make a copy because C_local_row_range_partial might not be a contiguous range of
                 # indices, but performance will be better if `C` is a contiguously-allocated
                 # array.
-                C = C[sc.C_local_row_range_partial,:]
+                C = @view C[sc.C_local_row_range_partial,:]
+                sc.C .= C
             end
-            sc.C = C
         end
 
         @sc_timeit timer "schur_complement" begin
@@ -1069,9 +1138,18 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             # `sc.schur_complement_factorization`) could be parallelised with shared memory and/or
             # distributed MPI, but we expect this step not to be a bottleneck, so it is done in
             # serial (at least for now).
-            if shared_rank == 0
+            if isa(sc.schur_complement_factorization, DenseLU)
                 if distributed_rank == 0
-                    sc.schur_complement_factorization = lu!(schur_complement)
+                    lu!(sc.schur_complement_factorization, schur_complement)
+                end
+            else
+                if shared_rank == 0
+                    if distributed_rank == 0
+                        new_lu = lu!(schur_complement)
+                        schur_complement_factorization = sc.schur_complement_factorization
+                        schur_complement_factorization.factors .= new_lu.factors
+                        schur_complement_factorization.ipiv .= new_lu.ipiv
+                    end
                 end
             end
         end
@@ -1122,6 +1200,7 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
     @sc_timeit timer "ldiv!" begin
         distributed_comm = sc.distributed_comm
         distributed_rank = sc.distributed_rank
+        parallel_schur = sc.parallel_schur
         A_factorization = sc.A_factorization
         Ainv_dot_B_local = sc.Ainv_dot_B_local
         schur_complement_factorization = sc.schur_complement_factorization
@@ -1169,10 +1248,19 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
             global_y = sc.global_y
             if sc.shared_rank == 0
                 MPI.Reduce!(bottom_vec_buffer, +, distributed_comm; root=0)
+            end
 
+            if parallel_schur
                 if distributed_rank == 0
                     ldiv!(global_y, schur_complement_factorization, bottom_vec_buffer)
                 end
+            else
+                if shared_rank == 0 && distributed_rank == 0
+                    ldiv!(global_y, schur_complement_factorization, bottom_vec_buffer)
+                end
+            end
+
+            if sc.shared_rank == 0
                 MPI.Bcast!(global_y, distributed_comm; root=0)
             end
             synchronize_shared()

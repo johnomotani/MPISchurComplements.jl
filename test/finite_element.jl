@@ -121,8 +121,8 @@ function get_distributed_slices(n_chunks, n_element_list)
     return all_chunks, lower_chunk_boundaries, upper_chunk_boundaries
 end
 
-function get_fe_like_matrix(n_element_list...; allocate_array, rng, distributed_comm,
-                            shared_comm, bottom_block_ndims=1)
+function get_fe_like_matrix(n_element_list...; allocate_array_float, rng,
+                            distributed_comm, shared_comm, bottom_block_ndims=1)
     # Fill top block with multi-dimensional matrix, and bottom block with 1d matrix, using
     # the first dimension of the top block.
     top_block_sizes, top_block_total = get_fe_sizes(n_element_list...)
@@ -135,7 +135,12 @@ function get_fe_like_matrix(n_element_list...; allocate_array, rng, distributed_
         bottom_block_sizes, bottom_block_total = get_fe_sizes(bottom_block_nelement_list...)
     end
     total_size = top_block_total + bottom_block_total
-    M = allocate_array(total_size, total_size)
+    M = allocate_array_float(total_size, total_size)
+    if (shared_comm === nothing || MPI.Comm_rank(shared_comm) == 0) &&
+            (distributed_comm === nothing || MPI.Comm_rank(distributed_comm) == 0)
+        M .= 0.0
+    end
+    shared_comm !== nothing && MPI.Barrier(shared_comm)
 
     function fill_fe_recursive!(M_subblock, n_element_row_list, n_element_column_list)
         if length(n_element_row_list) == 0 && length(n_element_column_list) == 0
@@ -218,19 +223,20 @@ function get_fe_like_matrix(n_element_list...; allocate_array, rng, distributed_
 end
 
 function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
-                                  separate_Ainv_B=false)
+                                  separate_Ainv_B=false, parallel_schur=true)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array, local_win_store = get_comms(n_shared)
+        shared_rank, allocate_array_float, allocate_array_int, local_win_store_float,
+        local_win_store_int = get_comms(n_shared)
 
     rng = StableRNG(2004)
 
     # Broadcast arrays from distributed_rank-0 so that all processes work with the same data.
     M, top_block_total_size, bottom_block_total_size =
-        get_fe_like_matrix(n1, n2; allocate_array=allocate_array, rng=rng,
+        get_fe_like_matrix(n1, n2; allocate_array_float=allocate_array_float, rng=rng,
                            distributed_comm=distributed_comm, shared_comm=shared_comm)
     n = top_block_total_size + bottom_block_total_size
-    b = allocate_array(n)
-    z = allocate_array(n)
+    b = allocate_array_float(n)
+    z = allocate_array_float(n)
     if distributed_rank == 0 && shared_rank == 0
         b .= rand(rng, n)
         z .= 0.0
@@ -269,10 +275,10 @@ function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
         # Make copies here so that we do not modify the original matrix.
         local_ntop = length(this_top_chunk)
         local_nbottom = length(this_bottom_chunk)
-        this_local_A = allocate_array(local_ntop,local_ntop)
-        this_local_B = allocate_array(local_ntop,local_nbottom)
-        this_local_C = allocate_array(local_nbottom,local_ntop)
-        this_local_D = allocate_array(local_nbottom,local_nbottom)
+        this_local_A = allocate_array_float(local_ntop,local_ntop)
+        this_local_B = allocate_array_float(local_ntop,local_nbottom)
+        this_local_C = allocate_array_float(local_nbottom,local_ntop)
+        this_local_D = allocate_array_float(local_nbottom,local_nbottom)
 
         if shared_rank == 0
             this_local_A .= this_A[this_top_chunk,this_top_chunk]
@@ -420,8 +426,11 @@ function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
 
     sc = mpi_schur_complement(Alu, local_B, local_C, local_D, top_chunk_global_inds,
                               bottom_chunk_global_inds; distributed_comm=distributed_comm,
-                              shared_comm=shared_comm, allocate_array=allocate_array,
-                              separate_Ainv_B=separate_Ainv_B)
+                              shared_comm=shared_comm,
+                              allocate_shared_float=allocate_array_float,
+                              allocate_shared_int=allocate_array_int,
+                              separate_Ainv_B=separate_Ainv_B,
+                              parallel_schur=parallel_schur)
 
     function test_once(M_assembled)
         ldiv!(local_x, local_y, sc, local_u, local_v)
@@ -503,7 +512,7 @@ function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
 
     @testset "change M" begin
         # Check changing the matrix is OK
-        M, _, _ = get_fe_like_matrix(n1, n2; allocate_array=allocate_array,
+        M, _, _ = get_fe_like_matrix(n1, n2; allocate_array_float=allocate_array_float,
                                      rng=rng, distributed_comm=distributed_comm,
                                      shared_comm=shared_comm)
         A = @view M[1:top_block_total_size,1:top_block_total_size]
@@ -543,31 +552,40 @@ function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         test_once(M_assembled)
     end
-    if local_win_store !== nothing
+    if local_win_store_float !== nothing
         # Free the MPI.Win objects, because if they are free'd by the garbage collector
         # it may cause an MPI error or hang.
-        for w ∈ local_win_store
+        for w ∈ local_win_store_float
             MPI.free(w)
         end
-        resize!(local_win_store, 0)
+        resize!(local_win_store_float, 0)
+    end
+    if local_win_store_int !== nothing
+        # Free the MPI.Win objects, because if they are free'd by the garbage collector
+        # it may cause an MPI error or hang.
+        for w ∈ local_win_store_int
+            MPI.free(w)
+        end
+        resize!(local_win_store_int, 0)
     end
 end
 
 function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, periodic=false,
-                                  separate_Ainv_B=false)
+                                  separate_Ainv_B=false, parallel_schur=true)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array, local_win_store = get_comms(n_shared)
+        shared_rank, allocate_array_float, allocate_array_int, local_win_store_float,
+        local_win_store_int = get_comms(n_shared)
 
     rng = StableRNG(2006)
 
     # Broadcast arrays from distributed_rank-0 so that all processes work with the same data.
     M, top_block_total_size, bottom_block_total_size =
-        get_fe_like_matrix(n1, n2, n3; allocate_array=allocate_array, rng=rng,
+        get_fe_like_matrix(n1, n2, n3; allocate_array_float=allocate_array_float, rng=rng,
                            distributed_comm=distributed_comm, shared_comm=shared_comm,
                            bottom_block_ndims=2)
     n = top_block_total_size + bottom_block_total_size
-    b = allocate_array(n)
-    z = allocate_array(n)
+    b = allocate_array_float(n)
+    z = allocate_array_float(n)
     if distributed_rank == 0 && shared_rank == 0
         b .= rand(rng, n)
         z .= 0.0
@@ -613,10 +631,10 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, periodic=false,
         # Make copies here so that we do not modify the original matrix.
         local_ntop = length(this_top_chunk)
         local_nbottom = length(this_bottom_chunk)
-        this_local_A = allocate_array(local_ntop,local_ntop)
-        this_local_B = allocate_array(local_ntop,local_nbottom)
-        this_local_C = allocate_array(local_nbottom,local_ntop)
-        this_local_D = allocate_array(local_nbottom,local_nbottom)
+        this_local_A = allocate_array_float(local_ntop,local_ntop)
+        this_local_B = allocate_array_float(local_ntop,local_nbottom)
+        this_local_C = allocate_array_float(local_nbottom,local_ntop)
+        this_local_D = allocate_array_float(local_nbottom,local_nbottom)
 
         if shared_rank == 0
             this_local_A .= this_A[this_top_chunk,this_top_chunk]
@@ -873,8 +891,11 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, periodic=false,
 
     sc = mpi_schur_complement(Alu, local_B, local_C, local_D, top_chunk_global_inds,
                               bottom_chunk_global_inds; distributed_comm=distributed_comm,
-                              shared_comm=shared_comm, allocate_array=allocate_array,
-                              separate_Ainv_B=separate_Ainv_B)
+                              shared_comm=shared_comm,
+                              allocate_shared_float=allocate_array_float,
+                              allocate_shared_int=allocate_array_int,
+                              separate_Ainv_B=separate_Ainv_B,
+                              parallel_schur=parallel_schur)
 
     function test_once(M_assembled)
         ldiv!(local_x, local_y, sc, local_u, local_v)
@@ -978,7 +999,8 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, periodic=false,
 
     @testset "change M" begin
         # Check changing the matrix is OK
-        M, _, _ = get_fe_like_matrix(n1, n2, n3; allocate_array=allocate_array, rng=rng,
+        M, _, _ = get_fe_like_matrix(n1, n2, n3;
+                                     allocate_array_float=allocate_array_float, rng=rng,
                                      distributed_comm=distributed_comm,
                                      shared_comm=shared_comm, bottom_block_ndims=2)
         A = @view M[1:top_block_total_size,1:top_block_total_size]
@@ -1018,13 +1040,21 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, periodic=false,
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         test_once(M_assembled)
     end
-    if local_win_store !== nothing
+    if local_win_store_float !== nothing
         # Free the MPI.Win objects, because if they are free'd by the garbage collector
         # it may cause an MPI error or hang.
-        for w ∈ local_win_store
+        for w ∈ local_win_store_float
             MPI.free(w)
         end
-        resize!(local_win_store, 0)
+        resize!(local_win_store_float, 0)
+    end
+    if local_win_store_int !== nothing
+        # Free the MPI.Win objects, because if they are free'd by the garbage collector
+        # it may cause an MPI error or hang.
+        for w ∈ local_win_store_int
+            MPI.free(w)
+        end
+        resize!(local_win_store_int, 0)
     end
 end
 
@@ -1033,9 +1063,10 @@ end
 # make the remainder of the matrix block-diagonal parts (i.e. split into disconnected
 # parts).
 function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, periodic=false,
-                                      separate_Ainv_B=false)
+                                      separate_Ainv_B=false, parallel_schur=true)
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array, local_win_store = get_comms(n_shared)
+        shared_rank, allocate_array_float, allocate_array_int, local_win_store_float,
+        local_win_store_int = get_comms(n_shared)
 
     rng = StableRNG(2007)
 
@@ -1043,11 +1074,12 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, periodic=fals
     ndims = length(nelement_list)
 
     # Broadcast arrays from distributed_rank-0 so that all processes work with the same data.
-    M, n, _ = get_fe_like_matrix(nelement_list...; allocate_array=allocate_array, rng=rng,
+    M, n, _ = get_fe_like_matrix(nelement_list...;
+                                 allocate_array_float=allocate_array_float, rng=rng,
                                  distributed_comm=distributed_comm,
                                  shared_comm=shared_comm, bottom_block_ndims=nothing)
-    b = allocate_array(n)
-    z = allocate_array(n)
+    b = allocate_array_float(n)
+    z = allocate_array_float(n)
     if distributed_rank == 0 && shared_rank == 0
         b .= rand(rng, n)
         z .= 0.0
@@ -1128,7 +1160,7 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, periodic=fals
         local_bottom_vector_local_inds = MPISchurComplements.find_local_vector_inds(local_bottom_vector_global_inds, this_chunk)
 
         # Make copy here so that we do not modify the original matrix.
-        this_local_M = allocate_array(local_n, local_n)
+        this_local_M = allocate_array_float(local_n, local_n)
         this_local_A = @view this_local_M[local_top_vector_local_inds,local_top_vector_local_inds]
         this_local_B = @view this_local_M[local_top_vector_local_inds,local_bottom_vector_local_inds]
         this_local_C = @view this_local_M[local_bottom_vector_local_inds,local_top_vector_local_inds]
@@ -1312,8 +1344,10 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, periodic=fals
                               periodic_global_inds[top_chunk_slice],
                               periodic_global_inds[bottom_chunk_slice];
                               distributed_comm=distributed_comm, shared_comm=shared_comm,
-                              allocate_array=allocate_array,
-                              separate_Ainv_B=separate_Ainv_B)
+                              allocate_shared_float=allocate_array_float,
+                              allocate_shared_int=allocate_array_int,
+                              separate_Ainv_B=separate_Ainv_B,
+                              parallel_schur=parallel_schur)
 
     function test_once(M_assembled)
         ldiv!(local_x, local_y, sc, local_u, local_v)
@@ -1407,8 +1441,9 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, periodic=fals
 
     @testset "change M" begin
         # Check changing the matrix is OK
-        M, _, _ = get_fe_like_matrix(nelement_list...; allocate_array=allocate_array,
-                                     rng=rng, distributed_comm=distributed_comm,
+        M, _, _ = get_fe_like_matrix(nelement_list...;
+                                     allocate_array_float=allocate_array_float, rng=rng,
+                                     distributed_comm=distributed_comm,
                                      shared_comm=shared_comm, bottom_block_ndims=nothing)
 
         M_assembled = assemble_M(M)
@@ -1443,13 +1478,21 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, periodic=fals
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         test_once(M_assembled)
     end
-    if local_win_store !== nothing
+    if local_win_store_float !== nothing
         # Free the MPI.Win objects, because if they are free'd by the garbage collector
         # it may cause an MPI error or hang.
-        for w ∈ local_win_store
+        for w ∈ local_win_store_float
             MPI.free(w)
         end
-        resize!(local_win_store, 0)
+        resize!(local_win_store_float, 0)
+    end
+    if local_win_store_int !== nothing
+        # Free the MPI.Win objects, because if they are free'd by the garbage collector
+        # it may cause an MPI error or hang.
+        for w ∈ local_win_store_int
+            MPI.free(w)
+        end
+        resize!(local_win_store_int, 0)
     end
 end
 
@@ -1460,17 +1503,19 @@ function finite_element_tests()
             n_shared = 1
             while n_shared ≤ nproc
                 n_distributed = nproc ÷ n_shared
-                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B" for (n1,n2,tol) ∈ (
+                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, parallel_schur=$parallel_schur" for (n1,n2,tol) ∈ (
                         (max(2, n_distributed), max(2, n_distributed), 3.0e-11),
                         (16, 8, 1.0e-9),
                         (24, 32, 3.0e-8),
-                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true)
+                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true), parallel_schur ∈ (true, false)
+                    println("finite element 1D1V n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, parallel_schur=$parallel_schur")
                     # Note that here n1 and n2 are numbers of elements, not total grid sizes.
                     # Total grid sizes are
                     # (n1*(ngrid-1)+1)*(n2*(ngrid-1)+1)=(n1*2+1)*(n2*2+1).
                     finite_element_1D1V_test(n1, n2, tol; n_shared=n_shared,
                                              periodic=periodic,
-                                             separate_Ainv_B=separate_Ainv_B)
+                                             separate_Ainv_B=separate_Ainv_B,
+                                             parallel_schur=parallel_schur)
                 end
                 n_shared *= 2
             end
@@ -1479,14 +1524,16 @@ function finite_element_tests()
             n_shared = 1
             while n_shared ≤ nproc
                 n_distributed = nproc ÷ n_shared
-                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B" for (n1,n2,tol) ∈ (
+                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, parallel_schur=$parallel_schur" for (n1,n2,tol) ∈ (
                         (max(2, n_distributed), max(2, n_distributed), 2.0e-8),
                         (8, 4, 4.0e-8),
                         (4, 12, 6.0e-9),
-                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true)
+                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true), parallel_schur ∈ (true, false)
+                    println("finite element 2D1V n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, parallel_schur=$parallel_schur")
                     finite_element_2D1V_test(n1, n2, 3, tol; n_shared=n_shared,
                                              periodic=periodic,
-                                             separate_Ainv_B=separate_Ainv_B)
+                                             separate_Ainv_B=separate_Ainv_B,
+                                             parallel_schur=parallel_schur)
                 end
                 n_shared *= 2
             end
@@ -1496,7 +1543,7 @@ function finite_element_tests()
             while n_shared ≤ nproc
                 n_distributed = nproc ÷ n_shared
                 tol = 4.0e-9
-                @testset "n_shared=$n_shared ($s1,$s2,$s3), periodic=$periodic, separate_Ainv_B=$separate_Ainv_B" for (s1,s2,s3) ∈ (
+                @testset "n_shared=$n_shared ($s1,$s2,$s3), periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, parallel_schur=$parallel_schur" for (s1,s2,s3) ∈ (
                         (1, 1, 2),
                         (1, 1, 4),
                         (1, 2, 1),
@@ -1523,10 +1570,12 @@ function finite_element_tests()
                         (4, 4, 1),
                         (4, 4, 2),
                         (4, 4, 4),
-                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true)
+                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true), parallel_schur ∈ (true, false)
+                    println("finite element 3D split n_shared=$n_shared ($s1,$s2,$s3), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, parallel_schur=$parallel_schur")
                     finite_element_3D_split_test(s1, s2, s3, tol; n_shared=n_shared,
                                                  periodic=periodic,
-                                                 separate_Ainv_B=separate_Ainv_B)
+                                                 separate_Ainv_B=separate_Ainv_B,
+                                                 parallel_schur=parallel_schur)
                 end
                 n_shared *= 2
             end
