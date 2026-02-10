@@ -29,8 +29,8 @@ function dense_lu_tests()
             end
             MPI.Barrier(shared_comm)
 
-            Alu = dense_lu(copy(A), tile_size, shared_comm, allocate_array_float,
-                           allocate_array_int)
+            Alu = dense_lu(copy(A), tile_size, distributed_comm, shared_comm,
+                           allocate_array_float, allocate_array_int)
 
             function test_once()
                 ldiv!(x, Alu, b)

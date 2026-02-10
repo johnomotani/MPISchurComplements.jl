@@ -856,7 +856,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                 schur_tile_size = min(256, 2^power_of_2)
             end
             schur_complement_factorization =
-                dense_lu(schur_complement, schur_tile_size, shared_comm,
+                dense_lu(schur_complement, schur_tile_size, distributed_comm, shared_comm,
                          allocate_shared_float, allocate_shared_int;
                          synchronize_shared=synchronize_shared, skip_factorization=true,
                          check_lu=check_lu)
