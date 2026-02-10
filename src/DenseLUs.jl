@@ -16,10 +16,14 @@ struct DenseLU{T,Tmat,Tvec,Tsync}
     my_L_tiles::Array{T,3}
     my_L_tile_row_ranges::Vector{UnitRange{Int64}}
     my_L_tile_col_ranges::Vector{UnitRange{Int64}}
+    L_receive_requests::Vector{MPI.Request}
+    L_send_requests::Vector{MPI.Request}
     my_U_tiles::Array{T,3}
     my_U_tile_row_ranges::Vector{UnitRange{Int64}}
     my_U_tile_col_ranges::Vector{UnitRange{Int64}}
-    is_diagonal::Vector{Bool}
+    U_receive_requests::Vector{MPI.Request}
+    U_send_requests::Vector{MPI.Request}
+    diagonal_indices::Vector{Int64}
     vec_buffer1::Tvec
     vec_buffer2::Tvec
     tile_size::Int64
@@ -27,11 +31,16 @@ struct DenseLU{T,Tmat,Tvec,Tsync}
     shared_comm::MPI.Comm
     shared_comm_rank::Int64
     shared_comm_size::Int64
+    distributed_comm::MPI.Comm
+    distributed_comm_rank::Int64
+    distributed_comm_size::Int64
+    is_root::Bool
     synchronize_shared::Tsync
     check_lu::Bool
 end
 
 function dense_lu(A::AbstractMatrix, tile_size::Int64,
+                  distributed_comm::Union{MPI.Comm,Nothing},
                   shared_comm::Union{MPI.Comm,Nothing}, allocate_shared_float::Function,
                   allocate_shared_int::Function; synchronize_shared=nothing,
                   skip_factorization=false, check_lu=true)
@@ -52,9 +61,25 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
     factors = allocate_shared_float(m, n)
     vec_buffer1 = allocate_shared_float(m)
     vec_buffer2 = allocate_shared_float(m)
+    rhs_update_buffer = allocate_shared_float(m)
 
     shared_comm_rank = MPI.Comm_rank(shared_comm)
     shared_comm_size = MPI.Comm_size(shared_comm)
+
+    # distributed comm is only needed on the root process of each shared-memory block.
+    if distributed_comm === nothing && shared_comm_rank == 0
+        distributed_comm = MPI.COMM_SELF
+    end
+
+    if shared_comm_rank == 0
+        distributed_rank = MPI.Comm_rank(distributed_comm)
+        distributed_size = MPI.Comm_size(distributed_comm)
+    else
+        # These values should not be used/required except on shared_comm_rank=0.
+        distributed_rank = -1
+        distributed_size = -1
+    end
+    is_root = (shared_comm_rank == 0 && distributed_comm_rank == 0)
 
     if shared_comm_rank == 0
         row_permutation = zeros(Int64, m)
@@ -72,11 +97,18 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
     n_steps_max = (n_tiles * (n_tiles + 1)) ÷ 2 # This is the number of steps if the tiles
                                                 # were handled in serial.
     if shared_comm_rank == 0
-        is_diagonal = fill(false, n_steps_max)
+        diagonal_indices = fill(0, n_steps_max)
     else
-        is_diagonal = Bool[]
+        diagonal_indices = Int64[]
     end
-    if shared_comm_rank == 0
+    if shared_comm_rank == 0 && distributed_comm_rank > 0
+        last_step_for_row = fill(0, n_tiles)
+        first_step_for_column = fill(0, n_tiles)
+    else
+        last_step_for_row = Int64[]
+        first_step_for_column = Int64[]
+    end
+    if is_root
         diagonal_tiles = fill(-1, n_steps_max)
         first_unhandled_column_in_row = ones(Int64, n_tiles)
         # The pairs of entries in `tiles_for_rank` are the (row,column) of a tile. We
@@ -99,7 +131,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                 # off-diagonal tile on this step.
                 next_diagonal_tile += 1
                 first_unhandled_column_in_row[this_diagonal_tile] += 1
-                is_diagonal[step] = true
+                diagonal_indices[step] = this_diagonal_tile
             else
                 # Cannot operate on a diagonal element on this step.
                 # Instead, the root of shared_comm works on tiles from the
@@ -182,22 +214,82 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
 
         n_steps = Ref(step - 1)
         tiles_for_rank = tiles_for_rank[:,1:n_steps[],:]
-        is_diagonal = is_diagonal[1:n_steps[]]
+        diagonal_indices = diagonal_indices[1:n_steps[]]
 
         MPI.Bcast!(n_steps, shared_comm; root=0)
 
         reqs = MPI.Request[]
-        for rank ∈ 1:shared_comm_size-1
-            push!(reqs, MPI.Isend(@view(tiles_for_rank[:,:,rank+1]), shared_comm; dest=rank))
+        # First handle the processes in the same shared_comm as root.
+        # Note that `shared_rank`, `block`, and `rank` are 0-based indices.
+        for shared_rank ∈ 1:shared_comm_size-1
+            push!(reqs, MPI.Isend(@view(tiles_for_rank[:,:,rank+1]), shared_comm;
+                                  dest=shared_rank))
         end
-        MPI.Waitall(reqs)
-
+        for block ∈ 1:distributed_comm_size-1
+            # Send shared_rank=0 last, because it is the one that does not need to be
+            # passed on by the shared_rank=0 process.
+            for shared_rank ∈ [1:shared_comm_size-1...,0]
+                rank = block * shared_comm_size + shared_rank
+                push!(reqs, MPI.Isend(@view(tiles_for_rank[:,:,rank+1]), distributed_comm;
+                                      dest=block, tag=shared_rank))
+            end
+            MPI.Waitall(reqs)
+        end
         my_tiles_for_rank = tiles_for_rank[:,:,1]
+    elseif shared_rank == 0
+        n_steps = Ref(-1)
+        MPI.Bcast!(n_steps, shared_comm; root=0)
+        # Receive tiles_for_rank for each process in this block, and then pass them on.
+        # Use my_tiles_for_rank as a buffer to pass on these arrays.
+        my_tiles_for_rank = zeros(Int64, 2, n_steps[])
+        for shared_rank ∈ 1:shared_comm_size-1
+            MPI.Recv!(my_tiles_for_rank, distributed_comm; source=0, tag=shared_rank)
+
+            # Check for the last appearances of rows and first appearances of columns
+            # while we are passing through my_tiles_for_rank to each process in the block.
+            for step ∈ 1:n_steps[]
+                row, column = @view my_tiles_for_rank[:,step]
+                if step > last_step_for_row[row]
+                    last_step_for_row[row] = step
+                end
+                if step < first_step_for_column[column]
+                    first_step_for_column[column] = step
+                end
+            end
+
+            MPI.Send(my_tiles_for_rank, shared_comm; dest=shared_rank)
+        end
+        MPI.Recv!(my_tiles_for_rank, distributed_comm; source=0, tag=0)
     else
         n_steps = Ref(-1)
         MPI.Bcast!(n_steps, shared_comm; root=0)
         my_tiles_for_rank = zeros(Int64, 2, n_steps[])
         MPI.Recv!(my_tiles_for_rank, shared_comm; source=0)
+    end
+
+    # Need to find the steps which are the last one to contribute to the RHS on a certain
+    # tile, or where the following step is the first one that uses the solution on a
+    # certain tile.
+    if shared_rank == 0 && distributed_rank > 0
+        completed_row_triggers = zeros(shared_comm_size, n_steps[])
+        for (tile, step) ∈ enumerate(last_step_for_row)
+            for i ∈ 1:shared_comm_size
+                if completed_row_triggers[i,step] == 0
+                    completed_row_triggers[i,step] = tile
+                    break
+                end
+            end
+        end
+
+        new_column_triggers = zeros(shared_comm_size, n_steps[])
+        for (tile, step) ∈ enumerate(first_step_for_column)
+            for i ∈ 1:shared_comm_size
+                if new_column_triggers[i,step-1] == 0
+                    completed_row_triggers[i,step-1] = tile
+                    break
+                end
+            end
+        end
     end
 
     # Store the tiles that will be handled by this process in contiguous arrays.
@@ -215,6 +307,13 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         tile = @view my_tiles_for_rank[:,i]
         my_L_tile_row_ranges[i] = get_L_tile_index_range(tile[1])
         my_L_tile_col_ranges[i] = get_L_tile_index_range(tile[2])
+    end
+    if shared_rank == 0
+        L_receive_requests = fill(MPI.REQUEST_NULL, n_tiles)
+        L_send_requests = fill(MPI.REQUEST_NULL, n_tiles)
+    else
+        L_receive_requests = MPI.Request[]
+        L_send_requests = MPI.Request[]
     end
 
     # When dealing with the upper-triangular 'U' matrix, we count the tiles from the
@@ -234,12 +333,21 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         my_U_tile_row_ranges[i] = get_U_tile_index_range(tile[1])
         my_U_tile_col_ranges[i] = get_U_tile_index_range(tile[2])
     end
+    if shared_rank == 0
+        U_receive_requests = fill(MPI.REQUEST_NULL, n_tiles)
+        U_send_requests = fill(MPI.REQUEST_NULL, n_tiles)
+    else
+        U_receive_requests = MPI.Request[]
+        U_send_requests = MPI.Request[]
+    end
 
     A_lu =  DenseLU(m, n, factors, row_permutation, my_L_tiles, my_L_tile_row_ranges,
-                    my_L_tile_col_ranges, my_U_tiles, my_U_tile_row_ranges,
-                    my_U_tile_col_ranges, is_diagonal, vec_buffer1, vec_buffer2,
+                    my_L_tile_col_ranges, L_receive_requests, L_send_requests, my_U_tiles,
+                    my_U_tile_row_ranges, my_U_tile_col_ranges, U_receive_requests,
+                    U_send_requests, diagonal_indices, vec_buffer1, vec_buffer2,
                     tile_size, n_tiles, shared_comm, shared_comm_rank, shared_comm_size,
-                    synchronize_shared, check_lu)
+                    distributed_comm, distributed_comm_rank, distributed_comm_size,
+                    is_root, synchronize_shared, check_lu)
 
     if !skip_factorization
         @time lu!(A_lu, A)
@@ -253,24 +361,29 @@ end
 
 function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
     factors = A_lu.factors
+    row_permutation = A_lu.row_permutation
     my_L_tiles = A_lu.my_L_tiles
     my_L_tile_row_ranges = A_lu.my_L_tile_row_ranges
     my_L_tile_col_ranges = A_lu.my_L_tile_col_ranges
     my_U_tiles = A_lu.my_U_tiles
     my_U_tile_row_ranges = A_lu.my_U_tile_row_ranges
     my_U_tile_col_ranges = A_lu.my_U_tile_col_ranges
-    shared_comm_rank = A_lu.shared_comm_rank
     synchronize_shared = A_lu.synchronize_shared
     check_lu = A_lu.check_lu
 
-    if A_lu.shared_comm_rank == 0
+    if A_lu.is_root
         # Factorize in serial for now. Could look at implementing a parallel version of
         # this later. Could maybe borrow algorithms from
         # https://github.com/JuliaLinearAlgebra/RecursiveFactorization.jl/ ?
         factorization = lu!(A; check=check_lu)
 
-        A_lu.factors .= factorization.factors
-        A_lu.row_permutation .= factorization.p
+        factors .= factorization.factors
+        row_permutation .= factorization.p
+    end
+    if A_lu.shared_rank == 0
+        req1 = temp_Ibcast!(factors, distributed_comm; root=0)
+        req2 = temp_Ibcast!(row_permutation, distributed_comm; root=0)
+        MPI.Waitall([req1, req2])
     end
     synchronize_shared()
 
@@ -296,15 +409,15 @@ function ldiv!(A_lu::DenseLU{T}, b::AbstractVector{T}) where T
 end
 
 function ldiv!(x::AbstractVector{T}, A_lu::DenseLU{T}, b::AbstractVector{T}) where T
+    is_root = A_lu.is_root
     row_permutation = A_lu.row_permutation
     b_permuted = A_lu.vec_buffer1
     y = A_lu.vec_buffer2
-    shared_comm_rank = A_lu.shared_comm_rank
     synchronize_shared = A_lu.synchronize_shared
 
     # Permute the RHS, storing in buffer2. This accounts for 'row permutations' that were
     # generated/used for 'pivoting' when the L and U factors were computed.
-    if shared_comm_rank == 0
+    if is_root
         # Could parallelise this?
         @views b_permuted .= b[row_permutation]
     end
@@ -312,44 +425,89 @@ function ldiv!(x::AbstractVector{T}, A_lu::DenseLU{T}, b::AbstractVector{T}) whe
     L_solve!(y, A_lu, b_permuted)
     U_solve!(x, A_lu, y)
 
+    # Clean up MPI requests. These should all have been completed already, so this should
+    # not take any time.
+    if is_root
+        MPI.Waitall(L_receive_requests)
+        MPI.Waitall(U_receive_requests)
+    elseif shared_rank == 0
+        MPI.Waitall(L_send_requests)
+        MPI.Waitall(U_send_requests)
+    end
     synchronize_shared()
 
     return x
 end
 
 function L_solve!(y, A_lu::DenseLU{T}, b) where T
+    n_tiles = A_lu.n_tiles
+    tile_size = A_lu.tile_size
     my_L_tiles = A_lu.my_L_tiles
     my_L_tile_row_ranges = A_lu.my_L_tile_row_ranges
     my_L_tile_col_ranges = A_lu.my_L_tile_col_ranges
-    is_diagonal = A_lu.is_diagonal
-    shared_comm_rank = A_lu.shared_comm_rank
+    diagonal_indices = A_lu.diagonal_indices
     synchronize_shared = A_lu.synchronize_shared
+    L_receive_requests = A_lu.L_receive_requests
+    L_send_requests = A_lu.L_send_requests
+    completed_row_triggers = A_lu.completed_row_triggers
+    new_column_triggers = A_lu.new_column_triggers
+    rhs_update_buffer = A_lu.rhs_update_buffer
+    shared_rank = A_lu.shared_rank
+    distributed_comm = A_lu.distributed_comm
 
-    if shared_comm_rank == 0
+    if shared_rank == 0
+        rhs_update_buffer .= 0.0
+    end
+
+    if A_lu.is_root
+        # Get reductions ready for pieces of the modified RHS vector.
+        if shared_rank == 0
+            for tile in 1:n_tiles
+                L_receive_requests[tile] =
+                    temp_Ireduce!(@view b[(tile-1)*tile_size+1:min(tile*tile_size,m)],
+                                  distributed_comm; dest=0, tag=tile)
+            end
+        end
         for step ∈ 1:length(my_L_tile_row_ranges)
+            diagonal_tile = diagonal_indices[step]
             row_range = my_L_tile_row_ranges[step]
             col_range = my_L_tile_col_ranges[step]
-            if is_diagonal[step]
-                # shared_comm_rank=0 always wrote to b[tile_range] on the previous step, so no
+            if diagonal_tile > 0
+                # Wait to ensure that contributions from all other blocks have been added
+                # to `b`.
+                MPI.Wait(L_receive_requests[diagonal_tile])
+                # Root process always wrote to b[tile_range] on the previous step, so no
                 # need to synchronize before this calculation.
-                @views y[col_range] .= b[col_range]
+                # Still need to add this block's contributions to `b`.
+                @views @. y[col_range] = b[col_range] + rhs_update_buffer[col_range]
                 # Need the [1:length(row_range),1:length(col_range)] selection, even
                 # though for most tiles this is just the full range, because the last row
                 # and column may have a different size
                 @views trsv!('L', 'N', 'U',
                              my_L_tiles[1:length(row_range),1:length(col_range),step],
                              y[col_range])
+                L_send_requests[diagonal_tile] = temp_Ibcast(@view y[col_range],
+                                                             distributed_comm; root=0,
+                                                             tag=diagonal_tile)
             else
                 # Need the [1:length(row_range)] selection, even though for most tiles
                 # this is just the full range, because the last row may have a different
                 # size
                 @views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
-                             y[col_range], one(T), b[row_range])
+                             y[col_range], one(T), rhs_update_buffer[row_range])
             end
             # Synchronize to avoid race conditions.
             synchronize_shared()
         end
     else
+        # Get receives ready for pieces of the solution vector.
+        if shared_rank == 0
+            for tile ∈ 1:n_tiles
+                L_receive_requests[tile] =
+                    temp_Ibcast(@view y[(tile-1)*tile_size:min(tile*tile_size, m)],
+                                distributed_comm; root=0, tag=tile)
+            end
+        end
         for step ∈ 1:length(my_L_tile_row_ranges)
             row_range = my_L_tile_row_ranges[step]
             col_range = my_L_tile_col_ranges[step]
@@ -358,10 +516,31 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
                 # this is just the full range, because the last row may have a different
                 # size
                 @views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
-                             y[col_range], one(T), b[row_range])
+                             y[col_range], one(T), rhs_update_buffer[row_range])
+            end
+            # Get data required for the next tiles processed on the block.
+            if shared_rank == 0
+                for tile ∈ @view new_column_triggers[:,step]
+                    if tile == 0
+                        # No more to do
+                        break
+                    end
+                    MPI.Wait(L_receive_requests[tile])
+                end
             end
             # Synchronize to avoid race conditions.
             synchronize_shared()
+            # Start reduction operation for any RHS pieces where this block's
+            # contributions have been completed.
+            for tile ∈ @view completed_row_triggers[:,step]
+                if tile == 0
+                    # No more to do.
+                    break
+                end
+                L_send_requests[tile] =
+                    temp_Ireduce!(@view rhs_update_buffer[(tile-1)*tile_size+1:min(tile*tile_size,m)],
+                                  distributed_comm; root=0, tag=tile)
+            end
         end
     end
 
@@ -369,38 +548,74 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
 end
 
 function U_solve!(x, A_lu::DenseLU{T}, y) where T
+    n_tiles = A_lu.n_tiles
+    tile_size = A_lu.tile_size
     my_U_tiles = A_lu.my_U_tiles
     my_U_tile_row_ranges = A_lu.my_U_tile_row_ranges
     my_U_tile_col_ranges = A_lu.my_U_tile_col_ranges
-    is_diagonal = A_lu.is_diagonal
-    shared_comm_rank = A_lu.shared_comm_rank
+    diagonal_indices = A_lu.diagonal_indices
     synchronize_shared = A_lu.synchronize_shared
+    U_receive_requests = A_lu.U_receive_requests
+    U_send_requests = A_lu.U_send_requests
+    completed_row_triggers = A_lu.completed_row_triggers
+    new_column_triggers = A_lu.new_column_triggers
+    rhs_update_buffer = A_lu.rhs_update_buffer
+    shared_rank = A_lu.shared_rank
+    distributed_comm = A_lu.distributed_comm
 
-    if shared_comm_rank == 0
+    if shared_rank == 0
+        rhs_update_buffer .= 0.0
+    end
+
+    if A_lu.is_root
+        # Get reductions ready for pieces of the modified RHS vector.
+        if shared_rank == 0
+            for tile in 1:n_tiles
+                U_receive_requests[tile] =
+                    temp_Ireduce!(@view y[max((n_tiles-tile)*tile_size+1,1):(n_tiles-tile+1)*tile_size],
+                                  distributed_comm; dest=0, tag=tile)
+            end
+        end
         for step ∈ 1:length(my_U_tile_row_ranges)
+            diagonal_tile = diagonal_indices[step]
             row_range = my_U_tile_row_ranges[step]
             col_range = my_U_tile_col_ranges[step]
-            if is_diagonal[step]
-                # shared_comm_rank=0 always wrote to b[tile_range] on the previous step, so no
+            if diagonal_tile > 0
+                # Wait to ensure that contributions from all other blocks have been added
+                # to `y`.
+                MPI.Wait(U_receive_requests[diagonal_tile])
+                # Root process always wrote to b[tile_range] on the previous step, so no
                 # need to synchronize before this calculation.
-                @views x[col_range] .= y[col_range]
+                # Still need to add this block's contributions to `y`.
+                @views @. x[col_range] = y[col_range] + rhs_update_buffer[col_range]
                 # Need the [1:length(row_range),1:length(col_range)] selection, even
                 # though for most tiles this is just the full range, because the last row
                 # and column may have a different size
                 @views trsv!('U', 'N', 'N',
                              my_U_tiles[1:length(row_range),1:length(col_range),step],
                              x[col_range])
+                U_send_requests[diagonal_tile] = temp_Ibcast(@view x[col_range],
+                                                             distributed_comm; root=0,
+                                                             tag=diagonal_tile)
             else
                 # Need the [1:length(row_range)] selection, even though for most tiles
                 # this is just the full range, because the last row may have a different
                 # size
                 @views gemm!('N', 'N', -one(T), my_U_tiles[1:length(row_range),:,step],
-                             x[col_range], one(T), y[row_range])
+                             x[col_range], one(T), rhs_update_buffer[row_range])
             end
             # Synchronize to avoid race conditions.
             synchronize_shared()
         end
     else
+        # Get receives ready for pieces of the solution vector.
+        if shared_rank == 0
+            for tile ∈ 1:n_tiles
+                U_receive_requests[tile] =
+                    temp_Ibcast(@view x[max((n_tiles-tile)*tile_size+1,1):(n_tiles-tile+1)*tile_size],
+                                distributed_comm; root=0, tag=tile)
+            end
+        end
         for step ∈ 1:length(my_U_tile_row_ranges)
             row_range = my_U_tile_row_ranges[step]
             col_range = my_U_tile_col_ranges[step]
@@ -411,12 +626,74 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                 @views gemm!('N', 'N', -one(T), my_U_tiles[1:length(row_range),:,step],
                              x[col_range], one(T), y[row_range])
             end
+            # Get data required for the next tiles processed on the block.
+            if shared_rank == 0
+                for tile ∈ @view new_column_triggers[:,step]
+                    if tile == 0
+                        # No more to do
+                        break
+                    end
+                    MPI.Wait(U_receive_requests[tile])
+                end
+            end
             # Synchronize to avoid race conditions.
             synchronize_shared()
+            # Start reduction operation for any RHS pieces where this block's
+            # contributions have been completed.
+            for tile ∈ @view completed_row_triggers[:,step]
+                if tile == 0
+                    # No more to do.
+                    break
+                end
+                U_send_requests[tile] =
+                    temp_Ireduce!(@view rhs_update_buffer[max((n_tiles-tile)*tile_size+1,1):(n_tiles-tile+1)*tile_size],
+                                  distributed_comm; root=0, tag=tile)
+            end
         end
     end
 
     return nothing
+end
+
+# Temporarily copy functions from https://github.com/JuliaParallel/MPI.jl/pull/827, until
+# that PR is merged to provide MPI.Ireduce!()
+temp_IReduce!(sendrecvbuf, op, comm::MPI.Comm, req::MPI.AbstractRequest=MPI.Request(); root::Integer=Cint(0)) =
+    temp_IReduce!(sendrecvbuf, op, root, comm, req)
+temp_IReduce!(sendbuf, recvbuf, op, comm::MPI.Comm, req::MPI.AbstractRequest=MPI.Request(); root::Integer=Cint(0)) =
+    temp_IReduce!(sendbuf, recvbuf, op, root, comm, req)
+function temp_IReduce!(rbuf::MPI.RBuffer, op::Union{MPI.Op,MPI.MPI_Op}, root::Integer, comm::MPI.Comm, req::MPI.AbstractRequest=MPI.Request())
+    # int MPI_Ireduce(const void* sendbuf, void* recvbuf, int count,
+    #                 MPI_Datatype datatype, MPI_Op op, int root, MPI_Comm comm,
+    #                 MPI_Request* req)
+    MPI.API.MPI_Ireduce(rbuf.senddata, rbuf.recvdata, rbuf.count, rbuf.datatype, op, root, comm, req)
+    MPI.setbuffer!(req, rbuf)
+    return req
+end
+temp_IReduce!(rbuf::RBuffer, op, root::Integer, comm::Comm, req::MPI.AbstractRequest=MPI.Request()) =
+    temp_IReduce!(rbuf, MPI.Op(op, eltype(rbuf)), root, comm, req)
+temp_IReduce!(sendbuf, recvbuf, op, root::Integer, comm::Comm, req::MPI.AbstractRequest=MPI.Request()) =
+    temp_IReduce!(MPI.RBuffer(sendbuf, recvbuf), op, root, comm, req)
+# inplace
+function IReduce!(buf, op, root::Integer, comm::Comm, req::AbstractRequest=Request())
+    if Comm_rank(comm) == root
+        temp_IReduce!(IN_PLACE, buf, op, root, comm, req)
+    else
+        temp_IReduce!(buf, nothing, op, root, comm, req)
+    end
+end
+
+# Temporarily copy functions from https://github.com/JuliaParallel/MPI.jl/pull/882, until
+# that PR is merged to provide MPI.Ibcast!()
+temp_Ibcast!(buf, comm::MPI.Comm; root::Integer=Cint(0)) =
+    temp_Ibcast!(buf, root, comm)
+function temp_Ibcast!(buf::MPI.Buffer, root::Integer, comm::MPI.Comm, req::MPI.AbstractRequest = MPI.Request())
+    # int MPI_Ibcast(void *buffer, int count, MPI_Datatype datatype, int root,
+    #   MPI_Comm comm, MPI_Request *request)
+    MPI.API.MPI_Ibcast(buf.data, buf.count, buf.datatype, root, comm, req)
+    return req
+end
+function temp_Ibcast!(data, root::Integer, comm::Comm)
+    temp_Ibcast!(MPI.Buffer(data), root, comm)
 end
 
 end # module DenseLUs
