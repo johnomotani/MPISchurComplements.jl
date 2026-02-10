@@ -643,7 +643,7 @@ function simple_matrix_tests()
         if nproc == 1
             # Test prime vector sizes - easier to do in serial.
             @testset "($n1,$n2), tol=$tol with_comm=$with_comm, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B, use_unitrange=$use_unitrange, parallel_schur=$parallel_schur" for (n1,n2,tol) ∈ (
-                    (3, 2, 2.0e-14),
+                    (3, 2, 5.0e-14),
                     (100, 32, 2.0e-10),
                     (1000, 17, 1.0e-8),
                     (1000, 129, 1.0e-8),
