@@ -1,15 +1,16 @@
 using MPISchurComplements.DenseLUs
+using Combinatorics
+using Primes
 
-function dense_lu_tests()
-    nproc = MPI.Comm_size(MPI.COMM_WORLD)
+function dense_lu_test(n_shared)
     # Only testing shared-memory parallelism for the DenseLU solver.
     distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
         shared_rank, allocate_array_float, allocate_array_int, local_win_store_float,
-        local_win_store_int = get_comms(nproc, true)
+        local_win_store_int = get_comms(n_shared, true)
 
     rng = StableRNG(3002)
 
-    @testset "dense_lu" begin
+    @testset "dense_lu $n_shared" begin
         @testset "m=$m, tile_size=$tile_size" for m ∈ (32, 33, 100, 128, 1009, 1024),
                                                   tile_size ∈ (2, 3, 25, 32, 90, 128)
             if tile_size > m + 5
@@ -17,7 +18,7 @@ function dense_lu_tests()
                 # matter, so skip what would (mostly?) be identical repeated tests.
                 continue
             end
-            println("dense_lu m=$m, tile_size=$tile_size")
+            println("dense_lu n_shared=$n_shared, m=$m, tile_size=$tile_size")
 
             A = allocate_array_float(m, m)
             b = allocate_array_float(m)
@@ -94,4 +95,11 @@ function dense_lu_tests()
     end
 
     return nothing
+end
+
+function dense_lu_tests()
+    nproc = MPI.Comm_size(MPI.COMM_WORLD)
+    for n_shared ∈ [prod(x) for x ∈ unique(combinations(factor(Vector, nproc)))]
+        dense_lu_test(n_shared)
+    end
 end
