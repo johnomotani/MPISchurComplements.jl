@@ -441,11 +441,11 @@ function ldiv!(x::AbstractVector{T}, A_lu::DenseLU{T}, b::AbstractVector{T}) whe
     # Clean up MPI requests. These should all have been completed already, so this should
     # not take any time.
     if is_root
-        MPI.Waitall(L_receive_requests)
-        MPI.Waitall(U_receive_requests)
+        MPI.Waitall(A_lu.L_receive_requests)
+        MPI.Waitall(A_lu.U_receive_requests)
     elseif shared_comm_rank == 0
-        MPI.Waitall(L_send_requests)
-        MPI.Waitall(U_send_requests)
+        MPI.Waitall(A_lu.L_send_requests)
+        MPI.Waitall(A_lu.U_send_requests)
     end
     synchronize_shared()
 
@@ -615,8 +615,8 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                 # cannot start this operation earlier.
                 if diagonal_tile < n_tiles
                     next_diagonal_tile = diagonal_tile+1
-                    U_receive_requests[tile] =
-                        temp_Ireduce!(@view(y[max((n_tiles-tile)*tile_size+1,1):(n_tiles-tile+1)*tile_size]),
+                    U_receive_requests[next_diagonal_tile] =
+                        temp_Ireduce!(@view(y[max((n_tiles-next_diagonal_tile)*tile_size+1,1):(n_tiles-next_diagonal_tile+1)*tile_size]),
                                       +, distributed_comm; root=0)
                 end
             else
@@ -703,7 +703,7 @@ temp_Ireduce!(rbuf::MPI.RBuffer, op, root::Integer, comm::MPI.Comm, req::MPI.Abs
 temp_Ireduce!(sendbuf, recvbuf, op, root::Integer, comm::MPI.Comm, req::MPI.AbstractRequest=MPI.Request()) =
     temp_Ireduce!(MPI.RBuffer(sendbuf, recvbuf), op, root, comm, req)
 # inplace
-function Ireduce!(buf, op, root::Integer, comm::MPI.Comm, req::MPI.AbstractRequest=MPI.Request())
+function temp_Ireduce!(buf, op, root::Integer, comm::MPI.Comm, req::MPI.AbstractRequest=MPI.Request())
     if MPI.Comm_rank(comm) == root
         temp_Ireduce!(MPI.IN_PLACE, buf, op, root, comm, req)
     else
