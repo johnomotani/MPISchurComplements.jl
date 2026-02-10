@@ -99,10 +99,8 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
     n_steps_max = (n_tiles * (n_tiles + 1)) ÷ 2 # This is the number of steps if the tiles
                                                 # were handled in serial.
     if shared_comm_rank == 0 && distributed_comm_rank > 0
-        last_step_for_row = fill(0, n_tiles)
         first_step_for_column = fill(0, n_tiles)
     else
-        last_step_for_row = Int64[]
         first_step_for_column = Int64[]
     end
     if is_root
@@ -112,10 +110,10 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         # The pairs of entries in `tiles_for_rank` are the (row,column) of a tile. We
         # build up a list of these Tuples for each rank, indicating the tile that that
         # rank should work on on each step.
-        tiles_for_rank = fill(-1, 2, n_steps_max, shared_comm_size)
+        tiles_for_rank = fill(-1, 2, n_steps_max, shared_comm_size * distributed_comm_size)
         next_diagonal_tile = 1
         step = 1
-        rows_with_tasks = zeros(Int64, shared_comm_size)
+        rows_with_tasks = zeros(Int64, shared_comm_size * distributed_comm_size)
         diagonal_distances_row_maxima = fill(typemin(Int64), n_tiles)
         first_incomplete_column = 1
         while next_diagonal_tile ≤ n_tiles
@@ -178,7 +176,8 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                 end
             end
             this_diagonal_distances_row_maxima = @view diagonal_distances_row_maxima[this_diagonal_tile+1:n_tiles]
-            for rank ∈ 2:min(shared_comm_size, n_tiles - this_diagonal_tile + 1)
+            for rank ∈ 2:min(shared_comm_size * distributed_comm_size, n_tiles -
+                             this_diagonal_tile + 1)
                 max_distance = maximum(this_diagonal_distances_row_maxima)
                 if max_distance == typemin(Int64)
                     # No work available.
@@ -236,18 +235,18 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
 
         reqs = MPI.Request[]
         # First handle the processes in the same shared_comm as root.
-        # Note that `shared_comm_rank`, `block`, and `rank` are 0-based indices.
-        for shared_comm_rank ∈ 1:shared_comm_size-1
+        # Note that `sr`, `block`, and `rank` are 0-based indices.
+        for sr ∈ 1:shared_comm_size-1
             push!(reqs, MPI.Isend(@view(tiles_for_rank[:,:,rank+1]), shared_comm;
-                                  dest=shared_comm_rank))
+                                  dest=sr))
         end
         for block ∈ 1:distributed_comm_size-1
-            # Send shared_comm_rank=0 last, because it is the one that does not need to be
-            # passed on by the shared_comm_rank=0 process.
-            for shared_comm_rank ∈ [1:shared_comm_size-1...,0]
-                rank = block * shared_comm_size + shared_comm_rank
+            # Send sr=0 last, because it is the one that does not need to be passed on by
+            # the sr=0 process.
+            for sr ∈ [1:shared_comm_size-1...,0]
+                rank = block * shared_comm_size + sr
                 push!(reqs, MPI.Isend(@view(tiles_for_rank[:,:,rank+1]), distributed_comm;
-                                      dest=block, tag=shared_comm_rank))
+                                      dest=block, tag=sr))
             end
             MPI.Waitall(reqs)
         end
@@ -261,24 +260,32 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         # Receive tiles_for_rank for each process in this block, and then pass them on.
         # Use my_tiles_for_rank as a buffer to pass on these arrays.
         my_tiles_for_rank = zeros(Int64, 2, n_steps[])
-        for shared_comm_rank ∈ 1:shared_comm_size-1
-            MPI.Recv!(my_tiles_for_rank, distributed_comm; source=0, tag=shared_comm_rank)
+        for rank ∈ 1:shared_comm_size-1
+            MPI.Recv!(my_tiles_for_rank, distributed_comm; source=0, tag=rank)
 
             # Check for the last appearances of rows and first appearances of columns
             # while we are passing through my_tiles_for_rank to each process in the block.
             for step ∈ 1:n_steps[]
-                row, column = @view my_tiles_for_rank[:,step]
-                if step > last_step_for_row[row]
-                    last_step_for_row[row] = step
-                end
-                if step < first_step_for_column[column]
+                column = my_tiles_for_rank[2,step]
+                if step < first_step_for_column[column] ||
+                        first_step_for_column[column] == 0
                     first_step_for_column[column] = step
                 end
             end
 
-            MPI.Send(my_tiles_for_rank, shared_comm; dest=shared_comm_rank)
+            MPI.Send(my_tiles_for_rank, shared_comm; dest=rank)
         end
         MPI.Recv!(my_tiles_for_rank, distributed_comm; source=0, tag=0)
+        # Finish checking for the last appearances of rows and first appearances of
+        # columns while we are passing through my_tiles_for_rank to each process in the
+        # block.
+        for step ∈ 1:n_steps[]
+            column = my_tiles_for_rank[2,step]
+            if column > 0 && (step < first_step_for_column[column] ||
+                              first_step_for_column[column] == 0)
+                first_step_for_column[column] = step
+            end
+        end
     else
         n_steps = Ref(-1)
         diagonal_indices = Int64[]
