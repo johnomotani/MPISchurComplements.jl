@@ -26,9 +26,13 @@ tile_size = 2
             b = allocate_array_float(m)
             x = allocate_array_float(m)
 
-            if shared_rank == 0
+            if shared_rank == 0 && distributed_rank == 0
                 A .= rand(rng, m, m)
                 b .= rand(rng, m)
+            end
+            if shared_rank == 0
+                MPI.Bcast!(A, distributed_comm; root=0)
+                MPI.Bcast!(b, distributed_comm; root=0)
             end
             MPI.Barrier(shared_comm)
 
@@ -48,8 +52,11 @@ tile_size = 2
 #            end
 
             @testset "change b" begin
-                if shared_rank == 0
+                if shared_rank == 0 && distributed_rank == 0
                     b .= rand(rng, m)
+                end
+                if shared_rank == 0
+                    MPI.Bcast!(b, distributed_comm; root=0)
                 end
                 MPI.Barrier(shared_comm)
 
@@ -57,9 +64,13 @@ tile_size = 2
             end
 
             @testset "change A" begin
-                if shared_rank == 0
+                if shared_rank == 0 && distributed_rank == 0
                     A .= rand(rng, m, m)
                     b .= rand(rng, m)
+                end
+                if shared_rank == 0
+                    MPI.Bcast!(A, distributed_comm; root=0)
+                    MPI.Bcast!(b, distributed_comm; root=0)
                 end
                 MPI.Barrier(shared_comm)
 
@@ -69,8 +80,11 @@ tile_size = 2
             end
 
             @testset "change A, change b" begin
-                if shared_rank == 0
+                if shared_rank == 0 && distributed_rank == 0
                     b .= rand(rng, m)
+                end
+                if shared_rank == 0
+                    MPI.Bcast!(b, distributed_comm; root=0)
                 end
                 MPI.Barrier(shared_comm)
 

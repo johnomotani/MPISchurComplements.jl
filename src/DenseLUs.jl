@@ -237,7 +237,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         # First handle the processes in the same shared_comm as root.
         # Note that `sr`, `block`, and `rank` are 0-based indices.
         for sr ∈ 1:shared_comm_size-1
-            push!(reqs, MPI.Isend(@view(tiles_for_rank[:,:,rank+1]), shared_comm;
+            push!(reqs, MPI.Isend(@view(tiles_for_rank[:,:,sr+1]), shared_comm;
                                   dest=sr))
         end
         for block ∈ 1:distributed_comm_size-1
@@ -297,10 +297,10 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
     # Need to find the steps where the following step is the first one that uses the
     # solution on a certain tile.
     if shared_comm_rank == 0 && distributed_comm_rank > 0
-        new_column_triggers = zeros(shared_comm_size, n_steps[])
+        new_column_triggers = zeros(Int64, shared_comm_size, n_steps[])
         for (tile, step) ∈ enumerate(first_step_for_column)
             for i ∈ 1:shared_comm_size
-                if new_column_triggers[i,step-1] == 0
+                if step > 0 && new_column_triggers[i,step-1] == 0
                     new_column_triggers[i,step-1] = tile
                     break
                 end
