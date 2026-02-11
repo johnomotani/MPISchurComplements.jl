@@ -177,7 +177,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
             end
             this_diagonal_distances_row_maxima = @view diagonal_distances_row_maxima[this_diagonal_tile+1:n_tiles]
             for rank ∈ 2:min(shared_comm_size * distributed_comm_size,
-                             n_tiles - this_diagonal_tile + 1 + 1)
+                             n_tiles - this_diagonal_tile + 1)
                 max_distance = maximum(this_diagonal_distances_row_maxima)
                 if max_distance == typemin(Int64)
                     # No work available.
@@ -218,7 +218,10 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         for block ∈ 0:distributed_comm_size-1
             ranks = block*shared_comm_size+1:(block+1)*shared_comm_size
             for step ∈ 1:n_steps[]
-                sorted_inds = sortperm(@view(tiles_for_rank[1,step,ranks]))
+                # A value of -1 indicates no tile, so sort this after any positive
+                # integers.
+                sorted_inds = sortperm(@view(tiles_for_rank[1,step,ranks]);
+                                       lt=(x,y)->x==-1 ? false : y==-1 ? true : x < y)
                 # Note do *not* use views to do this, as we want to create a permuted
                 # intermediate copy, then copy that into the original array. In-place
                 # would be trickier and any attempt at optimization would be overkill here
@@ -433,6 +436,7 @@ function ldiv!(x::AbstractVector{T}, A_lu::DenseLU{T}, b::AbstractVector{T}) whe
     row_permutation = A_lu.row_permutation
     b_permuted = A_lu.vec_buffer1
     y = A_lu.vec_buffer2
+    shared_comm_rank = A_lu.shared_comm_rank
     synchronize_shared = A_lu.synchronize_shared
 
     # Permute the RHS, storing in buffer2. This accounts for 'row permutations' that were
@@ -505,9 +509,9 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
                 # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm), so we
                 # cannot start this operation earlier.
                 if diagonal_tile < n_tiles
-                    next_diagonal_tile = diagonal_tile+1
-                    L_receive_requests[next_diagonal_tile] =
-                        temp_Ireduce!(@view(b[(next_diagonal_tile-1)*tile_size+1:min(next_diagonal_tile*tile_size,m)]), +,
+                    t = diagonal_tile+1
+                    L_receive_requests[t] =
+                        temp_Ireduce!(@view(b[(t-1)*tile_size+1:min(t*tile_size,m)]), +,
                                       distributed_comm; root=0)
                 end
             else
@@ -545,17 +549,16 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
                     # have to match the order that these operations are started on the root
                     # process.
                     L_receive_requests[maybe_diagonal_tile] =
-                        temp_Ibcast!(@view(y[(maybe_diagonal_tile-1)*tile_size:min(maybe_diagonal_tile*tile_size, m)]),
+                        temp_Ibcast!(@view(y[(maybe_diagonal_tile-1)*tile_size+1:min(maybe_diagonal_tile*tile_size, m)]),
                                      distributed_comm; root=0)
                     if maybe_diagonal_tile < n_tiles
                         # We have sorted the tiles so that the shared_comm_rank=0 process
                         # always handles the lowest row in the block, so if
-                        # `next_diagonal_tile` was handled on this step on this block, it
-                        # was definitely handled on this rank, so we do not need to
-                        # synchronize.
-                        next_diagonal_tile = maybe_diagonal_tile + 1
-                        L_send_requests[next_diagonal_tile] =
-                            temp_Ireduce!(@view(rhs_update_buffer[(next_diagonal_tile-1)*tile_size+1:min(next_diagonal_tile*tile_size,m)]),
+                        # `t` was handled on this step on this block, it was definitely
+                        # handled on this rank, so we do not need to synchronize.
+                        t = maybe_diagonal_tile + 1
+                        L_send_requests[t] =
+                            temp_Ireduce!(@view(rhs_update_buffer[(t-1)*tile_size+1:min(t*tile_size,m)]),
                                           +, distributed_comm; root=0)
                     end
                 end
@@ -661,17 +664,17 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                     # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm), so we
                     # have to match the order that these operations are started on the root
                     # process.
-                    U_receive_requests[tile] =
-                        temp_Ibcast!(@view(x[max((n_tiles-tile)*tile_size+1,1):(n_tiles-tile+1)*tile_size]),
+                    U_receive_requests[maybe_diagonal_tile] =
+                        temp_Ibcast!(@view(x[max((n_tiles-maybe_diagonal_tile)*tile_size+1,1):(n_tiles-maybe_diagonal_tile+1)*tile_size]),
                                      distributed_comm; root=0)
                     if maybe_diagonal_tile < n_tiles
                         # We have sorted the tiles so that the shared_comm_rank=0 process
                         # always handles the lowest row in the block, so if
-                        # `next_diagonal_tile` was handled on this step on this block, it
-                        # was definitely handled on this rank, so we do not need to
-                        # synchronize.
-                        U_send_requests[tile] =
-                            temp_Ireduce!(@view(rhs_update_buffer[max((n_tiles-tile)*tile_size+1,1):(n_tiles-tile+1)*tile_size]),
+                        # `t` was handled on this step on this block, it was definitely
+                        # handled on this rank, so we do not need to synchronize.
+                        t = maybe_diagonal_tile + 1
+                        U_send_requests[t] =
+                            temp_Ireduce!(@view(rhs_update_buffer[max((n_tiles-t)*tile_size+1,1):(n_tiles-t+1)*tile_size]),
                                           +, distributed_comm; root=0)
                     end
                 end
