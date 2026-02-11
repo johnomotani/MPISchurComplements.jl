@@ -251,8 +251,8 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                 push!(reqs, MPI.Isend(@view(tiles_for_rank[:,:,rank+1]), distributed_comm;
                                       dest=block, tag=sr))
             end
-            MPI.Waitall(reqs)
         end
+        MPI.Waitall(reqs)
         my_tiles_for_rank = tiles_for_rank[:,:,1]
     elseif shared_comm_rank == 0
         n_steps = Ref(-1)
@@ -457,6 +457,8 @@ function ldiv!(x::AbstractVector{T}, A_lu::DenseLU{T}, b::AbstractVector{T}) whe
     elseif shared_comm_rank == 0
         MPI.Waitall(A_lu.L_send_requests)
         MPI.Waitall(A_lu.U_send_requests)
+        MPI.Waitall(A_lu.L_receive_requests)
+        MPI.Waitall(A_lu.U_receive_requests)
     end
     synchronize_shared()
 
@@ -502,13 +504,14 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
                 @views trsv!('L', 'N', 'U',
                              my_L_tiles[1:length(row_range),1:length(col_range),step],
                              y[col_range])
-                L_send_requests[diagonal_tile] = temp_Ibcast!(@view(y[col_range]),
-                                                              distributed_comm; root=0)
-                # Start MPI.Ireduce!() ready for the next diagonal tile. MPI non-blocking
-                # collective operations have to be called in the same order on all ranks
-                # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm), so we
-                # cannot start this operation earlier.
                 if diagonal_tile < n_tiles
+                    L_send_requests[diagonal_tile] = temp_Ibcast!(@view(y[col_range]),
+                                                                  distributed_comm; root=0)
+                    # Start MPI.Ireduce!() ready for the next diagonal tile. MPI
+                    # non-blocking collective operations have to be called in the same
+                    # order on all ranks
+                    # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm),
+                    # so we cannot start this operation earlier.
                     t = diagonal_tile+1
                     L_receive_requests[t] =
                         temp_Ireduce!(@view(b[(t-1)*tile_size+1:min(t*tile_size,m)]), +,
@@ -548,10 +551,10 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
                     # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm), so we
                     # have to match the order that these operations are started on the root
                     # process.
-                    L_receive_requests[maybe_diagonal_tile] =
-                        temp_Ibcast!(@view(y[(maybe_diagonal_tile-1)*tile_size+1:min(maybe_diagonal_tile*tile_size, m)]),
-                                     distributed_comm; root=0)
                     if maybe_diagonal_tile < n_tiles
+                        L_receive_requests[maybe_diagonal_tile] =
+                            temp_Ibcast!(@view(y[(maybe_diagonal_tile-1)*tile_size+1:min(maybe_diagonal_tile*tile_size, m)]),
+                                         distributed_comm; root=0)
                         # We have sorted the tiles so that the shared_comm_rank=0 process
                         # always handles the lowest row in the block, so if
                         # `t` was handled on this step on this block, it was definitely
@@ -580,6 +583,7 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
 end
 
 function U_solve!(x, A_lu::DenseLU{T}, y) where T
+    m = A_lu.m
     n_tiles = A_lu.n_tiles
     tile_size = A_lu.tile_size
     my_U_tiles = A_lu.my_U_tiles
@@ -619,14 +623,15 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                              x[col_range])
                 U_send_requests[diagonal_tile] = temp_Ibcast!(@view(x[col_range]),
                                                               distributed_comm; root=0)
-                # Start MPI.Ireduce!() ready for the next diagonal tile. MPI non-blocking
-                # collective operations have to be called in the same order on all ranks
-                # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm), so we
-                # cannot start this operation earlier.
                 if diagonal_tile < n_tiles
-                    next_diagonal_tile = diagonal_tile+1
-                    U_receive_requests[next_diagonal_tile] =
-                        temp_Ireduce!(@view(y[max((n_tiles-next_diagonal_tile)*tile_size+1,1):(n_tiles-next_diagonal_tile+1)*tile_size]),
+                    # Start MPI.Ireduce!() ready for the next diagonal tile. MPI
+                    # non-blocking collective operations have to be called in the same
+                    # order on all ranks
+                    # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm),
+                    # so we cannot start this operation earlier.
+                    t = diagonal_tile+1
+                    U_receive_requests[t] =
+                        temp_Ireduce!(@view(y[max(m-t*tile_size+1,1):m-(t-1)*tile_size]),
                                       +, distributed_comm; root=0)
                 end
             else
@@ -648,7 +653,7 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                 # this is just the full range, because the last row may have a different
                 # size
                 @views gemm!('N', 'N', -one(T), my_U_tiles[1:length(row_range),:,step],
-                             x[col_range], one(T), y[row_range])
+                             x[col_range], one(T), rhs_update_buffer[row_range])
             end
             # Get data required for the next tiles processed on the block.
             if shared_comm_rank == 0
@@ -665,7 +670,7 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                     # have to match the order that these operations are started on the root
                     # process.
                     U_receive_requests[maybe_diagonal_tile] =
-                        temp_Ibcast!(@view(x[max((n_tiles-maybe_diagonal_tile)*tile_size+1,1):(n_tiles-maybe_diagonal_tile+1)*tile_size]),
+                        temp_Ibcast!(@view(x[max(m-maybe_diagonal_tile*tile_size+1,1):m-(maybe_diagonal_tile-1)*tile_size]),
                                      distributed_comm; root=0)
                     if maybe_diagonal_tile < n_tiles
                         # We have sorted the tiles so that the shared_comm_rank=0 process
@@ -674,7 +679,7 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                         # handled on this rank, so we do not need to synchronize.
                         t = maybe_diagonal_tile + 1
                         U_send_requests[t] =
-                            temp_Ireduce!(@view(rhs_update_buffer[max((n_tiles-t)*tile_size+1,1):(n_tiles-t+1)*tile_size]),
+                            temp_Ireduce!(@view(rhs_update_buffer[max(m-t*tile_size+1,1):m-(t-1)*tile_size]),
                                           +, distributed_comm; root=0)
                     end
                 end
