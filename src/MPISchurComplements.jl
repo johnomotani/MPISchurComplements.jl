@@ -850,19 +850,15 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     end
 
     if parallel_schur
-        if distributed_rank == 0
-            if schur_tile_size === nothing
-                power_of_2 = floor(Int64, log2(bottom_vec_global_size / 2))
-                schur_tile_size = min(256, 2^power_of_2)
-            end
-            schur_complement_factorization =
-                dense_lu(schur_complement, schur_tile_size, distributed_comm, shared_comm,
-                         allocate_shared_float, allocate_shared_int;
-                         synchronize_shared=synchronize_shared, skip_factorization=true,
-                         check_lu=check_lu)
-        else
-            schur_complement_factorization = nothing
+        if schur_tile_size === nothing
+            power_of_2 = floor(Int64, log2(bottom_vec_global_size / 2))
+            schur_tile_size = min(256, 2^power_of_2)
         end
+        schur_complement_factorization =
+            dense_lu(schur_complement, schur_tile_size, distributed_comm, shared_comm,
+                     allocate_shared_float, allocate_shared_int;
+                     synchronize_shared=synchronize_shared, skip_factorization=true,
+                     check_lu=check_lu)
     else
         if shared_rank == 0 && distributed_rank == 0
             schur_complement_factorization =
@@ -1150,18 +1146,12 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             # distributed MPI, but we expect this step not to be a bottleneck, so it is done in
             # serial (at least for now).
             if isa(sc.schur_complement_factorization, DenseLU)
-                if distributed_rank == 0
-                    lu!(sc.schur_complement_factorization, schur_complement)
-                end
-            else
-                if shared_rank == 0
-                    if distributed_rank == 0
-                        new_lu = lu!(schur_complement; check=check_lu)
-                        schur_complement_factorization = sc.schur_complement_factorization
-                        schur_complement_factorization.factors .= new_lu.factors
-                        schur_complement_factorization.ipiv .= new_lu.ipiv
-                    end
-                end
+                lu!(sc.schur_complement_factorization, schur_complement)
+            elseif shared_rank == 0 && distributed_rank == 0
+                new_lu = lu!(schur_complement; check=check_lu)
+                schur_complement_factorization = sc.schur_complement_factorization
+                schur_complement_factorization.factors .= new_lu.factors
+                schur_complement_factorization.ipiv .= new_lu.ipiv
             end
         end
     end
@@ -1262,9 +1252,7 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
             end
 
             if parallel_schur
-                if distributed_rank == 0
-                    ldiv!(global_y, schur_complement_factorization, bottom_vec_buffer)
-                end
+                ldiv!(global_y, schur_complement_factorization, bottom_vec_buffer)
             else
                 if shared_rank == 0 && distributed_rank == 0
                     ldiv!(global_y, schur_complement_factorization, bottom_vec_buffer)
