@@ -1,5 +1,6 @@
 using MPISchurComplements.DenseLUs
 using Combinatorics
+using LinearAlgebra
 using Primes
 
 function dense_lu_test(n_shared)
