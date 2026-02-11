@@ -147,7 +147,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                 end
             end
             this_diagonal_distances_row_maxima = @view diagonal_distances_row_maxima[this_diagonal_tile+1:n_tiles]
-            for rank ∈ 2:min(shared_comm_size, n_tiles - this_diagonal_tile)
+            for rank ∈ 2:min(shared_comm_size, n_tiles - this_diagonal_tile + 1)
                 max_distance = maximum(this_diagonal_distances_row_maxima)
                 if max_distance == typemin(Int64)
                     # No work available.
