@@ -105,6 +105,7 @@ struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,TCAiB,TCAiu,TAiBy,Tt
     use_sparse::Bool
     separate_Ainv_B::Bool
     parallel_schur::Bool
+    check_lu::Bool
     timer::Ttimer
 end
 
@@ -277,7 +278,8 @@ end
                          synchronize_shared::Union{Function,Nothing}=nothing,
                          use_sparse=true, separate_Ainv_B=false,
                          parallel_schur=shared_comm!==nothing,
-                         skip_factorization=false,
+                         schur_tile_size=nothing, skip_factorization=false,
+                         check_lu::Bool=true,
                          timer::Union{TimerOutput,Nothing}=nothing)
 
 Initialise an MPISchurComplement struct representing a 2x2 block-structured matrix
@@ -382,6 +384,10 @@ calculating the factorization corresponding to the input matrices. `ldiv!()` cal
 this instance will give incorrect results unless `update_schur_complement!()` is called
 first.
 
+`check_lu=false` can be passed to disable checks when performing dense LU factorizations.
+This may increase the speed of the factorization, but leaves it up to the user to
+guarantee correctness of the input matrices.
+
 A `TimerOutput` instance can be passed to `timer` to record timings of various
 subroutines.
 """
@@ -400,6 +406,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                               use_sparse=true, separate_Ainv_B=false,
                               parallel_schur=shared_comm!==nothing,
                               schur_tile_size=nothing, skip_factorization=false,
+                              check_lu::Bool=true,
                               timer::Union{TimerOutput,Nothing}=nothing)
 
     data_type = eltype(D)
@@ -851,14 +858,16 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
             schur_complement_factorization =
                 dense_lu(schur_complement, schur_tile_size, shared_comm,
                          allocate_shared_float, allocate_shared_int;
-                         synchronize_shared=synchronize_shared, skip_factorization=true)
+                         synchronize_shared=synchronize_shared, skip_factorization=true,
+                         check_lu=check_lu)
         else
             schur_complement_factorization = nothing
         end
     else
         if shared_rank == 0 && distributed_rank == 0
             schur_complement_factorization =
-                lu!(Matrix{data_type}(I, bottom_vec_global_size, bottom_vec_global_size))
+                lu!(Matrix{data_type}(I, bottom_vec_global_size, bottom_vec_global_size);
+                    check=check_lu)
         else
             schur_complement_factorization = nothing
         end
@@ -905,7 +914,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                                           local_bottom_vector_repeats_partial,
                                           distributed_comm, distributed_rank, shared_comm,
                                           shared_rank, synchronize_shared, use_sparse,
-                                          separate_Ainv_B, parallel_schur, timer)
+                                          separate_Ainv_B, parallel_schur, check_lu,
+                                          timer)
 
     if !skip_factorization
         update_schur_complement!(sc_factorization, missing, B, C, D)
@@ -978,6 +988,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
         synchronize_shared = sc.synchronize_shared
         use_sparse = sc.use_sparse
         separate_Ainv_B = sc.separate_Ainv_B
+        check_lu = sc.check_lu
 
         # When `A===missing`, this was called from the `mpi_schur_complement()` constructor,
         # where we assume `A_factorization` was already initialized.
@@ -1145,7 +1156,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             else
                 if shared_rank == 0
                     if distributed_rank == 0
-                        new_lu = lu!(schur_complement)
+                        new_lu = lu!(schur_complement; check=check_lu)
                         schur_complement_factorization = sc.schur_complement_factorization
                         schur_complement_factorization.factors .= new_lu.factors
                         schur_complement_factorization.ipiv .= new_lu.ipiv
