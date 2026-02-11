@@ -11,16 +11,14 @@ function dense_lu_test(n_shared)
 
     rng = StableRNG(3002)
 
-#    @testset "dense_lu $n_shared" begin
-#        @testset "m=$m, tile_size=$tile_size" for m ∈ (32, 33, 100, 128, 1009, 1024),
-#                                                  tile_size ∈ (2, 3, 25, 32, 90, 128)
-m = 32
-tile_size = 2
-#            if tile_size > m + 5
-#                # If tile_size is bigger than m, the actual value of tile_size does not
-#                # matter, so skip what would (mostly?) be identical repeated tests.
-#                continue
-#            end
+    @testset "dense_lu $n_shared" begin
+        @testset "m=$m, tile_size=$tile_size" for m ∈ (32, 33, 100, 128, 1009, 1024),
+                                                  tile_size ∈ (2, 3, 25, 32, 90, 128)
+            if tile_size > m + 5
+                # If tile_size is bigger than m, the actual value of tile_size does not
+                # matter, so skip what would (mostly?) be identical repeated tests.
+                continue
+            end
             println("dense_lu n_shared=$n_shared, m=$m, tile_size=$tile_size")
 
             A = allocate_array_float(m, m)
@@ -91,8 +89,8 @@ tile_size = 2
 
                 test_once()
             end
-#        end
-#    end
+        end
+    end
 
     if local_win_store_float !== nothing
         # Free the MPI.Win objects, because if they are free'd by the garbage collector
