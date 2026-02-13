@@ -270,8 +270,8 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
             # while we are passing through my_tiles_for_rank to each process in the block.
             for step ∈ 1:n_steps[]
                 column = my_tiles_for_rank[2,step]
-                if step < first_step_for_column[column] ||
-                        first_step_for_column[column] == 0
+                if column > 0 && (step < first_step_for_column[column] ||
+                                  first_step_for_column[column] == 0)
                     first_step_for_column[column] = step
                 end
             end
