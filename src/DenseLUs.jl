@@ -113,7 +113,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         tiles_for_rank = fill(-1, 2, n_steps_max, shared_comm_size * distributed_comm_size)
         next_diagonal_tile = 1
         step = 1
-        rows_with_tasks = zeros(Int64, shared_comm_size * distributed_comm_size)
+        rows_with_tasks = zeros(Int64, shared_comm_size, distributed_comm_size)
         diagonal_distances_row_maxima = fill(typemin(Int64), n_tiles)
         first_incomplete_column = 1
         while next_diagonal_tile ≤ n_tiles
@@ -176,20 +176,23 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                 end
             end
             this_diagonal_distances_row_maxima = @view diagonal_distances_row_maxima[this_diagonal_tile+1:n_tiles]
-            for rank ∈ 2:min(shared_comm_size * distributed_comm_size,
-                             n_tiles - this_diagonal_tile + 1)
+            for block ∈ 1:distributed_comm_size, sr ∈ 1:shared_comm_size
+                rank = (block - 1) * shared_comm_size + sr
+                if rank == 1 || rank > n_tiles - this_diagonal_tile + 1
+                    continue
+                end
                 max_distance = maximum(this_diagonal_distances_row_maxima)
                 if max_distance == typemin(Int64)
                     # No work available.
                 else
                     for irow ∈ this_diagonal_tile+1:n_tiles
                         rowmax = diagonal_distances_row_maxima[irow]
-                        if rowmax == max_distance && !(irow ∈ rows_with_tasks)
+                        if rowmax == max_distance && !(irow ∈ @view rows_with_tasks[:,block])
                             tiles_for_rank[1,step,rank] = irow
                             icolumn = first_unhandled_column_in_row[irow]
                             tiles_for_rank[2,step,rank] = icolumn
                             first_unhandled_column_in_row[irow] += 1
-                            rows_with_tasks[rank] = irow
+                            rows_with_tasks[sr,block] = irow
                             if icolumn == n_tiles
                                 first_incomplete_column = icolumn
                             end
