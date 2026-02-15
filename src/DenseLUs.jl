@@ -27,7 +27,8 @@ struct DenseLU{T,Tmat,Tvec,Tsync}
     new_column_triggers::Matrix{Int64}
     vec_buffer1::Tvec
     vec_buffer2::Tvec
-    rhs_update_buffer::Tvec
+    L_rhs_update_buffer::Tvec
+    U_rhs_update_buffer::Tvec
     tile_size::Int64
     n_tiles::Int64
     shared_comm::MPI.Comm
@@ -63,7 +64,8 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
     factors = allocate_shared_float(m, n)
     vec_buffer1 = allocate_shared_float(m)
     vec_buffer2 = allocate_shared_float(m)
-    rhs_update_buffer = allocate_shared_float(m)
+    L_rhs_update_buffer = allocate_shared_float(m)
+    U_rhs_update_buffer = allocate_shared_float(m)
 
     shared_comm_rank = MPI.Comm_rank(shared_comm)
     shared_comm_size = MPI.Comm_size(shared_comm)
@@ -369,10 +371,10 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                     my_L_tile_col_ranges, L_receive_requests, L_send_requests, my_U_tiles,
                     my_U_tile_row_ranges, my_U_tile_col_ranges, U_receive_requests,
                     U_send_requests, diagonal_indices, new_column_triggers, vec_buffer1,
-                    vec_buffer2, rhs_update_buffer, tile_size, n_tiles, shared_comm,
-                    shared_comm_rank, shared_comm_size, distributed_comm,
-                    distributed_comm_rank, distributed_comm_size, is_root,
-                    synchronize_shared, check_lu)
+                    vec_buffer2, L_rhs_update_buffer, U_rhs_update_buffer, tile_size,
+                    n_tiles, shared_comm, shared_comm_rank, shared_comm_size,
+                    distributed_comm, distributed_comm_rank, distributed_comm_size,
+                    is_root, synchronize_shared, check_lu)
 
     if !skip_factorization
         @time lu!(A_lu, A)
@@ -480,12 +482,12 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
     L_receive_requests = A_lu.L_receive_requests
     L_send_requests = A_lu.L_send_requests
     new_column_triggers = A_lu.new_column_triggers
-    rhs_update_buffer = A_lu.rhs_update_buffer
+    L_rhs_update_buffer = A_lu.L_rhs_update_buffer
     shared_comm_rank = A_lu.shared_comm_rank
     distributed_comm = A_lu.distributed_comm
 
     if shared_comm_rank == 0
-        rhs_update_buffer .= 0.0
+        L_rhs_update_buffer .= 0.0
     end
 
     if A_lu.is_root
@@ -500,7 +502,7 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
                 # Root process always wrote to b[tile_range] on the previous step, so no
                 # need to synchronize before this calculation.
                 # Still need to add this block's contributions to `b`.
-                @views @. y[col_range] = b[col_range] + rhs_update_buffer[col_range]
+                @views @. y[col_range] = b[col_range] + L_rhs_update_buffer[col_range]
                 # Need the [1:length(row_range),1:length(col_range)] selection, even
                 # though for most tiles this is just the full range, because the last row
                 # and column may have a different size
@@ -525,7 +527,7 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
                 # this is just the full range, because the last row may have a different
                 # size
                 @views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
-                             y[col_range], one(T), rhs_update_buffer[row_range])
+                             y[col_range], one(T), L_rhs_update_buffer[row_range])
             end
             # Synchronize to avoid race conditions.
             synchronize_shared()
@@ -539,10 +541,10 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
                 # this is just the full range, because the last row may have a different
                 # size
                 @views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
-                             y[col_range], one(T), rhs_update_buffer[row_range])
+                             y[col_range], one(T), L_rhs_update_buffer[row_range])
             end
             if shared_comm_rank == 0
-                # `diagonal_indices[step]` is non-zero if the root process is hanlding a
+                # `diagonal_indices[step]` is non-zero if the root process is handling a
                 # diagonal tile on this step.
                 maybe_diagonal_tile = diagonal_indices[step]
                 if maybe_diagonal_tile > 0
@@ -564,7 +566,7 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
                         # handled on this rank, so we do not need to synchronize.
                         t = maybe_diagonal_tile + 1
                         L_send_requests[t] =
-                            temp_Ireduce!(@view(rhs_update_buffer[(t-1)*tile_size+1:min(t*tile_size,m)]),
+                            temp_Ireduce!(@view(L_rhs_update_buffer[(t-1)*tile_size+1:min(t*tile_size,m)]),
                                           +, distributed_comm; root=0)
                     end
                 end
@@ -597,12 +599,12 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
     U_receive_requests = A_lu.U_receive_requests
     U_send_requests = A_lu.U_send_requests
     new_column_triggers = A_lu.new_column_triggers
-    rhs_update_buffer = A_lu.rhs_update_buffer
+    U_rhs_update_buffer = A_lu.U_rhs_update_buffer
     shared_comm_rank = A_lu.shared_comm_rank
     distributed_comm = A_lu.distributed_comm
 
     if shared_comm_rank == 0
-        rhs_update_buffer .= 0.0
+        U_rhs_update_buffer .= 0.0
     end
 
     if A_lu.is_root
@@ -617,7 +619,7 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                 # Root process always wrote to b[tile_range] on the previous step, so no
                 # need to synchronize before this calculation.
                 # Still need to add this block's contributions to `y`.
-                @views @. x[col_range] = y[col_range] + rhs_update_buffer[col_range]
+                @views @. x[col_range] = y[col_range] + U_rhs_update_buffer[col_range]
                 # Need the [1:length(row_range),1:length(col_range)] selection, even
                 # though for most tiles this is just the full range, because the last row
                 # and column may have a different size
@@ -642,7 +644,7 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                 # this is just the full range, because the last row may have a different
                 # size
                 @views gemm!('N', 'N', -one(T), my_U_tiles[1:length(row_range),:,step],
-                             x[col_range], one(T), rhs_update_buffer[row_range])
+                             x[col_range], one(T), U_rhs_update_buffer[row_range])
             end
             # Synchronize to avoid race conditions.
             synchronize_shared()
@@ -656,11 +658,11 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                 # this is just the full range, because the last row may have a different
                 # size
                 @views gemm!('N', 'N', -one(T), my_U_tiles[1:length(row_range),:,step],
-                             x[col_range], one(T), rhs_update_buffer[row_range])
+                             x[col_range], one(T), U_rhs_update_buffer[row_range])
             end
             # Get data required for the next tiles processed on the block.
             if shared_comm_rank == 0
-                # `diagonal_indices[step]` is non-zero if the root process is hanlding a
+                # `diagonal_indices[step]` is non-zero if the root process is handling a
                 # diagonal tile on this step.
                 maybe_diagonal_tile = diagonal_indices[step]
                 if maybe_diagonal_tile > 0
@@ -682,7 +684,7 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                         # handled on this rank, so we do not need to synchronize.
                         t = maybe_diagonal_tile + 1
                         U_send_requests[t] =
-                            temp_Ireduce!(@view(rhs_update_buffer[max(m-t*tile_size+1,1):m-(t-1)*tile_size]),
+                            temp_Ireduce!(@view(U_rhs_update_buffer[max(m-t*tile_size+1,1):m-(t-1)*tile_size]),
                                           +, distributed_comm; root=0)
                     end
                 end
