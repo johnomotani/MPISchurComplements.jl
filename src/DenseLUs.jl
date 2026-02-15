@@ -238,6 +238,8 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         step_needs_synchronize = step_needs_synchronize[1:n_steps[],:]
         # Always synchronize on the final step.
         step_needs_synchronize[end,:] .= true
+        # Convert because Int64 is more convenient to communicate over MPI than Bool.
+        step_needs_synchronize = Int64.(step_needs_synchronize)
 
         # Sort the tiles so that the shared_comm_rank=0 process on each block handles the
         # 'lowest'/'highest' row for the L/U solve. This avoids the need for a
