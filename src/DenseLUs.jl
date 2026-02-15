@@ -247,7 +247,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                     rank_worked_on_row_current_step[irow,block] = sr
                     if rank_worked_on_row_since_synchronize[irow,block] ∉ (0, sr)
                         step_needs_synchronize[step-1, block] = true
-                        rank_worked_on_row_since_synchronize[:,block] .=
+                        @views rank_worked_on_row_since_synchronize[:,block] .=
                             rank_worked_on_row_current_step[:,block]
                     else
                         rank_worked_on_row_since_synchronize[irow,block] = sr
@@ -357,6 +357,19 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         end
     else
         new_column_triggers = zeros(Int64, 0, 0)
+    end
+
+    # Also need to trigger synchronization after every step where we wait for 'new column'
+    # data. The MPI.Wait() is only called on the root process of the shared-memory block,
+    # so without a synchronize_shared() call, there would be a risk of other processes
+    # using the data before the MPI.Wait() completed.
+    if shared_comm_rank == 0 && distributed_comm_rank > 0
+        for step ∈ 1:n_steps[]
+            if any(@view(new_column_triggers[:,step]) .> 0)
+                # We call MPI.Wait() one or more times on this step.
+                step_needs_synchronize_this_block[step] = 1
+            end
+        end
     end
 
     # Store the tiles that will be handled by this process in contiguous arrays.
