@@ -180,7 +180,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
             this_diagonal_distances_row_maxima = @view diagonal_distances_row_maxima[this_diagonal_tile+1:n_tiles]
             for block ∈ 1:distributed_comm_size, sr ∈ 1:shared_comm_size
                 rank = (block - 1) * shared_comm_size + sr
-                if rank == 1 || rank > n_tiles - this_diagonal_tile + 1
+                if rank == 1 || length(this_diagonal_distances_row_maxima) == 0
                     continue
                 end
                 max_distance = maximum(this_diagonal_distances_row_maxima)
