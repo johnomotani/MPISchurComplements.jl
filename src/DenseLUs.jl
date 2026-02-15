@@ -8,7 +8,7 @@ using MPI
 
 import LinearAlgebra: lu!, ldiv!
 
-struct DenseLU{T,Tmat,Tvec,Tsync}
+struct DenseLU{T,Tmat,Tvec,Tintvec,Tsync}
     m::Int64
     n::Int64
     factors::Tmat
@@ -25,6 +25,7 @@ struct DenseLU{T,Tmat,Tvec,Tsync}
     U_send_requests::Vector{MPI.Request}
     diagonal_indices::Vector{Int64}
     new_column_triggers::Matrix{Int64}
+    step_needs_synchronize_this_block::Tintvec
     vec_buffer1::Tvec
     vec_buffer2::Tvec
     L_rhs_update_buffer::Tvec
@@ -107,7 +108,6 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
     end
     if is_root
         diagonal_indices = fill(0, n_steps_max)
-        diagonal_tiles = fill(-1, n_steps_max)
         first_unhandled_column_in_row = ones(Int64, n_tiles)
         # The pairs of entries in `tiles_for_rank` are the (row,column) of a tile. We
         # build up a list of these Tuples for each rank, indicating the tile that that
@@ -235,11 +235,45 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
             end
         end
 
+        # Need to check which steps need synchronization after sorting.
+        step_needs_synchronize = fill(false, n_steps[], distributed_comm_size)
+        rank_worked_on_row_since_synchronize = zeros(Int64, n_tiles, distributed_comm_size)
+        rank_worked_on_row_current_step = zeros(Int64, n_tiles, distributed_comm_size)
+        for step ∈ 1:n_steps[]
+            for block ∈ 1:distributed_comm_size, sr ∈ 1:shared_comm_size
+                rank = (block - 1) * shared_comm_size + sr
+                irow = tiles_for_rank[1,step,rank]
+                if irow > 0
+                    rank_worked_on_row_current_step[irow,block] = sr
+                    if rank_worked_on_row_since_synchronize[irow,block] ∉ (0, sr)
+                        step_needs_synchronize[step-1, block] = true
+                        @views rank_worked_on_row_since_synchronize[:,block] .=
+                            rank_worked_on_row_current_step[:,block]
+                    else
+                        rank_worked_on_row_since_synchronize[irow,block] = sr
+                    end
+                end
+            end
+            if diagonal_indices[step] > 0
+                # Always need to synchronize after diagonal steps, so that the new
+                # solution vector entries can be used by non-root proceses.
+                step_needs_synchronize[step,:] .= true
+                rank_worked_on_row_since_synchronize .= 0
+            end
+            rank_worked_on_row_current_step .= 0
+        end
+        # Always synchronize on the final step.
+        step_needs_synchronize[end,:] .= true
+        # Convert because Int64 is more convenient to communicate over MPI than Bool.
+        step_needs_synchronize = Int64.(step_needs_synchronize)
+
         diagonal_indices = diagonal_indices[1:n_steps[]]
 
         MPI.Bcast!(n_steps, distributed_comm; root=0)
         MPI.Bcast!(n_steps, shared_comm; root=0)
         MPI.Bcast!(diagonal_indices, distributed_comm; root=0)
+
+        step_needs_synchronize_this_block = allocate_shared_int(n_steps[])
 
         reqs = MPI.Request[]
         # First handle the processes in the same shared_comm as root.
@@ -248,6 +282,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
             push!(reqs, MPI.Isend(@view(tiles_for_rank[:,:,sr+1]), shared_comm;
                                   dest=sr))
         end
+        step_needs_synchronize_this_block .= @view step_needs_synchronize[:,1]
         for block ∈ 1:distributed_comm_size-1
             # Send sr=0 last, because it is the one that does not need to be passed on by
             # the sr=0 process.
@@ -256,6 +291,8 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                 push!(reqs, MPI.Isend(@view(tiles_for_rank[:,:,rank+1]), distributed_comm;
                                       dest=block, tag=sr))
             end
+            push!(reqs, MPI.Isend(@view(step_needs_synchronize[:,block+1]),
+                                  distributed_comm; dest=block, tag=shared_comm_size))
         end
         MPI.Waitall(reqs)
         my_tiles_for_rank = tiles_for_rank[:,:,1]
@@ -265,6 +302,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         MPI.Bcast!(n_steps, shared_comm; root=0)
         diagonal_indices = fill(0, n_steps[])
         MPI.Bcast!(diagonal_indices, distributed_comm; root=0)
+        step_needs_synchronize_this_block = allocate_shared_int(n_steps[])
         # Receive tiles_for_rank for each process in this block, and then pass them on.
         # Use my_tiles_for_rank as a buffer to pass on these arrays.
         my_tiles_for_rank = zeros(Int64, 2, n_steps[])
@@ -284,6 +322,8 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
             MPI.Send(my_tiles_for_rank, shared_comm; dest=rank)
         end
         MPI.Recv!(my_tiles_for_rank, distributed_comm; source=0, tag=0)
+        MPI.Recv!(step_needs_synchronize_this_block, distributed_comm; source=0,
+                  tag=shared_comm_size)
         # Finish checking for the last appearances of rows and first appearances of
         # columns while we are passing through my_tiles_for_rank to each process in the
         # block.
@@ -298,6 +338,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         n_steps = Ref(-1)
         diagonal_indices = Int64[]
         MPI.Bcast!(n_steps, shared_comm; root=0)
+        step_needs_synchronize_this_block = allocate_shared_int(n_steps[])
         my_tiles_for_rank = zeros(Int64, 2, n_steps[])
         MPI.Recv!(my_tiles_for_rank, shared_comm; source=0)
     end
@@ -316,6 +357,19 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         end
     else
         new_column_triggers = zeros(Int64, 0, 0)
+    end
+
+    # Also need to trigger synchronization after every step where we wait for 'new column'
+    # data. The MPI.Wait() is only called on the root process of the shared-memory block,
+    # so without a synchronize_shared() call, there would be a risk of other processes
+    # using the data before the MPI.Wait() completed.
+    if shared_comm_rank == 0 && distributed_comm_rank > 0
+        for step ∈ 1:n_steps[]
+            if any(@view(new_column_triggers[:,step]) .> 0)
+                # We call MPI.Wait() one or more times on this step.
+                step_needs_synchronize_this_block[step] = 1
+            end
+        end
     end
 
     # Store the tiles that will be handled by this process in contiguous arrays.
@@ -370,11 +424,12 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
     A_lu =  DenseLU(m, n, factors, row_permutation, my_L_tiles, my_L_tile_row_ranges,
                     my_L_tile_col_ranges, L_receive_requests, L_send_requests, my_U_tiles,
                     my_U_tile_row_ranges, my_U_tile_col_ranges, U_receive_requests,
-                    U_send_requests, diagonal_indices, new_column_triggers, vec_buffer1,
-                    vec_buffer2, L_rhs_update_buffer, U_rhs_update_buffer, tile_size,
-                    n_tiles, shared_comm, shared_comm_rank, shared_comm_size,
-                    distributed_comm, distributed_comm_rank, distributed_comm_size,
-                    is_root, synchronize_shared, check_lu)
+                    U_send_requests, diagonal_indices, new_column_triggers,
+                    step_needs_synchronize_this_block, vec_buffer1, vec_buffer2,
+                    L_rhs_update_buffer, U_rhs_update_buffer, tile_size, n_tiles,
+                    shared_comm, shared_comm_rank, shared_comm_size, distributed_comm,
+                    distributed_comm_rank, distributed_comm_size, is_root,
+                    synchronize_shared, check_lu)
 
     if !skip_factorization
         lu!(A_lu, A)
@@ -464,7 +519,6 @@ function ldiv!(x::AbstractVector{T}, A_lu::DenseLU{T}, b::AbstractVector{T}) whe
         MPI.Waitall(A_lu.L_receive_requests)
         MPI.Waitall(A_lu.U_receive_requests)
     end
-    synchronize_shared()
 
     return x
 end
@@ -481,6 +535,7 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
     L_receive_requests = A_lu.L_receive_requests
     L_send_requests = A_lu.L_send_requests
     new_column_triggers = A_lu.new_column_triggers
+    step_needs_synchronize_this_block = A_lu.step_needs_synchronize_this_block
     L_rhs_update_buffer = A_lu.L_rhs_update_buffer
     shared_comm_rank = A_lu.shared_comm_rank
     distributed_comm = A_lu.distributed_comm
@@ -528,8 +583,10 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
                 @views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
                              y[col_range], one(T), L_rhs_update_buffer[row_range])
             end
-            # Synchronize to avoid race conditions.
-            synchronize_shared()
+            if step_needs_synchronize_this_block[step] == 1
+                # Synchronize to avoid race conditions.
+                synchronize_shared()
+            end
         end
     else
         for step ∈ 1:length(my_L_tile_row_ranges)
@@ -578,8 +635,10 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
                     MPI.Wait(L_receive_requests[tile])
                 end
             end
-            # Synchronize to avoid race conditions.
-            synchronize_shared()
+            if step_needs_synchronize_this_block[step] == 1
+                # Synchronize to avoid race conditions.
+                synchronize_shared()
+            end
         end
     end
 
@@ -598,6 +657,7 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
     U_receive_requests = A_lu.U_receive_requests
     U_send_requests = A_lu.U_send_requests
     new_column_triggers = A_lu.new_column_triggers
+    step_needs_synchronize_this_block = A_lu.step_needs_synchronize_this_block
     U_rhs_update_buffer = A_lu.U_rhs_update_buffer
     shared_comm_rank = A_lu.shared_comm_rank
     distributed_comm = A_lu.distributed_comm
@@ -645,8 +705,10 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                 @views gemm!('N', 'N', -one(T), my_U_tiles[1:length(row_range),:,step],
                              x[col_range], one(T), U_rhs_update_buffer[row_range])
             end
-            # Synchronize to avoid race conditions.
-            synchronize_shared()
+            if step_needs_synchronize_this_block[step] == 1
+                # Synchronize to avoid race conditions.
+                synchronize_shared()
+            end
         end
     else
         for step ∈ 1:length(my_U_tile_row_ranges)
@@ -695,8 +757,10 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                     MPI.Wait(U_receive_requests[tile])
                 end
             end
-            # Synchronize to avoid race conditions.
-            synchronize_shared()
+            if step_needs_synchronize_this_block[step] == 1
+                # Synchronize to avoid race conditions.
+                synchronize_shared()
+            end
         end
     end
 
