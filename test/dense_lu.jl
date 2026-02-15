@@ -46,9 +46,9 @@ function dense_lu_test(n_shared)
                 end
             end
 
-#            @testset "solve" begin
+            @testset "solve" begin
                 test_once()
-#            end
+            end
 
             @testset "change b" begin
                 if shared_rank == 0 && distributed_rank == 0
