@@ -108,9 +108,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
     end
     if is_root
         diagonal_indices = fill(0, n_steps_max)
-        step_needs_synchronize = fill(false, n_steps_max, distributed_comm_size)
         first_unhandled_column_in_row = ones(Int64, n_tiles)
-        rank_worked_on_row_since_synchronize = zeros(Int64, n_tiles, distributed_comm_size)
         # The pairs of entries in `tiles_for_rank` are the (row,column) of a tile. We
         # build up a list of these Tuples for each rank, indicating the tile that that
         # rank should work on on each step.
@@ -141,11 +139,6 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                 first_unhandled_column_in_row[this_diagonal_tile] += 1
                 tiles_for_rank[2,step,1] = this_column
             end
-            if rank_worked_on_row_since_synchronize[this_diagonal_tile,1] ∉ (0, 1)
-                step_needs_synchronize[step-1,1] = true
-                rank_worked_on_row_since_synchronize[:,1] .= 0
-            end
-            rank_worked_on_row_since_synchronize[this_diagonal_tile,1] = 1
 
             # Assign the other ranks tiles each from a different row, so that they will write
             # to distinct elements of the RHS vector. Pick the tile that is furthest from the
@@ -200,11 +193,6 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                             tiles_for_rank[1,step,rank] = irow
                             icolumn = first_unhandled_column_in_row[irow]
                             tiles_for_rank[2,step,rank] = icolumn
-                            if rank_worked_on_row_since_synchronize[irow,block] ∉ (0, sr)
-                                step_needs_synchronize[step-1, block] = true
-                                rank_worked_on_row_since_synchronize[:,block] .= 0
-                            end
-                            rank_worked_on_row_since_synchronize[irow,block] = sr
                             first_unhandled_column_in_row[irow] += 1
                             rows_with_tasks[sr,block] = irow
                             if icolumn == n_tiles
@@ -223,23 +211,11 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                 end
             end
 
-            if diagonal_indices[step] > 0
-                # Always need to synchronize after diagonal steps, so that the new
-                # solution vector entries can be used by non-root proceses.
-                step_needs_synchronize[step,:] .= true
-                rank_worked_on_row_since_synchronize .= 0
-            end
-
             step += 1
         end
 
         n_steps = Ref(step - 1)
         tiles_for_rank = tiles_for_rank[:,1:n_steps[],:]
-        step_needs_synchronize = step_needs_synchronize[1:n_steps[],:]
-        # Always synchronize on the final step.
-        step_needs_synchronize[end,:] .= true
-        # Convert because Int64 is more convenient to communicate over MPI than Bool.
-        step_needs_synchronize = Int64.(step_needs_synchronize)
 
         # Sort the tiles so that the shared_comm_rank=0 process on each block handles the
         # 'lowest'/'highest' row for the L/U solve. This avoids the need for a
@@ -258,6 +234,38 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                 @. tiles_for_rank[:,step,ranks] .= tiles_for_rank[:,step,ranks[sorted_inds]]
             end
         end
+
+        # Need to check which steps need synchronization after sorting.
+        step_needs_synchronize = fill(false, n_steps[], distributed_comm_size)
+        rank_worked_on_row_since_synchronize = zeros(Int64, n_tiles, distributed_comm_size)
+        rank_worked_on_row_current_step = zeros(Int64, n_tiles, distributed_comm_size)
+        for step ∈ 1:n_steps[]
+            for block ∈ 1:distributed_comm_size, sr ∈ 1:shared_comm_size
+                rank = (block - 1) * shared_comm_size + sr
+                irow = tiles_for_rank[1,step,rank]
+                if irow > 0
+                    rank_worked_on_row_current_step[irow,block] = sr
+                    if rank_worked_on_row_since_synchronize[irow,block] ∉ (0, sr)
+                        step_needs_synchronize[step-1, block] = true
+                        rank_worked_on_row_since_synchronize[:,block] .=
+                            rank_worked_on_row_current_step[:,block]
+                    else
+                        rank_worked_on_row_since_synchronize[irow,block] = sr
+                    end
+                end
+            end
+            if diagonal_indices[step] > 0
+                # Always need to synchronize after diagonal steps, so that the new
+                # solution vector entries can be used by non-root proceses.
+                step_needs_synchronize[step,:] .= true
+                rank_worked_on_row_since_synchronize .= 0
+            end
+            rank_worked_on_row_current_step .= 0
+        end
+        # Always synchronize on the final step.
+        step_needs_synchronize[end,:] .= true
+        # Convert because Int64 is more convenient to communicate over MPI than Bool.
+        step_needs_synchronize = Int64.(step_needs_synchronize)
 
         diagonal_indices = diagonal_indices[1:n_steps[]]
 
