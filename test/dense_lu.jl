@@ -12,8 +12,8 @@ function dense_lu_test(n_shared)
     rng = StableRNG(3002)
 
     @testset "dense_lu n_shared=$n_shared" begin
-        @testset "m=$m, tile_size=$tile_size" for m ∈ (32, 33, 100, 128, 1009, 1024),
-                                                  tile_size ∈ (2, 3, 25, 32, 90, 128)
+        @testset "m=$m, tile_size=$tile_size" for m ∈ (32, 33, 100, 128, 295, 317, 460, 532, 604, 739, 827, 964, 1009, 1024),
+                                                  tile_size ∈ (1, 2, 3, 25, 32, 90, 128)
             if tile_size > m + 5
                 # If tile_size is bigger than m, the actual value of tile_size does not
                 # matter, so skip what would (mostly?) be identical repeated tests.

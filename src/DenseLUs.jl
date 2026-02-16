@@ -5,6 +5,7 @@ export DenseLU, dense_lu
 using LinearAlgebra
 using LinearAlgebra.BLAS: trsv!, gemm!
 using MPI
+using StatsBase: countmap
 
 import LinearAlgebra: lu!, ldiv!
 
@@ -236,22 +237,170 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         end
 
         # Need to check which steps need synchronization after sorting.
+        # While checking, attempt to re-arrange the tiles among the shared-memory ranks to
+        # reduce the need to synchronize. Only do this by rearranging each step in turn.
+        # Possibly there would be more optimal ways of doing this with some global
+        # rearrangement of tiles/ranks?
         step_needs_synchronize = fill(false, n_steps[], distributed_comm_size)
         rank_worked_on_row_since_synchronize = zeros(Int64, n_tiles, distributed_comm_size)
         rank_worked_on_row_current_step = zeros(Int64, n_tiles, distributed_comm_size)
+        this_diagonal_tile = 1
         for step ∈ 1:n_steps[]
-            for block ∈ 1:distributed_comm_size, sr ∈ 1:shared_comm_size
-                rank = (block - 1) * shared_comm_size + sr
-                irow = tiles_for_rank[1,step,rank]
-                if irow > 0
-                    rank_worked_on_row_current_step[irow,block] = sr
-                    if rank_worked_on_row_since_synchronize[irow,block] ∉ (0, sr)
-                        step_needs_synchronize[step-1, block] = true
-                        @views rank_worked_on_row_since_synchronize[:,block] .=
-                            rank_worked_on_row_current_step[:,block]
-                    else
-                        rank_worked_on_row_since_synchronize[irow,block] = sr
+            # Except when handling a diagonal tile, the 'next row' to the one being
+            # handled by the global root is this_diagonal_tile+2, ...
+            diagonal_offset = 2
+            if diagonal_indices[step] > 0
+                this_diagonal_tile = diagonal_indices[step]
+                # ...but on the step where the diagonal tile is handled, the 'next row' is
+                # this_diagonal_tile+1.
+                diagonal_offset = 1
+            end
+            for block ∈ 1:distributed_comm_size #, sr ∈ 1:shared_comm_size
+                ranks = [(block - 1) * shared_comm_size + sr for sr ∈ 1:shared_comm_size]
+                this_step_rows = tiles_for_rank[1,step,ranks]
+
+                # Modified array that skips entries that have no tile to work on. These
+                # should be gathered at the end of this_step_rows.
+                first_missing_tile = findfirst(x -> x==-1, this_step_rows)
+                if first_missing_tile !== nothing
+                    this_step_rows_no_missing = this_step_rows[1:first_missing_tile-1]
+                    if any(this_step_rows[first_missing_tile:end] .≥ 0)
+                        error("expected all tiles after first missing tile to be '-1'. "
+                              * "Got $this_step_rows.")
                     end
+                else
+                    this_step_rows_no_missing = this_step_rows
+                end
+
+                sorted_this_step_rows = sort(this_step_rows)
+                existing_processes_for_rows = rank_worked_on_row_since_synchronize[this_step_rows_no_missing,block]
+                # Pad existing_processes_for_rows with zeros so that it has length
+                # shared_comm_size.
+                existing_processes_for_rows =
+                    vcat(existing_processes_for_rows,
+                         zeros(Int64, shared_comm_size -
+                               length(existing_processes_for_rows)))
+
+                counts = countmap(existing_processes_for_rows)
+                # Any entries that are 0 are rows that have not been accessed since the
+                # last synchronization, so any rank can take them.
+                pop!(counts, 0, 0)
+                if any(x > 1 for x in values(counts))
+                    # Need to syncronize at the end of the previous step because there are
+                    # multiple rows that have been accessed by the same rank, so we cannot
+                    # distribute these rows among the ranks without synchronizing.
+                    step_needs_synchronize[step-1, block] = true
+                    rank_worked_on_row_since_synchronize[:,block] .= 0
+                end
+
+                free_rows = [r for r ∈ this_step_rows_no_missing
+                             if rank_worked_on_row_since_synchronize[r,block] == 0]
+
+                function swap_local_ranks!(a, b)
+                    if a == b
+                        return nothing
+                    end
+                    a_rank = (block-1)*shared_comm_size + a
+                    b_rank = (block-1)*shared_comm_size + b
+                    tiles_for_rank[:,step,[a_rank,b_rank]] .= tiles_for_rank[:,step,[b_rank,a_rank]]
+                    this_step_rows[[a,b]] .= this_step_rows[[b,a]]
+                    existing_processes_for_rows[[a,b]] .= existing_processes_for_rows[[b,a]]
+                    return nothing
+                end
+
+                function delete_from_free_rows!(row)
+                    irow = findfirst(x -> x==row, free_rows)
+                    if irow !== nothing
+                        deleteat!(free_rows, irow)
+                    end
+                    return nothing
+                end
+
+                root_rank = (block - 1) * shared_comm_size + 1
+
+                if block == 1
+                    # The root process always handle the first incomplete row. This is
+                    # already set. Just need to delete this row from free_rows to prevent
+                    # a later rank from trying to take it.
+                    delete_from_free_rows!(tiles_for_rank[1,step,1])
+                elseif sorted_this_step_rows[1] == this_diagonal_tile + diagonal_offset
+                    # This row should be handled by the root of the shared-memory block as
+                    # this avoids some synchronization. Note that this_step_rows is
+                    # sorted, so only the first entry can be the second incomplete row, as
+                    # the first incomplete row is always handled by the global root.
+                    rank_with_row = findfirst(x -> x == this_diagonal_tile + diagonal_offset,
+                                              this_step_rows)
+                    swap_local_ranks!(1, rank_with_row)
+                    if root_rank ∈ existing_processes_for_rows[2:end] ||
+                            existing_processes_for_rows[2:end] ∉ (0, root_rank)
+                        # As we have required this root_rank to take the row
+                        # `this_diagonal_tile + diagonal_offset`, we need to
+                        # re-synchronize if it has already accessed any other row since
+                        # the last synchronization, or if another process has already
+                        # accessed `this_diagonal_tile + diagonal_offset`.
+                        step_needs_synchronize[step-1, block] = true
+                        rank_worked_on_row_since_synchronize[:,block] .= 0
+                        existing_processes_for_rows .= 0
+                        # Need to re-create free_rows since
+                        # rank_worked_on_row_since_synchronize is being reset.
+                        # Don't need to worry about the row handled by the global-root,
+                        # because this branch only handles `block > 1`.
+                        free_rows = copy(this_step_rows_no_missing)
+                    end
+                    # Delete from free rows to stop another rank picking up this row.
+                    delete_from_free_rows!(this_diagonal_tile + diagonal_offset)
+                elseif root_rank ∈ existing_processes_for_rows
+                    rank_with_row = findfirst(x -> x == root_rank, existing_processes_for_rows)
+                    swap_local_ranks!(1, rank_with_row)
+                else
+                    # If there are no free rows, there is no work for this rank to do. Its
+                    # tile should be assigned [-1,-1] already, or will be by a swap with
+                    # another rank that needs to claim the tile that this rank currently
+                    # owns.
+                    if length(free_rows) > 0
+                        # Take the lowest row that does not have an associated rank already.
+                        irow = argmin(free_rows)
+                        row = free_rows[irow]
+                        deleteat!(free_rows, irow)
+                        swap_local_ranks!(1, findfirst(x -> x == row, this_step_rows))
+                    end
+                end
+
+                # Now handle the non-root ranks of the shared-memory block.
+                for sr ∈ 2:shared_comm_size
+                    rank = (block - 1) * shared_comm_size + sr
+                    if rank ∈ existing_processes_for_rows
+                        rank_with_row = findfirst(x -> x == rank, existing_processes_for_rows)
+                        swap_local_ranks!(sr, rank_with_row)
+                    else
+                        # If there are no free rows, there is no work for this rank to do. Its
+                        # tile should be assigned [-1,-1] already, or will be by a swap with
+                        # another rank that needs to claim the tile that this rank currently
+                        # owns.
+                        if length(free_rows) > 0
+                            # Take the lowest row that does not have an associated rank already.
+                            irow = argmin(free_rows)
+                            row = free_rows[irow]
+                            deleteat!(free_rows, irow)
+                            swap_local_ranks!(sr, findfirst(x -> x == row, this_step_rows))
+                        end
+                    end
+                end
+
+                # this_step_rows was updated as rows were swapped, so now contains the
+                # final rows handled by each rank in the shared-memory block.
+                for (sr, row) ∈ enumerate(this_step_rows)
+                    if row < 0
+                        continue
+                    end
+                    rank = (block - 1) * shared_comm_size + sr
+                    if rank_worked_on_row_since_synchronize[row,block] ∉ (0, rank)
+                        error("Sorting has failed! "
+                              * "rank_worked_on_row_since_synchronize[$row,$block] "
+                              * "should be either 0 or $rank, but is "
+                              * "$(rank_worked_on_row_since_synchronize[row,block]).")
+                    end
+                    rank_worked_on_row_since_synchronize[row,block] = rank
                 end
             end
             if diagonal_indices[step] > 0
