@@ -1,3 +1,16 @@
+function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64,
+                  allocate_shared_float::Ff) where Ff
+    factors = allocate_shared_float(m, n)
+
+    if shared_comm_rank == 0
+        row_permutation = zeros(Int64, m)
+    else
+        row_permutation = zeros(Int64, 0)
+    end
+
+    return (; factors, row_permutation)
+end
+
 function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
     factors = A_lu.factors
     row_permutation = A_lu.row_permutation
