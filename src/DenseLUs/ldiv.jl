@@ -1,97 +1,12 @@
-module DenseLUs
-
-export DenseLU, dense_lu
-
-using LinearAlgebra
-using LinearAlgebra.BLAS: trsv!, gemm!
-using MPI
-using StatsBase: countmap
-
-import LinearAlgebra: lu!, ldiv!
-
-struct DenseLU{T,Tmat,Tvec,Tintvec,Tsync}
-    m::Int64
-    n::Int64
-    factors::Tmat
-    row_permutation::Vector{Int64}
-    my_L_tiles::Array{T,3}
-    my_L_tile_row_ranges::Vector{UnitRange{Int64}}
-    my_L_tile_col_ranges::Vector{UnitRange{Int64}}
-    L_receive_requests::Vector{MPI.Request}
-    L_send_requests::Vector{MPI.Request}
-    my_U_tiles::Array{T,3}
-    my_U_tile_row_ranges::Vector{UnitRange{Int64}}
-    my_U_tile_col_ranges::Vector{UnitRange{Int64}}
-    U_receive_requests::Vector{MPI.Request}
-    U_send_requests::Vector{MPI.Request}
-    diagonal_indices::Vector{Int64}
-    new_column_triggers::Matrix{Int64}
-    step_needs_synchronize_this_block::Tintvec
-    vec_buffer1::Tvec
-    vec_buffer2::Tvec
-    L_rhs_update_buffer::Tvec
-    U_rhs_update_buffer::Tvec
-    tile_size::Int64
-    n_tiles::Int64
-    shared_comm::MPI.Comm
-    shared_comm_rank::Int64
-    shared_comm_size::Int64
-    distributed_comm::MPI.Comm
-    distributed_comm_rank::Int64
-    distributed_comm_size::Int64
-    is_root::Bool
-    synchronize_shared::Tsync
-    check_lu::Bool
-end
-
-function dense_lu(A::AbstractMatrix, tile_size::Int64,
-                  distributed_comm::Union{MPI.Comm,Nothing},
-                  shared_comm::Union{MPI.Comm,Nothing}, allocate_shared_float::Function,
-                  allocate_shared_int::Function; synchronize_shared=nothing,
-                  skip_factorization=false, check_lu=true)
-    datatype = eltype(A)
-
-    if shared_comm === nothing
-        shared_comm = MPI.COMM_SELF
-    end
-
-    if synchronize_shared === nothing
-        synchronize_shared = ()->MPI.Barrier(shared_comm)
-    end
-
-    m, n = size(A)
-    if m != n
-        error("Non-square matrices not supported in DenseLU. Got ($m,$n).")
-    end
-    factors = allocate_shared_float(m, n)
+function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI.Comm,
+                    shared_comm_size::Int64, shared_comm_rank::Int64,
+                    distributed_comm::MPI.Comm, distributed_comm_size::Int64,
+                    distributed_comm_rank::Int64, is_root::Bool,
+                    allocate_shared_float::Ff, allocate_shared_int::Fi) where {Ff,Fi}
     vec_buffer1 = allocate_shared_float(m)
     vec_buffer2 = allocate_shared_float(m)
     L_rhs_update_buffer = allocate_shared_float(m)
     U_rhs_update_buffer = allocate_shared_float(m)
-
-    shared_comm_rank = MPI.Comm_rank(shared_comm)
-    shared_comm_size = MPI.Comm_size(shared_comm)
-
-    # distributed comm is only needed on the root process of each shared-memory block.
-    if distributed_comm === nothing && shared_comm_rank == 0
-        distributed_comm = MPI.COMM_SELF
-    end
-
-    if shared_comm_rank == 0
-        distributed_comm_rank = MPI.Comm_rank(distributed_comm)
-        distributed_comm_size = MPI.Comm_size(distributed_comm)
-    else
-        # These values should not be used/required except on shared_comm_rank=0.
-        distributed_comm_rank = -1
-        distributed_comm_size = -1
-    end
-    is_root = (shared_comm_rank == 0 && distributed_comm_rank == 0)
-
-    if shared_comm_rank == 0
-        row_permutation = zeros(Int64, m)
-    else
-        row_permutation = zeros(Int64, 0)
-    end
 
     # Number of tiles. Note that the final tile may be smaller than the others.
     n_tiles = (m + tile_size - 1) ÷ tile_size
@@ -570,69 +485,11 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         U_send_requests = MPI.Request[]
     end
 
-    A_lu =  DenseLU(m, n, factors, row_permutation, my_L_tiles, my_L_tile_row_ranges,
-                    my_L_tile_col_ranges, L_receive_requests, L_send_requests, my_U_tiles,
-                    my_U_tile_row_ranges, my_U_tile_col_ranges, U_receive_requests,
-                    U_send_requests, diagonal_indices, new_column_triggers,
-                    step_needs_synchronize_this_block, vec_buffer1, vec_buffer2,
-                    L_rhs_update_buffer, U_rhs_update_buffer, tile_size, n_tiles,
-                    shared_comm, shared_comm_rank, shared_comm_size, distributed_comm,
-                    distributed_comm_rank, distributed_comm_size, is_root,
-                    synchronize_shared, check_lu)
-
-    if !skip_factorization
-        lu!(A_lu, A)
-    end
-
-    synchronize_shared()
-
-    return A_lu
-end
-
-function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
-    factors = A_lu.factors
-    row_permutation = A_lu.row_permutation
-    my_L_tiles = A_lu.my_L_tiles
-    my_L_tile_row_ranges = A_lu.my_L_tile_row_ranges
-    my_L_tile_col_ranges = A_lu.my_L_tile_col_ranges
-    my_U_tiles = A_lu.my_U_tiles
-    my_U_tile_row_ranges = A_lu.my_U_tile_row_ranges
-    my_U_tile_col_ranges = A_lu.my_U_tile_col_ranges
-    distributed_comm = A_lu.distributed_comm
-    synchronize_shared = A_lu.synchronize_shared
-    check_lu = A_lu.check_lu
-
-    if A_lu.is_root
-        # Factorize in serial for now. Could look at implementing a parallel version of
-        # this later. Could maybe borrow algorithms from
-        # https://github.com/JuliaLinearAlgebra/RecursiveFactorization.jl/ ?
-        factorization = lu!(A; check=check_lu)
-
-        factors .= factorization.factors
-        row_permutation .= factorization.p
-    end
-    if A_lu.shared_comm_rank == 0
-        req1 = temp_Ibcast!(factors, distributed_comm; root=0)
-        req2 = temp_Ibcast!(row_permutation, distributed_comm; root=0)
-        MPI.Waitall([req1, req2])
-    end
-    synchronize_shared()
-
-    for (step, (row_range, col_range)) ∈ enumerate(zip(my_L_tile_row_ranges,
-                                                       my_L_tile_col_ranges))
-        if !isempty(row_range)
-            @views my_L_tiles[1:length(row_range),1:length(col_range),step] .= factors[row_range, col_range]
-        end
-    end
-
-    for (step, (row_range, col_range)) ∈ enumerate(zip(my_U_tile_row_ranges,
-                                                       my_U_tile_col_ranges))
-        if !isempty(row_range)
-            @views my_U_tiles[1:length(row_range),1:length(col_range),step] .= factors[row_range, col_range]
-        end
-    end
-
-    return A_lu
+    return (; my_L_tiles, my_L_tile_row_ranges, my_L_tile_col_ranges, L_receive_requests,
+            L_send_requests, my_U_tiles, my_U_tile_row_ranges, my_U_tile_col_ranges,
+            U_receive_requests, U_send_requests, diagonal_indices, new_column_triggers,
+            step_needs_synchronize_this_block, vec_buffer1, vec_buffer2,
+            L_rhs_update_buffer, U_rhs_update_buffer, n_tiles)
 end
 
 function ldiv!(A_lu::DenseLU{T}, b::AbstractVector{T}) where T
@@ -956,5 +813,3 @@ end
 function temp_Ibcast!(data, root::Integer, comm::MPI.Comm)
     temp_Ibcast!(MPI.Buffer(data), root, comm)
 end
-
-end # module DenseLUs

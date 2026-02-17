@@ -40,7 +40,7 @@ macro sc_timeit(timer, name, expr)
     end
 end
 
-include("DenseLUs.jl")
+include("DenseLUs/DenseLUs.jl")
 using .DenseLUs
 
 struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,Tbv,Tgy,
