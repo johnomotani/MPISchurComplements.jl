@@ -44,7 +44,7 @@ include("DenseLUs/DenseLUs.jl")
 using .DenseLUs
 
 struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,Tbv,Tgy,
-                          TBob,Trangeno,Tscomm,Tsync,Ttimer}
+                          TBob,Trangeno,Tsync,Ttimer}
     A_factorization::TA
     Ainv_dot_B::TAiB
     Ainv_dot_B_local::TAiBl
@@ -97,10 +97,11 @@ struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,TCAiB,TCAiu,TAiBy,Tt
     local_bottom_vector_unique_entries::Vector{Int64}
     local_bottom_vector_repeats::Matrix{Int64}
     local_bottom_vector_repeats_partial::Matrix{Int64}
+    comm::MPI.Comm
+    shared_comm::MPI.Comm
+    shared_rank::Int64
     distributed_comm::MPI.Comm
     distributed_rank::Int64
-    shared_comm::Tscomm
-    shared_rank::Int64
     synchronize_shared::Tsync
     use_sparse::Bool
     separate_Ainv_B::Bool
@@ -272,12 +273,13 @@ end
                          B_global_column_range::Union{UnitRange{Int64},Vector{Int64},Nothing}=nothing,
                          C_global_row_range::Union{UnitRange{Int64},Vector{Int64},Nothing}=nothing,
                          D_global_column_range::Union{UnitRange{Int64},Vector{Int64},Nothing}=nothing,
-                         distributed_comm::MPI.Comm=MPI.COMM_SELF,
-                         shared_comm::Union{MPI.Comm,Nothing}=nothing,
+                         comm::MPI.Comm=MPI.COMM_WORLD,
+                         shared_comm::MPI.Comm=MPI.COMM_SELF,
+                         distributed_comm::Union{MPI.Comm,Nothing}=nothing,
                          allocate_array::Union{Function,Nothing}=nothing,
                          synchronize_shared::Union{Function,Nothing}=nothing,
                          use_sparse=true, separate_Ainv_B=false,
-                         parallel_schur=shared_comm!==nothing,
+                         parallel_schur=shared_comm!=MPI.COMM_SELF,
                          schur_tile_size=nothing, skip_factorization=false,
                          check_lu::Bool=true,
                          timer::Union{TimerOutput,Nothing}=nothing)
@@ -344,8 +346,14 @@ together the matrices passed on each distributed-MPI rank gives the full, global
 overlap can be passed on any distributed rank, as long as the contributions from each
 distributed rank add up to the full value).
 
-`distributed_comm` and `shared_comm` are the MPI communicators to use for
-distributed-memory and shared-memory communications.
+`comm` is the MPI communicator containing all processes to be used by DenseLU.
+
+`shared_comm` is the MPI communicator to use for shared-memory communications.
+
+`distributed_comm` (if passed) is the MPI communicator for distributed-memory
+communications. It should include only the ranks that are rank-0 in each `shared_comm`.
+By default it will be created from `comm`, but can be passed in to avoid creating extra
+`MPI.Comm`s.
 
 `allocate_shared_float` and `allocate_shared_int` must be passed when `shared_comm` is
 passed. They should be passed functions that will be used to allocate various buffer
@@ -398,8 +406,9 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                               B_global_column_range::Union{UnitRange{Int64},Vector{Int64},Nothing}=nothing,
                               C_global_row_range::Union{UnitRange{Int64},Vector{Int64},Nothing}=nothing,
                               D_global_column_range::Union{UnitRange{Int64},Vector{Int64},Nothing}=nothing,
-                              distributed_comm::MPI.Comm=MPI.COMM_SELF,
-                              shared_comm::Union{MPI.Comm,Nothing}=nothing,
+                              comm::MPI.Comm=MPI.COMM_WORLD,
+                              shared_comm::MPI.Comm=MPI.COMM_SELF,
+                              distributed_comm::Union{MPI.Comm,Nothing}=nothing,
                               allocate_shared_float::Union{Function,Nothing}=nothing,
                               allocate_shared_int::Union{Function,Nothing}=nothing,
                               synchronize_shared::Union{Function,Nothing}=nothing,
@@ -420,19 +429,20 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
         owned_bottom_vector_entries = collect(owned_bottom_vector_entries)
     end
 
+    shared_nproc = MPI.Comm_size(shared_comm)
+    shared_rank = MPI.Comm_rank(shared_comm)
+
+    if distributed_comm == nothing
+        color = shared_rank == 0 ? 0 : nothing
+        distributed_comm = MPI.Comm_split(comm, color, 0)
+    end
+
     if distributed_comm != MPI.COMM_NULL
         distributed_nproc = MPI.Comm_size(distributed_comm)
         distributed_rank = MPI.Comm_rank(distributed_comm)
     else
         distributed_nproc = -1
         distributed_rank = -1
-    end
-    if shared_comm === nothing
-        shared_nproc = 1
-        shared_rank = 0
-    else
-        shared_nproc = MPI.Comm_size(shared_comm)
-        shared_rank = MPI.Comm_rank(shared_comm)
     end
 
     top_vec_local_size = length(owned_top_vector_entries)
@@ -554,59 +564,58 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
         local_bottom_vector_unique_entries = nothing
         local_bottom_vector_repeats = nothing
     end
-    if shared_comm !== nothing
-        # Communicate index ranges, etc. to all processes on the shared-memory
-        # communicator.
-        function shared_broadcast_int(i::Union{Int64,Nothing})
-            if shared_rank == 0
-                if i === nothing
-                    error("`i` should not be `nothing` on root of shared-memory communicator")
-                end
-                MPI.Bcast(i, 0, shared_comm)
-                return i
-            else
-                return MPI.Bcast(-1, 0, shared_comm)
-            end
-        end
-        function shared_broadcast_range(r::Union{Trange,Nothing})
-            if shared_rank == 0
-                if r === nothing
-                    error("`r` should not be `nothing` on root of shared-memory communicator")
-                end
-                MPI.bcast(r, 0, shared_comm)
-                return r
-            else
-                range = MPI.bcast(Int64[], 0, shared_comm)
-                return range
-            end
-        end
-        function shared_broadcast_matrix(m::Union{Matrix{Int64},Nothing})
-            if shared_rank == 0
-                if m === nothing
-                    error("`m` should not be `nothing` on root of shared-memory communicator")
-                end
-                MPI.bcast(m, 0, shared_comm)
-                return m
-            else
-                mat = MPI.bcast(zeros(Int64, 0, 0), 0, shared_comm)
-                return mat
-            end
-        end
 
-        distributed_rank = shared_broadcast_int(distributed_rank)
-        distributed_nproc = shared_broadcast_int(distributed_nproc)
-        top_vec_global_size = shared_broadcast_int(top_vec_global_size)
-        local_top_vector_repeats = shared_broadcast_matrix(local_top_vector_repeats)
-        bottom_vec_global_size = shared_broadcast_int(bottom_vec_global_size)
-        owned_top_vector_entries = shared_broadcast_range(owned_top_vector_entries)
-        unique_top_vector_entries = shared_broadcast_range(unique_top_vector_entries)
-        local_top_vector_unique_entries = shared_broadcast_range(local_top_vector_unique_entries)
-        owned_bottom_vector_entries = shared_broadcast_range(owned_bottom_vector_entries)
-        owned_bottom_vector_entries_no_overlap = shared_broadcast_range(owned_bottom_vector_entries_no_overlap)
-        unique_bottom_vector_entries = shared_broadcast_range(unique_bottom_vector_entries)
-        local_bottom_vector_unique_entries = shared_broadcast_range(local_bottom_vector_unique_entries)
-        local_bottom_vector_repeats = shared_broadcast_matrix(local_bottom_vector_repeats)
+    # Communicate index ranges, etc. to all processes on the shared-memory
+    # communicator.
+    function shared_broadcast_int(i::Union{Int64,Nothing})
+        if shared_rank == 0
+            if i === nothing
+                error("`i` should not be `nothing` on root of shared-memory communicator")
+            end
+            MPI.Bcast(i, 0, shared_comm)
+            return i
+        else
+            return MPI.Bcast(-1, 0, shared_comm)
+        end
     end
+    function shared_broadcast_range(r::Union{Trange,Nothing})
+        if shared_rank == 0
+            if r === nothing
+                error("`r` should not be `nothing` on root of shared-memory communicator")
+            end
+            MPI.bcast(r, 0, shared_comm)
+            return r
+        else
+            range = MPI.bcast(Int64[], 0, shared_comm)
+            return range
+        end
+    end
+    function shared_broadcast_matrix(m::Union{Matrix{Int64},Nothing})
+        if shared_rank == 0
+            if m === nothing
+                error("`m` should not be `nothing` on root of shared-memory communicator")
+            end
+            MPI.bcast(m, 0, shared_comm)
+            return m
+        else
+            mat = MPI.bcast(zeros(Int64, 0, 0), 0, shared_comm)
+            return mat
+        end
+    end
+
+    distributed_rank = shared_broadcast_int(distributed_rank)
+    distributed_nproc = shared_broadcast_int(distributed_nproc)
+    top_vec_global_size = shared_broadcast_int(top_vec_global_size)
+    local_top_vector_repeats = shared_broadcast_matrix(local_top_vector_repeats)
+    bottom_vec_global_size = shared_broadcast_int(bottom_vec_global_size)
+    owned_top_vector_entries = shared_broadcast_range(owned_top_vector_entries)
+    unique_top_vector_entries = shared_broadcast_range(unique_top_vector_entries)
+    local_top_vector_unique_entries = shared_broadcast_range(local_top_vector_unique_entries)
+    owned_bottom_vector_entries = shared_broadcast_range(owned_bottom_vector_entries)
+    owned_bottom_vector_entries_no_overlap = shared_broadcast_range(owned_bottom_vector_entries_no_overlap)
+    unique_bottom_vector_entries = shared_broadcast_range(unique_bottom_vector_entries)
+    local_bottom_vector_unique_entries = shared_broadcast_range(local_bottom_vector_unique_entries)
+    local_bottom_vector_repeats = shared_broadcast_matrix(local_bottom_vector_repeats)
 
     # If Matrix ranges were not passed explicitly, set them from the top/bottom vector
     # ranges.
@@ -625,9 +634,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
         else
             B_global_column_range = Int64[]
         end
-        if shared_comm !== nothing
-            B_global_column_range = shared_broadcast_range(B_global_column_range)
-        end
+        B_global_column_range = shared_broadcast_range(B_global_column_range)
         B_global_column_range, B_local_column_range, B_local_column_repeats =
             separate_repeated_indices(B_global_column_range)
     end
@@ -646,9 +653,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
         else
             C_global_column_range = Int64[]
         end
-        if shared_comm !== nothing
-            C_global_column_range = shared_broadcast_range(C_global_column_range)
-        end
+        C_global_column_range = shared_broadcast_range(C_global_column_range)
         C_global_row_range, C_local_row_range, C_local_row_repeats =
             separate_repeated_indices(C_global_row_range)
     end
@@ -667,9 +672,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
         else
             D_global_column_range = Int64[]
         end
-        if shared_comm !== nothing
-            D_global_column_range = shared_broadcast_range(D_global_column_range)
-        end
+        D_global_column_range = shared_broadcast_range(D_global_column_range)
         D_global_column_range, D_local_column_range, D_local_column_repeats =
             separate_repeated_indices(D_global_column_range)
     end
@@ -683,8 +686,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     @boundscheck size(D, 1) == bottom_vec_local_size || error(BoundsError, " Rows in D do not match locally-owned 'bottom vector' entries.")
     @boundscheck size(D, 2) == length(D_local_column_range) + size(D_local_column_repeats, 2) || error(BoundsError, " Columns in D do not match index ranges.")
 
-    if shared_comm !== nothing && (allocate_shared_float === nothing
-                                   || allocate_shared_int === nothing)
+    if shared_comm != MPI.COMM_SELF && (allocate_shared_float === nothing
+                                        || allocate_shared_int === nothing)
         error("when `shared_comm` is passed, `allocate_shared_float` and "
               * "`allocate_shared_int` arguments are required, because it is necessary "
               * "to manage the MPI.Win objects to ensure they are not garbage collected, "
@@ -700,7 +703,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
 
     # Define indices that will be handled by this process in shared-memory-parallelised
     # operations.
-    if shared_comm === nothing
+    if shared_comm == MPI.COMM_SELF
         synchronize_shared = ()->nothing
         B_column_range_partial = 1:bottom_vec_global_size
         B_global_column_range_partial = B_global_column_range
@@ -855,8 +858,8 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
             schur_tile_size = min(256, 2^power_of_2)
         end
         schur_complement_factorization =
-            dense_lu(schur_complement, schur_tile_size, distributed_comm, shared_comm,
-                     allocate_shared_float, allocate_shared_int;
+            dense_lu(schur_complement, schur_tile_size, comm, shared_comm,
+                     distributed_comm, allocate_shared_float, allocate_shared_int;
                      synchronize_shared=synchronize_shared, skip_factorization=true,
                      check_lu=check_lu)
     else
@@ -908,10 +911,10 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                                           local_bottom_vector_unique_entries,
                                           local_bottom_vector_repeats,
                                           local_bottom_vector_repeats_partial,
-                                          distributed_comm, distributed_rank, shared_comm,
-                                          shared_rank, synchronize_shared, use_sparse,
-                                          separate_Ainv_B, parallel_schur, check_lu,
-                                          timer)
+                                          comm, shared_comm, shared_rank,
+                                          distributed_comm, distributed_rank,
+                                          synchronize_shared, use_sparse, separate_Ainv_B,
+                                          parallel_schur, check_lu, timer)
 
     if !skip_factorization
         update_schur_complement!(sc_factorization, missing, B, C, D)

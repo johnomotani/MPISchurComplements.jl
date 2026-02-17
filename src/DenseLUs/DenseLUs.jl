@@ -33,6 +33,9 @@ import LinearAlgebra: lu!, ldiv!
     U_rhs_update_buffer::Tvec
     tile_size::Int64
     n_tiles::Int64
+    comm::MPI.Comm
+    comm_rank::Int64
+    comm_size::Int64
     shared_comm::MPI.Comm
     shared_comm_rank::Int64
     shared_comm_size::Int64
@@ -44,16 +47,11 @@ import LinearAlgebra: lu!, ldiv!
     check_lu::Bool
 end
 
-function dense_lu(A::AbstractMatrix, tile_size::Int64,
-                  distributed_comm::Union{MPI.Comm,Nothing},
-                  shared_comm::Union{MPI.Comm,Nothing}, allocate_shared_float::Function,
-                  allocate_shared_int::Function; synchronize_shared=nothing,
-                  skip_factorization=false, check_lu=true)
+function dense_lu(A::AbstractMatrix, tile_size::Int64, comm::MPI.Comm,
+                  shared_comm::MPI.Comm, distributed_comm::MPI.Comm,
+                  allocate_shared_float::Function, allocate_shared_int::Function;
+                  synchronize_shared=nothing, skip_factorization=false, check_lu=true)
     datatype = eltype(A)
-
-    if shared_comm === nothing
-        shared_comm = MPI.COMM_SELF
-    end
 
     if synchronize_shared === nothing
         synchronize_shared = ()->MPI.Barrier(shared_comm)
@@ -64,14 +62,13 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
         error("Non-square matrices not supported in DenseLU. Got ($m,$n).")
     end
 
+    comm_rank = MPI.Comm_rank(comm)
+    comm_size = MPI.Comm_size(comm)
+
     shared_comm_rank = MPI.Comm_rank(shared_comm)
     shared_comm_size = MPI.Comm_size(shared_comm)
 
     # distributed comm is only needed on the root process of each shared-memory block.
-    if distributed_comm === nothing && shared_comm_rank == 0
-        distributed_comm = MPI.COMM_SELF
-    end
-
     if shared_comm_rank == 0
         distributed_comm_rank = MPI.Comm_rank(distributed_comm)
         distributed_comm_size = MPI.Comm_size(distributed_comm)
@@ -94,10 +91,10 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                    distributed_comm_rank, is_root, allocate_shared_float,
                    allocate_shared_int)
 
-    A_lu =  DenseLU(; m, n, tile_size, shared_comm, shared_comm_rank, shared_comm_size,
-                    distributed_comm, distributed_comm_rank, distributed_comm_size,
-                    is_root, synchronize_shared, check_lu, lu_variables...,
-                    ldiv_variables...)
+    A_lu =  DenseLU(; m, n, tile_size, comm, comm_rank, comm_size, shared_comm,
+                    shared_comm_rank, shared_comm_size, distributed_comm,
+                    distributed_comm_rank, distributed_comm_size, is_root,
+                    synchronize_shared, check_lu, lu_variables..., ldiv_variables...)
 
     if !skip_factorization
         lu!(A_lu, A)

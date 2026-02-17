@@ -224,9 +224,9 @@ end
 
 function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
                                   separate_Ainv_B=false, parallel_schur=true)
-    distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array_float, allocate_array_int, local_win_store_float,
-        local_win_store_int = get_comms(n_shared)
+    comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
+        shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
+        local_win_store_float, local_win_store_int = get_comms(n_shared)
 
     rng = StableRNG(2004)
 
@@ -425,8 +425,8 @@ function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
                            comm=distributed_comm, shared_comm=shared_comm)
 
     sc = mpi_schur_complement(Alu, local_B, local_C, local_D, top_chunk_global_inds,
-                              bottom_chunk_global_inds; distributed_comm=distributed_comm,
-                              shared_comm=shared_comm,
+                              bottom_chunk_global_inds; comm=comm,
+                              shared_comm=shared_comm, distributed_comm=distributed_comm,
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               separate_Ainv_B=separate_Ainv_B,
@@ -572,9 +572,9 @@ end
 
 function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, periodic=false,
                                   separate_Ainv_B=false, parallel_schur=true)
-    distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array_float, allocate_array_int, local_win_store_float,
-        local_win_store_int = get_comms(n_shared)
+    comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
+        shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
+        local_win_store_float, local_win_store_int = get_comms(n_shared)
 
     rng = StableRNG(2006)
 
@@ -890,8 +890,8 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, periodic=false,
                            comm=distributed_comm, shared_comm=shared_comm)
 
     sc = mpi_schur_complement(Alu, local_B, local_C, local_D, top_chunk_global_inds,
-                              bottom_chunk_global_inds; distributed_comm=distributed_comm,
-                              shared_comm=shared_comm,
+                              bottom_chunk_global_inds; comm=comm,
+                              shared_comm=shared_comm, distributed_comm=distributed_comm,
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               separate_Ainv_B=separate_Ainv_B,
@@ -1064,9 +1064,9 @@ end
 # parts).
 function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, periodic=false,
                                       separate_Ainv_B=false, parallel_schur=true)
-    distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array_float, allocate_array_int, local_win_store_float,
-        local_win_store_int = get_comms(n_shared)
+    comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
+        shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
+        local_win_store_float, local_win_store_int = get_comms(n_shared)
 
     rng = StableRNG(2007)
 
@@ -1343,7 +1343,8 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, periodic=fals
     sc = mpi_schur_complement(Alu, local_B, local_C, local_D,
                               periodic_global_inds[top_chunk_slice],
                               periodic_global_inds[bottom_chunk_slice];
-                              distributed_comm=distributed_comm, shared_comm=shared_comm,
+                              comm=comm, shared_comm=shared_comm,
+                              distributed_comm=distributed_comm,
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               separate_Ainv_B=separate_Ainv_B,
