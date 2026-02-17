@@ -28,12 +28,13 @@ struct DenseLU{T,Tmat,Tvec,Tsync}
     shared_comm_rank::Int64
     shared_comm_size::Int64
     synchronize_shared::Tsync
+    check_lu::Bool
 end
 
 function dense_lu(A::AbstractMatrix, tile_size::Int64,
                   shared_comm::Union{MPI.Comm,Nothing}, allocate_shared_float::Function,
                   allocate_shared_int::Function; synchronize_shared=nothing,
-                  skip_factorization=false)
+                  skip_factorization=false, check_lu=true)
     datatype = eltype(A)
 
     if shared_comm === nothing
@@ -147,7 +148,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                 end
             end
             this_diagonal_distances_row_maxima = @view diagonal_distances_row_maxima[this_diagonal_tile+1:n_tiles]
-            for rank ∈ 2:min(shared_comm_size, n_tiles - this_diagonal_tile)
+            for rank ∈ 2:min(shared_comm_size, n_tiles - this_diagonal_tile + 1)
                 max_distance = maximum(this_diagonal_distances_row_maxima)
                 if max_distance == typemin(Int64)
                     # No work available.
@@ -238,7 +239,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64,
                     my_L_tile_col_ranges, my_U_tiles, my_U_tile_row_ranges,
                     my_U_tile_col_ranges, is_diagonal, vec_buffer1, vec_buffer2,
                     tile_size, n_tiles, shared_comm, shared_comm_rank, shared_comm_size,
-                    synchronize_shared)
+                    synchronize_shared, check_lu)
 
     if !skip_factorization
         @time lu!(A_lu, A)
@@ -260,12 +261,13 @@ function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
     my_U_tile_col_ranges = A_lu.my_U_tile_col_ranges
     shared_comm_rank = A_lu.shared_comm_rank
     synchronize_shared = A_lu.synchronize_shared
+    check_lu = A_lu.check_lu
 
     if A_lu.shared_comm_rank == 0
         # Factorize in serial for now. Could look at implementing a parallel version of
         # this later. Could maybe borrow algorithms from
         # https://github.com/JuliaLinearAlgebra/RecursiveFactorization.jl/ ?
-        factorization = lu!(A)
+        factorization = lu!(A; check=check_lu)
 
         A_lu.factors .= factorization.factors
         A_lu.row_permutation .= factorization.p
