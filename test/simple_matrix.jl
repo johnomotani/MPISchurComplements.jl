@@ -1,8 +1,8 @@
 function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=true,
                            separate_Ainv_B=false, use_unitrange=true, parallel_schur=true)
-    distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array_float, allocate_array_int, local_win_store_float,
-        local_win_store_int = get_comms(n_shared, with_comm)
+    comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
+        shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
+        local_win_store_float, local_win_store_int = get_comms(n_shared, with_comm)
 
     if use_unitrange
         convert_range = identity
@@ -74,7 +74,8 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=
                               B_global_column_range=convert_range(1:n2),
                               C_global_row_range=convert_range(1:n2),
                               D_global_column_range=convert_range(1:n2),
-                              distributed_comm=distributed_comm, shared_comm=shared_comm,
+                              comm=comm, shared_comm=shared_comm,
+                              distributed_comm=distributed_comm,
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               use_sparse=use_sparse, separate_Ainv_B=separate_Ainv_B,
@@ -168,9 +169,9 @@ end
 function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=true,
                             separate_Ainv_B=false, use_unitrange=true,
                             parallel_schur=true)
-    distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array_float, allocate_array_int, local_win_store_float,
-        local_win_store_int = get_comms(n_shared, with_comm)
+    comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
+        shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
+        local_win_store_float, local_win_store_int = get_comms(n_shared, with_comm)
 
     if use_unitrange
         convert_range = identity
@@ -305,7 +306,8 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse
                               B_global_column_range=convert_range(local_bottom_irange),
                               C_global_row_range=convert_range(local_bottom_irange),
                               D_global_column_range=convert_range(D_local_irange),
-                              distributed_comm=distributed_comm, shared_comm=shared_comm,
+                              comm=comm, shared_comm=shared_comm,
+                              distributed_comm=distributed_comm,
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               use_sparse=use_sparse, separate_Ainv_B=separate_Ainv_B,
@@ -402,9 +404,9 @@ end
 function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=false,
                              use_sparse=true, separate_Ainv_B=false, use_unitrange=true,
                              add_index_gap=false, parallel_schur=true)
-    distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array_float, allocate_array_int, local_win_store_float,
-        local_win_store_int = get_comms(n_shared, with_comm)
+    comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
+        shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
+        local_win_store_float, local_win_store_int = get_comms(n_shared, with_comm)
 
     if use_unitrange
         convert_range = identity
@@ -538,7 +540,8 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
     sc = mpi_schur_complement(Alu, local_B, local_C, local_D,
                               convert_range(nominal_local_top_vec_range),
                               convert_range(nominal_local_bottom_vec_range);
-                              distributed_comm=distributed_comm, shared_comm=shared_comm,
+                              comm=comm, shared_comm=shared_comm,
+                              distributed_comm=distributed_comm,
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               use_sparse=use_sparse, separate_Ainv_B=separate_Ainv_B,

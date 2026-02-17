@@ -5,9 +5,9 @@ using Primes
 
 function dense_lu_test(n_shared)
     # Only testing shared-memory parallelism for the DenseLU solver.
-    distributed_comm, distributed_nproc, distributed_rank, shared_comm, shared_nproc,
-        shared_rank, allocate_array_float, allocate_array_int, local_win_store_float,
-        local_win_store_int = get_comms(n_shared, true)
+    comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
+        shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
+        local_win_store_float, local_win_store_int = get_comms(n_shared, true)
 
     rng = StableRNG(3002)
 
@@ -35,7 +35,7 @@ function dense_lu_test(n_shared)
             end
             MPI.Barrier(shared_comm)
 
-            Alu = dense_lu(copy(A), tile_size, distributed_comm, shared_comm,
+            Alu = dense_lu(copy(A), tile_size, comm, shared_comm, distributed_comm,
                            allocate_array_float, allocate_array_int)
 
             function test_once()
