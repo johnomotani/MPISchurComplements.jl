@@ -14,11 +14,25 @@ import LinearAlgebra: lu!, ldiv!
     n::Int64
     factors::Tmat
     row_permutation::Vector{Int64}
+    section_K::Int64
+    section_L::Int64
+    section_k::Int64
+    section_l::Int64
+    section_height::Int64
+    section_width::Int64
     factorization_matrix_parts::Matrix{Transpose{T,Matrix{T}}}
     factorization_matrix_parts_row_ranges::Vector{UnitRange{Int64}}
     factorization_matrix_parts_col_ranges::Vector{UnitRange{Int64}}
     factorization_tile_size::Int64
     factorization_n_tiles::Int64
+    first_pivot_section_k::Int64
+    first_row_with_diagonal::Int64
+    first_pivoting_buffers::Array{T,3}
+    first_pivoting_row_index_buffers::Matrix{Int64}
+    pivoting_buffers::Array{T,3}
+    pivoting_row_index_buffers::Matrix{Int64}
+    pivot_send_requests::Vector{MPI.Request}
+    pivot_recv_requests::Vector{MPI.Request}
     my_L_tiles::Array{T,3}
     my_L_tile_row_ranges::Vector{UnitRange{Int64}}
     my_L_tile_col_ranges::Vector{UnitRange{Int64}}
