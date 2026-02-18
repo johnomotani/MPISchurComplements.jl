@@ -12,8 +12,9 @@ function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size:
 
     # Each block owns a rectangular section of each tile. Try to make sections as square
     # as possible, and when they cannot be exactly square (because distributed_comm_size
-    # is not a square number) make them wider than they are tall, as this increases the
-    # parallelism (although also increases the amount of communication in some stages).
+    # is not a square number) make them taller than they are wide, as this simplifies the
+    # communication-avoiding (CA) pivoting implementation, and possibly reduces overall
+    # communication.
     #
     # Tiles are indexed by (i,j) - i for row, j for column.
     # Sections within each tile are indexed by (k,l) - k for row, l for column.
@@ -28,8 +29,8 @@ function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size:
          collect(unique(combinations(factor(Vector, distributed_comm_size))))]
     # Find the last factor ≤ sqrt(distributed_comm_size)
     factor_ind = findlast(x -> x≤sqrt(distributed_comm_size))
-    section_K = distributed_comm_size_factors[factor_ind]
-    section_L = distributed_comm_size ÷ section_K
+    section_L = distributed_comm_size_factors[factor_ind]
+    section_K = distributed_comm_size ÷ section_L
 
     section_height = factorization_tile_size ÷ section_K
     section_width = factorization_tile_size ÷ section_L
@@ -57,7 +58,7 @@ function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size:
 
     factorization_matrix_parts_row_ranges = [get_row_range(tile_i) for tile_i ∈ 1:factorization_n_tiles]
     factorization_matrix_parts_col_ranges = [get_col_range(tile_j) for tile_j ∈ 1:factorization_n_tiles]
-    factorization_matrix_parts = [transpose(allocate_shared_float(length(col_range), length(row_range)))
+    factorization_matrix_parts = [allocate_shared_float(length(row_range), length(col_range))
                                   for row_range ∈ factorization_matrix_parts_row_ranges,
                                       col_range ∈ factorization_matrix_parts_col_ranges]
 
@@ -105,13 +106,7 @@ function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
 end
 
 # For parallelized LU factorization, each block of ranks owns a certain cyclic subset of
-# tiles of the matrix, in the 'local buffers'. We store the 'local buffers' in
-# 'transposed' arrays, so that our storage is effectively row-major, which will make
-# row-based operations (e.g. swapping, or splitting by row for matrix-vector
-# multiplication) more efficient.
-# A quick test suggests that when copying between a transposed and a non-transposed
-# matrix, it is most efficient to index in the natural way for the matrix that we are
-# copying *into*.
+# tiles of the matrix, in the 'local buffers'.
 function redistribute_matrix!(A_lu, A)
     shared_comm_rank = A_lu.shared_comm_rank
     matrix_parts = A_lu.factorization_matrix_parts
@@ -121,12 +116,7 @@ function redistribute_matrix!(A_lu, A)
 
     if shared_comm_rank == 0
         for j ∈ 1:nt, i ∈ 1:nt
-            # Direct looping seems to be faster than broadcasting when one of the arrays
-            # is a transpose.
-            for (local_k, global_k) ∈ enumerate(matrix_row_ranges[i]),
-                    (local_l, global_l) ∈ enumerate(matrix_col_ranges[i])
-                matrix_parts[local_k,local_l] = A[global_k,global_l]
-            end
+            @views matrix_parts[i,j] .= A[matrix_parts_row_ranges[i],matrix_parts_col_ranges[j]]
         end
     end
 
