@@ -3,17 +3,31 @@ module DenseLUs
 export DenseLU, dense_lu
 
 using LinearAlgebra
-using LinearAlgebra.BLAS: trsv!, gemm!
+using LinearAlgebra.BLAS: trsv!, trsm!, gemm!
 using MPI
 using StatsBase: countmap
 
 import LinearAlgebra: lu!, ldiv!
 
-@kwdef struct DenseLU{T,Tmat,Tvec,Tintvec,Tsync}
+@kwdef struct DenseLU{T,Tmat,Tvec,Tintvec,Tfmp,Tsync}
     m::Int64
     n::Int64
     factors::Tmat
     row_permutation::Vector{Int64}
+    group_K::Int64
+    group_L::Int64
+    group_k::Int64
+    group_l::Int64
+    factorization_matrix_storage::Tmat
+    factorization_matrix_parts::Tfmp
+    factorization_matrix_parts_row_ranges::Vector{UnitRange{Int64}}
+    factorization_matrix_parts_col_ranges::Vector{UnitRange{Int64}}
+    factorization_locally_owned_rows::Vector{Int64}
+    factorization_pivoting_buffer::Tvec
+    factorization_pivoting_reduction_buffer::Tvec
+    factorization_pivoting_reduction_indices::Tintvec
+    factorization_row_swap_buffers::Matrix{T}
+    comm_requests::Vector{MPI.Request}
     my_L_tiles::Array{T,3}
     my_L_tile_row_ranges::Vector{UnitRange{Int64}}
     my_L_tile_col_ranges::Vector{UnitRange{Int64}}
@@ -70,30 +84,35 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, comm::MPI.Comm,
 
     # distributed comm is only needed on the root process of each shared-memory block.
     if shared_comm_rank == 0
-        distributed_comm_rank = MPI.Comm_rank(distributed_comm)
-        distributed_comm_size = MPI.Comm_size(distributed_comm)
+        distributed_comm_rank = Ref(MPI.Comm_rank(distributed_comm))
+        distributed_comm_size = Ref(MPI.Comm_size(distributed_comm))
+        # ...but need to know distributed_comm_size on all ranks for initialization.
     else
-        # These values should not be used/required except on shared_comm_rank=0.
-        distributed_comm_rank = -1
-        distributed_comm_size = -1
+        distributed_comm_rank = Ref(-1)
+        distributed_comm_size = Ref(-1)
     end
-    is_root = (shared_comm_rank == 0 && distributed_comm_rank == 0)
+    MPI.Bcast!(distributed_comm_rank, shared_comm; root=0)
+    MPI.Bcast!(distributed_comm_size, shared_comm; root=0)
+    is_root = (shared_comm_rank == 0 && distributed_comm_rank[] == 0)
 
     # setup_lu and setup_ldiv both return NamedTuples. All the entries in both those
     # NamedTuples are fields of the DenseLU struct, which we splat into the DenseLU
     # constructor to avoid having to type out long lists of variable names repeatedly.
     lu_variables =
-        setup_lu(m, n, shared_comm_rank, allocate_shared_float)
+        setup_lu(m, n, tile_size, shared_comm_rank, shared_comm_size,
+                 distributed_comm_rank[], distributed_comm_size[], datatype,
+                 allocate_shared_float, allocate_shared_int)
 
     ldiv_variables =
         setup_ldiv(m, datatype, tile_size, shared_comm, shared_comm_size,
-                   shared_comm_rank, distributed_comm, distributed_comm_size,
-                   distributed_comm_rank, is_root, allocate_shared_float,
+                   shared_comm_rank, distributed_comm, distributed_comm_size[],
+                   distributed_comm_rank[], is_root, allocate_shared_float,
                    allocate_shared_int)
 
     A_lu =  DenseLU(; m, n, tile_size, comm, comm_rank, comm_size, shared_comm,
                     shared_comm_rank, shared_comm_size, distributed_comm,
-                    distributed_comm_rank, distributed_comm_size, is_root,
+                    distributed_comm_rank=distributed_comm_rank[],
+                    distributed_comm_size=distributed_comm_size[], is_root,
                     synchronize_shared, check_lu, lu_variables..., ldiv_variables...)
 
     if !skip_factorization

@@ -19,7 +19,9 @@ function dense_lu_test(n_shared)
                 # matter, so skip what would (mostly?) be identical repeated tests.
                 continue
             end
-            println("dense_lu n_shared=$n_shared, m=$m, tile_size=$tile_size")
+            if distributed_rank == 0 && shared_rank == 0
+                println("dense_lu n_shared=$n_shared, m=$m, tile_size=$tile_size")
+            end
 
             A = allocate_array_float(m, m)
             b = allocate_array_float(m)
@@ -27,6 +29,10 @@ function dense_lu_test(n_shared)
 
             if shared_rank == 0 && distributed_rank == 0
                 A .= rand(rng, m, m)
+                # Ensure A is non-singular.
+                while abs(det(A)) < 1.0e-4
+                    A .= rand(rng, m, m)
+                end
                 b .= rand(rng, m)
             end
             if shared_rank == 0
@@ -40,9 +46,14 @@ function dense_lu_test(n_shared)
 
             function test_once()
                 ldiv!(x, Alu, b)
+                # LU factorise using the row permutation calculated for Alu, to compare
+                # the factors.
+                check_factors_lu = lu(A[Alu.row_permutation,:], NoPivot())
                 if shared_rank == 0
-                    @test isapprox(A * x, b; norm=(x)->NaN, atol=1.0e-10)
-                    @test isapprox(x, A \ b; norm=(x)->NaN, atol=2.0e-11)
+                    tol = 2.0e-10
+                    @test isapprox(A * x, b; norm=(x)->NaN, rtol=tol, atol=tol)
+                    @test isapprox(x, A \ b; norm=(x)->NaN, rtol=tol, atol=tol)
+                    @test isapprox(Alu.factors, check_factors_lu.factors; norm=(x)->NaN, rtol=tol, atol=tol)
                 end
             end
 
@@ -65,6 +76,10 @@ function dense_lu_test(n_shared)
             @testset "change A" begin
                 if shared_rank == 0 && distributed_rank == 0
                     A .= rand(rng, m, m)
+                    # Ensure A is non-singular.
+                    while abs(det(A)) < 1.0e-4
+                        A .= rand(rng, m, m)
+                    end
                     b .= rand(rng, m)
                 end
                 if shared_rank == 0
@@ -108,6 +123,8 @@ function dense_lu_test(n_shared)
         end
         resize!(local_win_store_int, 0)
     end
+
+    MPI.Barrier(MPI.COMM_WORLD)
 
     return nothing
 end

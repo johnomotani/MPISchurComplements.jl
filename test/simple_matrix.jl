@@ -30,6 +30,10 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=
         rng = StableRNG(2001)
 
         M .= rand(rng, n, n)
+        # Ensure M is non-singular.
+        while abs(det(M)) < 1.0e-4
+            M .= rand(rng, m, m)
+        end
         b .= rand(rng, n)
         z .= 0.0
     end
@@ -126,6 +130,10 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=
         if shared_rank == 0
             if distributed_rank == 0
                 M .= rand(rng, n, n)
+                # Ensure M is non-singular.
+                while abs(det(M)) < 1.0e-4
+                    M .= rand(rng, m, m)
+                end
                 b .= rand(rng, n)
             end
             MPI.Bcast!(M, distributed_comm; root=0)
@@ -232,6 +240,11 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse
 
         M .= rand(rng, n, n)
         sparsify_M!(M)
+        # Ensure M is non-singular.
+        while abs(det(M)) < 1.0e-4
+            M .= rand(rng, m, m)
+            sparsify_M!(M)
+        end
         b .= rand(rng, n)
         z .= 0.0
     end
@@ -359,6 +372,11 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse
             if distributed_rank == 0
                 M .= rand(rng, n, n)
                 sparsify_M!(M)
+                # Ensure M is non-singular.
+                while abs(det(M)) < 1.0e-4
+                    M .= rand(rng, m, m)
+                    sparsify_M!(M)
+                end
                 b .= rand(rng, n)
             end
             MPI.Bcast!(M, distributed_comm; root=0)
