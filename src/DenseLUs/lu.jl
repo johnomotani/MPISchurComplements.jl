@@ -44,7 +44,8 @@ function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size:
         tile_row_start = (tile_i - 1) * factorization_tile_size + 1
         tile_row_end = min(tile_i * factorization_tile_size, m)
         section_row_start = tile_row_start + (section_k - 1) * section_height
-        section_row_end = min(tile_row_start - 1 + section_k * section_height, tile_row_end)
+        section_row_end = min(tile_row_start - 1 + section_k * section_height,
+                              tile_row_end)
         return section_row_start:section_row_end
     end
 
@@ -52,13 +53,17 @@ function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size:
         tile_col_start = (tile_j - 1) * factorization_tile_size
         tile_col_end = min(tile_j * factorization_tile_size, n)
         section_col_start = tile_row_start + (section_l - 1) * section_width
-        section_col_end = min(tile_row_start - 1 + section_l * section_width, tile_col_end)
+        section_col_end = min(tile_row_start - 1 + section_l * section_width,
+                              tile_col_end)
         return section_col_start:section_col_end
     end
 
-    factorization_matrix_parts_row_ranges = [get_row_range(tile_i) for tile_i ∈ 1:factorization_n_tiles]
-    factorization_matrix_parts_col_ranges = [get_col_range(tile_j) for tile_j ∈ 1:factorization_n_tiles]
-    factorization_matrix_parts = [allocate_shared_float(length(row_range), length(col_range))
+    factorization_matrix_parts_row_ranges = [get_row_range(tile_i)
+                                             for tile_i ∈ 1:factorization_n_tiles]
+    factorization_matrix_parts_col_ranges = [get_col_range(tile_j)
+                                             for tile_j ∈ 1:factorization_n_tiles]
+    factorization_matrix_parts = [allocate_shared_float(length(row_range),
+                                                        length(col_range))
                                   for row_range ∈ factorization_matrix_parts_row_ranges,
                                       col_range ∈ factorization_matrix_parts_col_ranges]
 
@@ -116,7 +121,8 @@ function redistribute_matrix!(A_lu, A)
 
     if shared_comm_rank == 0
         for j ∈ 1:nt, i ∈ 1:nt
-            @views matrix_parts[i,j] .= A[matrix_parts_row_ranges[i],matrix_parts_col_ranges[j]]
+            @views matrix_parts[i,j] .=
+                A[matrix_parts_row_ranges[i],matrix_parts_col_ranges[j]]
         end
     end
 
@@ -135,14 +141,16 @@ function fill_ldiv_tiles!(A_lu)
     for (step, (row_range, col_range)) ∈ enumerate(zip(my_L_tile_row_ranges,
                                                        my_L_tile_col_ranges))
         if !isempty(row_range)
-            @views my_L_tiles[1:length(row_range),1:length(col_range),step] .= factors[row_range, col_range]
+            @views my_L_tiles[1:length(row_range),1:length(col_range),step] .=
+                factors[row_range, col_range]
         end
     end
 
     for (step, (row_range, col_range)) ∈ enumerate(zip(my_U_tile_row_ranges,
                                                        my_U_tile_col_ranges))
         if !isempty(row_range)
-            @views my_U_tiles[1:length(row_range),1:length(col_range),step] .= factors[row_range, col_range]
+            @views my_U_tiles[1:length(row_range),1:length(col_range),step] .=
+                factors[row_range, col_range]
         end
     end
     return nothing
