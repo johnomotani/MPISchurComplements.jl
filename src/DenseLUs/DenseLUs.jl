@@ -14,6 +14,11 @@ import LinearAlgebra: lu!, ldiv!
     n::Int64
     factors::Tmat
     row_permutation::Vector{Int64}
+    factorization_matrix_parts::Matrix{Transpose{T,Matrix{T}}}
+    factorization_matrix_parts_row_ranges::Vector{UnitRange{Int64}}
+    factorization_matrix_parts_col_ranges::Vector{UnitRange{Int64}}
+    factorization_tile_size::Int64
+    factorization_n_tiles::Int64
     my_L_tiles::Array{T,3}
     my_L_tile_row_ranges::Vector{UnitRange{Int64}}
     my_L_tile_col_ranges::Vector{UnitRange{Int64}}
@@ -83,7 +88,8 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, comm::MPI.Comm,
     # NamedTuples are fields of the DenseLU struct, which we splat into the DenseLU
     # constructor to avoid having to type out long lists of variable names repeatedly.
     lu_variables =
-        setup_lu(m, n, shared_comm_rank, allocate_shared_float)
+        setup_lu(m, n, shared_comm_rank, shared_comm_size, distributed_comm_rank,
+                 distributed_comm_size, allocate_shared_float)
 
     ldiv_variables =
         setup_ldiv(m, datatype, tile_size, shared_comm, shared_comm_size,
