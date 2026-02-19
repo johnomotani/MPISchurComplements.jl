@@ -1,3 +1,7 @@
+using LinearAlgebra: ipiv2perm # Don't think ipiv2perm is part of the public interface,
+                               # but it is convenient for us and seems unlikely to change
+                               # often.
+
 function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size::Int64,
                   distributed_comm_rank::Int64, distributed_comm_size::Int64,
                   allocate_shared_float::Ff) where Ff
@@ -62,6 +66,8 @@ function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size:
                                              for tile_i ∈ 1:factorization_n_tiles]
     factorization_matrix_parts_col_ranges = [get_col_range(tile_j)
                                              for tile_j ∈ 1:factorization_n_tiles]
+    factorization_locally_owned_rows = vcat((collect(r) for r ∈
+                                             factorization_matrix_parts_row_ranges)...)
 
     # Store the locally-owned parts of the array in a joined-together 2D array
     # `factorization_matrix_storage`. This will be useful for some operations.
@@ -79,12 +85,6 @@ function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size:
     # to be pivoted.
     diagonal_row = factorization_matrix_parts_col_ranges[1]
     first_pivot_section_k = (diagonal_row - 1) ÷ section_height + 1
-    if first_pivot_section_k == section_k
-        first_row_with_diagonal = (factorization_matrix_parts_col_ranges[1] -
-                                   factorization_matrix_parts_row_ranges[1] + 1)
-    else
-        first_row_with_diagonal = -1
-    end
 
     if shared_comm_rank == 0
         # The most blocks that will ever be owned by this process when calculating the
@@ -94,36 +94,32 @@ function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size:
         # factorization), allowing for possible remainders.
         max_local_pivoting_blocks = (factorization_n_tiles + section_K - 1) ÷ section_K
 
-        first_pivoting_buffers = Array{datatype,3}(undef, 2*section_height, section_width,
-                                                   max_local_pivoting_blocks)
         first_pivoting_row_index_buffers = Matrix{Int64}(undef, 2*section_height,
                                                          max_local_pivoting_blocks)
         first_section_pair_lu_buffer = Matrix{datatype}(undef, 2*section_height,
                                                         section_width)
-        pivoting_buffers = Array{datatype,3}(undef, 2*section_width, section_width,
-                                             max_local_pivoting_blocks)
         pivoting_row_index_buffers = Matrix{Int64}(undef, 2*section_width,
                                                    max_local_pivoting_blocks)
-        section_pair_lu_buffer = Matrix{datatype}(undef, 2*section_width, section_width)
     else
-        first_pivoting_buffers = zeros(datatype, 0, 0, 0)
         first_pivoting_row_index_buffers = zeros(Int64, 0, 0)
-        pivoting_buffers = zeros(datatype, 0, 0, 0)
         pivoting_row_index_buffers = zeros(Int64, 0, 0)
         first_section_pair_lu_buffer = zeros(datatype, 0, 0)
-        section_pair_lu_buffer = zeros(datatype, 0, 0)
     end
-    pivot_send_requests = [MPI.REQUEST_NULL for _ ∈ 1:factorization_n_tiles+2]
-    pivot_recv_requests = [MPI.REQUEST_NULL for _ ∈ 1:factorization_n_tiles+2]
+    factorization_pivoting_buffer = allocate_shared_float(n_tiles * section_height *
+                                                          section_width)
+    factorization_pivoting_reduction_buffer =
+        allocate_shared_float(section_width * section_K * section_width)
+    factorization_pivoting_reduction_indices =
+        allocate_shared_int(section_width * section_K)
+    pivot_requests = [MPI.REQUEST_NULL for _ ∈ 1:section_K]
 
     return (; factors, row_permutation, section_K, section_L, section_k, section_l,
-            section_height, section_width, factorization_matrix_parts,
-            factorization_matrix_parts_row_ranges, factorization_matrix_parts_col_ranges,
+            section_height, section_width, factorization_matrix_storage,
+            factorization_matrix_parts, factorization_matrix_parts_row_ranges,
+            factorization_matrix_parts_col_ranges, factorization_locally_owned_rows,
             factorization_tile_size, factorization_n_tiles, first_pivot_section_k,
-            first_row_with_diagonal, first_pivoting_buffers,
-            first_pivoting_row_index_buffers, first_section_pair_lu_buffer,
-            pivoting_buffers, pivoting_row_index_buffers, section_pair_lu_buffer,
-            pivot_send_requests, pivot_recv_requests)
+            factorization_pivoting_buffer, factorization_pivoting_reduction_buffer,
+            factorization_pivoting_reduction_indices, pivot_requests)
 end
 
 function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
@@ -219,210 +215,179 @@ function generate_pivots!(A_lu, p)
     end
     comm = A_lu.comm
     rank = A_lu.comm_rank
-    comm_size = A_lu.comm_rank
-    recv_reqs = A_lu.pivot_recv_requests
-    send_reqs = A_lu.pivot_send_requests
+    reqs = A_lu.pivot_requests
+    m = A_lu.m
     n_tiles = A_lu.factorization_n_tiles
     tile_size = A_lu.factorization_tile_size
     section_k = A_lu.section_k
     section_K = A_lu.section_K
+    section_L = A_lu.section_L
     section_height = A_lu.section_height
     section_width = A_lu.section_width
     first_pivot_section_k = A_lu.first_pivot_section_k
-    first_pivoting_buffers = A_lu.first_pivoting_buffers
-    first_pivoting_row_index_buffers = A_lu.first_pivoting_row_index_buffers
-    first_section_pair_lu_buffer = A_lu.first_section_pair_lu_buffer
-    pivoting_buffers = A_lu.first_pivoting_buffers
-    pivoting_row_index_buffers = A_lu.first_pivoting_row_index_buffers
-    matrix_parts = A_lu.factorization_matrix_parts
-    row_ranges = A_lu.factorization_matrix_parts_row_ranges
+    pivoting_buffer = A_lu.factorization_pivoting_buffer
+    pivoting_reduction_buffer = A_lu.factorization_pivoting_reduction_buffer
+    pivoting_reduction_indices = A_lu.factorization_pivoting_reduction_indices
+    matrix_storage = A_lu.factorization_matrix_storage
     col_ranges = A_lu.factorization_matrix_parts_col_ranges
+    locally_owned_rows = A_lu.factorization_locally_owned_rows
 
-    # The first step of the tree-reduction of the pivot candidates is special, because the
-    # input matrices are potentially non-square (they may be taller than they are wide
-    # away from tile edges, and matrices from locations at the bottom of a tile may be
-    # truncated). On all following steps, the input matrices are square, with a size
-    # (section_width,section_width) given by the number of pivot rows we are searching
-    # for. We therefore have a first step here which requires quite a bit of special
-    # handling, followed by a call to a more generic function that recurses until the
-    # binary tree has only one element left, which contains the final pivots.
-
-    function receive_next_section!(counter, tile)
-        next_part_rank = rank + section_L
-        if section_k == section_K - 1
-            # This is the second-last section on the tile, the next section is the last on
-            # the tile, which might not be full height. `buffer_last_row` should be equal
-            # to the height of the last two sections on the tile.
-            buffer_last_row = tile_size - (section_K - 2) * section_height
+    this_matrix_column =
+        @view matrix_storage[:,(p-1)*section_width+1:min(p*section_width,size(matrix_storage,2))]
+    if shared_rank == 0
+        # Find the first row of local storage that is on or below the matrix diagonal.
+        if section_k < first_pivot_section_k
+            first_local_row = (p + 1) * section_height
+        elseif section_k == first_pivot_section_k
+            # This block contains the first diagonal row in this column.
+            global_diagonal_row = col_ranges[1]
+            first_local_row = (p * section_height
+                               + global_diagonal_row
+                               - (p - 1) * tile_size
+                               - section_k * section_height)
         else
-            # If this section is neither the last nor second-last on this tile, then the
-            # next section is certainly full height.
-            # If this section is the last row on this tile, then the next section is the
-            # first one on the next tile, which is always full height.
-            buffer_last_row = 2 * section_height
+            first_local_row = p * section_height
         end
-        recv_reqs[2*counter+1] =
-            MPI.Irecv!(@view first_pivoting_buffers[section_height:buffer_last_row,:,counter+1],
-                       comm; source=next_part_rank, tag=tile)
-        recv_reqs[2*counter+2] =
-            MPI.Irecv!(@view
-                       first_pivoting_row_index_buffers[section_height:buffer_last_row,counter+1],
-                       comm; source=next_part_rank, tag=tile)
-        return nothing
-    end
+        n_panel_rows = size(matrix_storage, 1) - first_local_row + 1
+        # Construct a reshaped view so that lu_panel_buffer is a contiguously-allocated
+        # array. Need this complication because we need a different number of rows for
+        # each `p`, but we use column-major storage for arrays, so slicing the rows of a
+        # 2D buffer would give non-contiguous storage.
+        lu_panel_buffer = reshape(@view(pivoting_buffer[1:n_panel_rows*section_width]),
+                                  n_panel_rows, section_width)
+        lu_panel_buffer .= @view this_matrix_column[first_local_row:end,:]
 
-    function receive_previous_section!(counter, tile)
-        previous_part_rank = rank - section_L
-        if section_k == 1
-            # This is the first section on the tile, the previous section is the last on
-            # the previous tile, which might not be full height. `buffer_first_row` should
-            # be equal to the difference in height between a standard section and the last
-            # section on the tile.
-            buffer_first_row = tile_size - (section_K - 1) * section_height + 1
-            tag = tile - 1
-        else
-            # For all other sections then the previous section is certainly full height.
-            buffer_first_row = 1
-            tag = tile
-        end
-        recv_reqs[2*counter+1] =
-            MPI.Irecv!(@view first_pivoting_buffers[buffer_first_row:section_height,:,counter+1],
-                       comm; source=next_part_rank, tag=tag)
-        recv_reqs[2*counter+2] =
-            MPI.Irecv!(@view
-                       first_pivoting_row_index_buffers[buffer_first_row:section_height,counter+1],
-                       comm; source=next_part_rank, tag=tag)
-        return nothing
-    end
+        # LU factorize this locally-owned part of the column to get the pivots, we will
+        # then reduce the locally-found pivot rows with those found by all other blocks
+        # that share this column.
+        local_lu = lu!(lu_panel_buffer)
+        # Get the rows for just the first `section_width` pivots, which is the number need
+        # to find in the end, after reducing over all blocks.
+        # Using the internal LinearAlgebra function ipiv2perm is slightly more efficient
+        # than constructing the full permutation vector and then selecting only the first
+        # `section_width` entries from it.
+        local_pivot_indices = (ipiv2perm(local_lu.ipiv,
+                                        min(section_width, size(lu_panel_buffer, 1)))
+                               .+ first_local_row .- 1)
+        global_pivot_indices = locally_owned_rows[local_pivot_indices]
 
-    function send_to_next_section!(counter, tile)
-        next_part_rank = rank + section_L
-        send_reqs[2*counter+1] =
-            MPI.Isend!(@view matrix_parts[:,:,tile], comm; dest=next_part_rank, tag=tile)
-        send_reqs[2*counter+2] =
-            MPI.Isend!(@view
-                       first_pivoting_row_index_buffers[section_height:buffer_last_row,counter+1],
-                       comm; source=next_part_rank, tag=tile)
-        return nothing
-    end
+        # Collect all the local pivot rows and indices onto the `first_pivot_section_k`
+        # block.
+        if section_k == first_pivot_section_k
+            function get_n_rows_from_k(k)
+                if k < first_pivot_section_k
+                    if p == n_tiles
+                        # Last tile, but this block would only contribute starting at the
+                        # next tile, so no rows.
+                        return 0
+                    elseif p == n_tiles - 1
+                        # The next tile is the last one, which may not be full height.
+                        # first_row is limited to maximum of `m + 1` so that if the
+                        # section is entirely beyond the bottom of the matrix, we will
+                        # return 0.
+                        first_row = min((n_tiles - 1) * tile_size
+                                        + (k - 1) * section_height + 1,
+                                        m + 1
+                                       )
+                        last_row = min((n_tiles - 1) * tile_size + k * section_height, m)
+                        return last_row - first_row + 1
+                    else
+                        # This block cannot own the last section, so its sections must be
+                        # full-height (except possibly on the last tile, but the next tile
+                        # is not the last tile). A full-height section has at least as
+                        # many rows as section_width (we made this choice during setup).
+                        # So this block will pass the full number of pivot rows
+                        # (`section_width`).
+                        return section_width
+                    end
+                elseif k > first_pivot_section_k
+                    this_section_height =
+                        (k < section_K ? section_height :
+                         tile_size - (section_K - 1) * section_height)
+                    # Contributions from all tile-rows before the last one
+                    n_rows = this_section_height * (n_tiles - p)
 
-    function send_to_previous_section!(counter, tile)
-        previous_part_rank = rank - section_L
-        if section_k == 1
-            # This is the first section on the tile, the previous section is the last on
-            # the previous tile, which might not be full height. `buffer_first_row` should
-            # be equal to the difference in height between a standard section and the last
-            # section on the tile.
-            buffer_first_row = tile_size - (section_K - 1) * section_height + 1
-            tag = tile - 1
-        else
-            # For all other sections then the previous section is certainly full height.
-            buffer_first_row = 1
-            tag = tile
-        end
-        recv_reqs[2*counter+1] =
-            MPI.Irecv!(@view first_pivoting_buffers[buffer_first_row:section_height,:,counter+1],
-                       comm; source=next_part_rank, tag=tag)
-        recv_reqs[2*counter+2] =
-            MPI.Irecv!(@view first_pivoting_row_index_buffers[buffer_first_row:section_height,counter+1],
-                       comm; source=next_part_rank, tag=tag)
-        return nothing
-    end
-
-    # Only include parts on or below the matrix diagonal. The section that contains the
-    # diagonal requires some special handling.
-    # Notionally we loop over all the diagonal-and-below sections in each step below, but
-    # this rank only handles its own sections, and so 'skips through' the loop.
-
-    # First handle all the matrix-section communications
-    n_received_sections = 0
-    n_sent_sections = 0
-    if section_k < first_pivot_section_k
-        first_remaining_tile = p + 1
-    else
-        first_remaining_tile = p
-    end
-    section_K_is_odd = section_K % 2 == 1
-    for (tile_counter, tile) ∈ enumerate(first_remaining_tile:n_tiles)
-        # Find which section in the part of the column from diagonal down to the bottom of
-        # the matrix we are currently handling.
-        section_counter = section_k - first_pivot_section_k + 1 + (tile - p) * section_K
-        section_pair_counter, section_pair_which = divrem(section_counter - 1, 2) .+ 1
-
-        # We are setting up a binary tree. When section_counter is odd, this rank receives
-        # a section from the next rank. When section_counter is even, this rank sends a
-        # section to the next rank.
-        # There is a set of blocks of two sections, and we want to evenly distribute them
-        # among the ranks participating in this pivot calculation (of which there are
-        # `section_K`). Therefore as we iterate through the pairs, the rank out of the two
-        # holding the pair that owns the lowest existing number of pairs receives the
-        # pair, breaking ties by choosing the lower section_k of the pair. To achieve
-        # this: when section_K is odd, we just choose the first rank of the two owning the
-        # pair every time; when section_K is even, we choose the first rank on odd loops
-        # through the ranks, then the second on the even loops through the ranks.
-        if section_K_is_odd
-            if section_pair_which == 1
-                # Receive the other member of the pair.
-                receive_next_section!(n_received_sections, tile)
-                n_received_sections += 1
-            else
-                send_to_previous_rank!(n_sent_sections, tile)
-                n_sent_sections += 1
-            end
-        else
-            if tile_counter % 2 == 1
-                if section_pair_which == 1
-                    # Receive the other member of the pair.
-                    receive_next_section!(n_received_sections, tile)
-                    n_received_sections += 1
+                    # The last tile might not be full height, so get its height specially,
+                    # similar to the `p == n_tiles - 1` case above.
+                    last_tile_first_row = min((n_tiles - 1) * tile_size
+                                    + (k - 1) * section_height + 1,
+                                    m + 1
+                                   )
+                    last_tile_last_row = min((n_tiles - 1) * tile_size + k * section_height, m)
+                    n_rows += last_tile_last_row - last_tile_first_row + 1
+                    return min(n_rows, section_width)
                 else
-                    # Send to the rank holding the other member of the pair.
-                    send_to_previous_rank!(n_sent_sections, tile)
-                    n_sent_sections += 1
-                end
-            else
-                if section_pair_which == 1
-                    # Send to the rank holding the other member of the pair.
-                    send_to_next_rank!(n_sent_sections, tile)
-                    n_sent_sections += 1
-                else
-                    # Receive the other member of the pair.
-                    receive_previous_section!(n_received_sections, tile)
-                    n_received_sections += 1
+                    return length(local_pivot_indices)
                 end
             end
+            n_rows_from_k = [get_n_rows_from_k(k) for k ∈ 1:section_K]
+            k_rows_end = cumsum(n_rows_from_k)
+            n_reduced_rows = k_rows_end[end]
+            reduced_buffer =
+                reshape(@view pivoting_reduction_buffer[1:n_reduced_rows*section_width],
+                        n_reduced_rows, section_width)
+            reduced_row_indices = @view pivoting_reduction_indices[1:n_reduced_rows]
+
+            # Post receives for the rows and row indices from other blocks.
+            for k ∈ 1:section_K
+                if k == section_k
+                    # This rank does not need to communicate with itself!
+                    continue
+                end
+                if n_rows_from_k[k] == 0
+                    # No rows to colect
+                    continue
+                end
+                # Each rank in this column is offset from the next/previous in the global
+                # communicator `comm` by `section_L`.
+                rank_k = rank + (k - section_k) * section_L
+                if k == 1
+                    reqs[2*(k-1)+1] = MPI.Irecv(@view(reduced_buffer[1:k_rows_end[k],:]),
+                                                      comm; source=rank_k, tag=1)
+                    reqs[2*(k-1)+2] =
+                        MPI.Irecv(@view(reduced_row_indices[1:k_rows_end[k]], comm;
+                                        source=rank_k)), tag=2
+                else
+                    reqs[2*(k-1)+1] =
+                        MPI.Irecv(@view(reduced_buffer[k_rows_end[k-1]+1:k_rows_end[k],:]),
+                                        comm; source=rank_k, tag=1)
+                    reqs[2*(k-1)+2] =
+                        MPI.Irecv(@view(reduced_row_indices[k_rows_end[k-1]+1:k_rows_end[k]],
+                                        comm; source=rank_k), tag=2)
+                end
+            end
+
+            # Copy in the local contributions
+            k = section_k
+            if section_k == 1
+                @views reduced_buffer[1:k_rows_end[k],:] .=
+                    this_matrix_column[local_pivot_indices,:]
+                @views reduced_row_indices[1:k_rows_end[k]] .= global_pivot_indices
+            else
+                @views reduced_buffer[1:k_rows_end[k],:] .=
+                    this_matrix_column[local_pivot_indices,:]
+                @views reduced_row_indices[k_rows_end[k-1]+1:k_rows_end[k]] .=
+                    global_pivot_indices
+            end
+
+            MPI.Waitall(reqs)
+
+            # Do an LU factorization on the reduced rows. This gives the final pivot
+            # indices, and also the (section_width,section_width) top-left block of the LU
+            # factors.
+            local_lu = lu!(reduced_buffer)
+            buffer_pivot_indices = ipiv2perm(local_lu.ipiv, section_width)
+            global_pivot_indices = reduced_row_indices[buffer_pivot_indices]
+        else
+            # Get the local pivot rows ready for collection.
+            if length(local_pivot_indices) > 0
+                local_pivots_buffer .= @view matrix_storage[local_pivot_indices,:]
+                reqs[1] = MPI.Isend(local_pivots_buffer, comm; dest=collecting_rank, tag=1)
+                reqs[2] = MPI.Isend(global_pivot_indices, comm; dest=collecting_rank, tag=2)
+                MPI.Waitall(@view reqs[1:2])
+            end
         end
     end
-
-    # For receiving ranks, fill in the locally-owned part, wait for the part being
-    # communicated, and do the LU factorization to get the potential pivot rows.
-    if first_pivot_section_k == section_k
-        # This rank contains the first diagonal row. However, that row might not be at the
-        # beginning of matrix_parts[p,p], so need to handle the possibility of only
-        # including part of the locally-owned section. As the sections are taller than
-        # they are wide (if they are non-square), the first two sections are certain to
-        # contain all the diagonal rows, which are therefore included in `buffer1` below.
-        # `generate_pivots!()` is not called for the very last square piece of the matrix,
-        # so there are always at least two sections.
-        first_row = A_lu.first_row_with_diagonal
-        buffer1 = @view first_pivoting_buffers[first_row:2*section_height,:,1]
-        lu_buffer1 = @view first_section_pair_lu_buffer[first_row:2*section_height,:]
-        rowind_buffer1 = @view first_pivoting_row_index_buffers[first_row:2*section_height,1]
-        @views first_pivoting_buffers[first_row:section_height,:,1] .=
-            matrix_parts[first_row:end,:,p]
-        section_start = (p - 1) * tile_size + (section_k - 1) * section_height
-        @views rowind_buffer1[first_row:section_height,:,1] .=
-            (section_start+first_row:section_start+section_height)
-        MPI.Wait(recv_reqs[1])
-        lu_buffer1 .= buffer1_lu
-        buffer1_lu = lu!(lu_buffer1)
-        MPI.Wait(recv_reqs[2])
-        # Note that section_width is always ≤section_height, so this slice will always be
-        # in range.
-        pivot_candidates1 = rowind_buffer1[buffer1_lu.p[1:section_width]]
-    end
-
-    MPI.Waitall(send_reqs)
 end
 
 function fill_ldiv_tiles!(A_lu)
