@@ -62,10 +62,18 @@ function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size:
                                              for tile_i ∈ 1:factorization_n_tiles]
     factorization_matrix_parts_col_ranges = [get_col_range(tile_j)
                                              for tile_j ∈ 1:factorization_n_tiles]
-    factorization_matrix_parts = [allocate_shared_float(length(row_range),
-                                                        length(col_range))
-                                  for row_range ∈ factorization_matrix_parts_row_ranges,
-                                      col_range ∈ factorization_matrix_parts_col_ranges]
+
+    # Store the locally-owned parts of the array in a joined-together 2D array
+    # `factorization_matrix_storage`. This will be useful for some operations.
+    # `factorization_matrix_parts` contains views into `factorization_matrix_storage`
+    # corresponding to the locally-owned section of each tile.
+    local_storage_m = sum(length(r) for r ∈ factorization_matrix_parts_row_ranges)
+    local_storage_n = sum(length(c) for c ∈ factorization_matrix_parts_col_ranges)
+    factorization_matrix_storage = allocate_shared_float(local_storage_m, local_storage_n)
+    factorization_matrix_parts =
+        [@view(factorization_matrix_storage[(tile_i-1)*section_height:min(tile_i*section_height,local_storage_n),
+                                            (tile_j-1)*section_width:min(tile_j*section_width,local_storage_m)])
+         for tile_i ∈ 1:n_tiles, tile_j ∈ 1:n_tiles]
 
     # This rank is the top of the column of diagonal and below-diagonal blocks that need
     # to be pivoted.

@@ -9,7 +9,7 @@ using StatsBase: countmap
 
 import LinearAlgebra: lu!, ldiv!
 
-@kwdef struct DenseLU{T,Tmat,Tvec,Tintvec,Tsync}
+@kwdef struct DenseLU{T,Tmat,Tvec,Tintvec,Tfmp,Tsync}
     m::Int64
     n::Int64
     factors::Tmat
@@ -20,7 +20,8 @@ import LinearAlgebra: lu!, ldiv!
     section_l::Int64
     section_height::Int64
     section_width::Int64
-    factorization_matrix_parts::Matrix{Transpose{T,Matrix{T}}}
+    factorization_matrix_storage::Tmat
+    factorization_matrix_parts::Tfmp
     factorization_matrix_parts_row_ranges::Vector{UnitRange{Int64}}
     factorization_matrix_parts_col_ranges::Vector{UnitRange{Int64}}
     factorization_tile_size::Int64
