@@ -31,6 +31,7 @@ import LinearAlgebra: lu!, ldiv!
     factorization_pivoting_buffer::Tvec
     factorization_pivoting_reduction_buffer::Tvec
     factorization_pivoting_reduction_indices::Tvecint
+    factorization_row_swap_buffer::Vector{T}
     pivot_requests::Vector{MPI.Request}
     my_L_tiles::Array{T,3}
     my_L_tile_row_ranges::Vector{UnitRange{Int64}}

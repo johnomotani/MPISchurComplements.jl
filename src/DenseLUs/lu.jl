@@ -81,10 +81,10 @@ function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size:
                                             (tile_j-1)*section_width:min(tile_j*section_width,local_storage_m)])
          for tile_i ∈ 1:n_tiles, tile_j ∈ 1:n_tiles]
 
-    # This rank is the top of the column of diagonal and below-diagonal blocks that need
-    # to be pivoted.
-    diagonal_row = factorization_matrix_parts_col_ranges[1]
-    first_pivot_section_k = (diagonal_row - 1) ÷ section_height + 1
+    # Find the section-row-index of the rank containing the first diagonal row for each
+    # sub-column.
+    first_pivot_section_k = [((l - 1) * section_width) ÷ section_height + 1
+                             for l ∈ 1:section_L]
 
     if shared_comm_rank == 0
         # The most blocks that will ever be owned by this process when calculating the
@@ -102,7 +102,6 @@ function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size:
                                                    max_local_pivoting_blocks)
     else
         first_pivoting_row_index_buffers = zeros(Int64, 0, 0)
-        pivoting_row_index_buffers = zeros(Int64, 0, 0)
         first_section_pair_lu_buffer = zeros(datatype, 0, 0)
     end
     factorization_pivoting_buffer = allocate_shared_float(n_tiles * section_height *
@@ -111,7 +110,8 @@ function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size:
         allocate_shared_float(section_width * section_K * section_width)
     factorization_pivoting_reduction_indices =
         allocate_shared_int(section_width * section_K)
-    pivot_requests = [MPI.REQUEST_NULL for _ ∈ 1:section_K]
+    factorization_row_swap_buffers = zeros(datatype, section_width, section_width)
+    pivot_requests = [MPI.REQUEST_NULL for _ ∈ 1:2*section_K]
 
     return (; factors, row_permutation, section_K, section_L, section_k, section_l,
             section_height, section_width, factorization_matrix_storage,
@@ -119,7 +119,8 @@ function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size:
             factorization_matrix_parts_col_ranges, factorization_locally_owned_rows,
             factorization_tile_size, factorization_n_tiles, first_pivot_section_k,
             factorization_pivoting_buffer, factorization_pivoting_reduction_buffer,
-            factorization_pivoting_reduction_indices, pivot_requests)
+            factorization_pivoting_reduction_indices, factorization_row_swap_buffers,
+            pivot_requests)
 end
 
 function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
@@ -184,37 +185,34 @@ function pivot_panel_factorization!(A_lu, p)
     n_tiles = A_lu.factorization_n_tiles
 
     for sub_column ∈ 1:section_L
-        if sub_column == section_l
-            if p == n_tiles
-                # This is the last, bottom-right section, so we just LU in serial.
-                if A_lu.section_k = A_lu.section_K
-                    section_width = length(A_lu.factorization_matrix_parts_col_ranges[end])
-                    last_block = @view A_lu.factorization_matrix_parts[end-section_width+1:end,:,end]
-                    # Note the in-place version `lu!` actually saves the L and U factors
-                    # into last_block.
-                    last_section_lu = lu!(last_block)
-                end
-                # LU is finished, there are no more sub columns to handle.
-                break
+        if p == n_tiles && sub_column == section_L
+            # This is the last, bottom-right section, so we just LU in serial.
+            if section_l == section_L && A_lu.section_k = A_lu.section_K
+                section_width = length(A_lu.factorization_matrix_parts_col_ranges[end])
+                last_block = @view A_lu.factorization_matrix_parts[end,end]
+                # Note the in-place version `lu!` actually saves the L and U factors
+                # into last_block.
+                last_section_lu = lu!(last_block)
             end
-
-            # This rank owns sub_column, so participates in generating pivots.
-            generate_pivots!(A_lu, p)
+            # LU is finished, and as we have completed the final section in serial, we do
+            # not need to call the remaining functions.
+            break
         end
-        pivot_sub_column!(A_lu, p, sub_column)
-        LU_sub_column!(A_lu, p, sub_column)
+        generate_pivots!(A_lu, p, sub_column)
+        apply_pivots_from_sub_column!(A_lu, p, sub_column)
+        update_below_diagonal_sub_column!(A_lu, p, sub_column)
+        update_right_sub_columns!(A_lu, p, sub_column)
     end
 end
 
-function generate_pivots!(A_lu, p)
-    if A_lu.section_K == 1
-        error("does this case need special handling? No pieces to swap?")
-    end
-    if A_lu.section_K == 2
-        error("does this case need special handling? second section might not be full size?")
+function generate_pivots!(A_lu, p, sub_column)
+    if sub_column != A_lu.section_l
+        # This rank does not participate in pivot generation for this sub-column.
+        return nothing
     end
     comm = A_lu.comm
     rank = A_lu.comm_rank
+    shared_comm_rank = A_lu.shared_comm_rank
     reqs = A_lu.pivot_requests
     m = A_lu.m
     n_tiles = A_lu.factorization_n_tiles
@@ -224,7 +222,7 @@ function generate_pivots!(A_lu, p)
     section_L = A_lu.section_L
     section_height = A_lu.section_height
     section_width = A_lu.section_width
-    first_pivot_section_k = A_lu.first_pivot_section_k
+    this_first_pivot_section_k = A_lu.first_pivot_section_k[sub_column]
     pivoting_buffer = A_lu.factorization_pivoting_buffer
     pivoting_reduction_buffer = A_lu.factorization_pivoting_reduction_buffer
     pivoting_reduction_indices = A_lu.factorization_pivoting_reduction_indices
@@ -234,11 +232,11 @@ function generate_pivots!(A_lu, p)
 
     this_matrix_column =
         @view matrix_storage[:,(p-1)*section_width+1:min(p*section_width,size(matrix_storage,2))]
-    if shared_rank == 0
+    if shared_comm_rank == 0
         # Find the first row of local storage that is on or below the matrix diagonal.
-        if section_k < first_pivot_section_k
+        if section_k < this_first_pivot_section_k
             first_local_row = (p + 1) * section_height
-        elseif section_k == first_pivot_section_k
+        elseif section_k == this_first_pivot_section_k
             # This block contains the first diagonal row in this column.
             global_diagonal_row = col_ranges[1]
             first_local_row = (p * section_height
@@ -271,11 +269,11 @@ function generate_pivots!(A_lu, p)
                                .+ first_local_row .- 1)
         global_pivot_indices = locally_owned_rows[local_pivot_indices]
 
-        # Collect all the local pivot rows and indices onto the `first_pivot_section_k`
-        # block.
-        if section_k == first_pivot_section_k
+        # Collect all the local pivot rows and indices onto the
+        # `this_first_pivot_section_k` block.
+        if section_k == this_first_pivot_section_k
             function get_n_rows_from_k(k)
-                if k < first_pivot_section_k
+                if k < this_first_pivot_section_k
                     if p == n_tiles
                         # Last tile, but this block would only contribute starting at the
                         # next tile, so no rows.
@@ -300,7 +298,7 @@ function generate_pivots!(A_lu, p)
                         # (`section_width`).
                         return section_width
                     end
-                elseif k > first_pivot_section_k
+                elseif k > this_first_pivot_section_k
                     this_section_height =
                         (k < section_K ? section_height :
                          tile_size - (section_K - 1) * section_height)
@@ -377,7 +375,12 @@ function generate_pivots!(A_lu, p)
             # factors.
             local_lu = lu!(reduced_buffer)
             buffer_pivot_indices = ipiv2perm(local_lu.ipiv, section_width)
-            global_pivot_indices = reduced_row_indices[buffer_pivot_indices]
+            # Is OK to re-use the pivoting_reduction_indices buffer, as
+            # we are already finished with `reduced_row_indices`.
+            # The pivot indices stored in this buffer will be broadcast to all ranks in
+            # `apply_pivots_from_sub_column!()`.
+            sub_column_pivot_indices = @view pivoting_reduction_indices[1:section_width]
+            sub_column_pivot_indices .= reduced_row_indices[buffer_pivot_indices]
         else
             # Get the local pivot rows ready for collection.
             if length(local_pivot_indices) > 0
