@@ -75,7 +75,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
                                                                     * tile_size)
     factorization_pivoting_reduction_indices = allocate_shared_int(tile_size * group_K)
     factorization_row_swap_buffers = zeros(datatype, 2 * tile_size, local_storage_n)
-    pivot_requests = [MPI.REQUEST_NULL for _ ∈ 1:max(2*group_K, group_K + group_L)]
+    comm_requests = [MPI.REQUEST_NULL for _ ∈ 1:max(2*group_K, group_K + group_L)]
 
     return (; factors, row_permutation, group_K, group_L, group_k, group_l,
             factorization_matrix_storage, factorization_matrix_parts,
@@ -83,7 +83,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
             factorization_locally_owned_rows, factorization_pivoting_buffer,
             factorization_pivoting_reduction_buffer,
             factorization_pivoting_reduction_indices, factorization_row_swap_buffer,
-            pivot_requests)
+            comm_requests)
 end
 
 function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
@@ -143,8 +143,8 @@ function redistribute_matrix!(A_lu, A)
 end
 
 function generate_pivots!(A_lu, panel)
-    group_L = A_lu.group_L
     group_l = A_lu.group_l
+    group_L = A_lu.group_L
     if (panel - 1) % group_L + 1 != group_l
         # This rank does not participate in pivot generation for this panel.
         return nothing
@@ -152,7 +152,7 @@ function generate_pivots!(A_lu, panel)
     comm = A_lu.comm
     rank = A_lu.comm_rank
     shared_comm_rank = A_lu.shared_comm_rank
-    reqs = A_lu.pivot_requests
+    reqs = A_lu.comm_requests
     m = A_lu.m
     n_tiles = A_lu.n_tiles
     tile_size = A_lu.tile_size
@@ -304,7 +304,7 @@ function apply_pivots_from_sub_column!(A_lu, panel)
     comm = A_lu.comm
     rank = A_lu.comm_rank
     shared_comm_rank = A_lu.shared_comm_rank
-    reqs = A_lu.pivot_requests
+    reqs = A_lu.comm_requests
     m = A_lu.m
     tile_size = A_lu.tile_size
     group_K = A_lu.group_K
@@ -503,9 +503,10 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
     shared_comm_rank = A_lu.shared_comm_rank
     row_ranges = factorization_matrix_parts_row_ranges
     col_ranges = factorization_matrix_parts_col_ranges
+    matrix_storage = A_lu.factorization_matrix_storage
     matrix_parts = A_lu.factorization_matrix_parts
-    tile_width = A_lu.factorization_tile_width
-    reqs = A_lu.pivot_requests
+    tile_size = A_lu.tile_size
+    reqs = A_lu.comm_requests
     group_k = A_lu.group_k
     group_K = A_lu.group_K
     group_L = A_lu.group_L
@@ -590,9 +591,9 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
             # diagonal sub-tile. Now need to apply U^-1 from the right to the
             # locally-owned part of the sub-column that is below the diagonal sub-tile.
             if group_k ≤ panel_k
-                first_storage_row_this_rank = panel_group_row * tile_size + 1
+                first_storage_row = panel_group_row * tile_size + 1
             else
-                first_storage_row_this_rank = (panel_group_row - 1) * tile_size + 1
+                first_storage_row = (panel_group_row - 1) * tile_size + 1
             end
             last_storage_row = size(matrix_storage, 1)
             first_storage_col = (panel_group_col - 1) * tile_size + 1
@@ -622,23 +623,21 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
             col_buffer .= local_below_diagonal_sub_column
         end
 
-        if section_k == panel_k
+        if group_k == panel_k
             # This branch now includes the rank that owns the diagonal sub-tile.
 
             # The whole sub-row to the right of the diagonal sub-block needs to be updated
             # by solving L*M=A to find M, where A are the original matrix entries and L is
             # the lower-triangular factor from the diagonal sub-block.
 
-            first_diagonal_row = (sub_column - 1) * diagonal_block_size + 1
-            last_diagonal_row = first_diagonal_row + diagonal_block_size - 1
-            first_row_this_rank = (section_k - 1) * section_height + 1
-            last_row_this_rank = min(section_k * section_height, tile_size)
-            local_n_rows = min(last_diagonal_row, last_row_this_rank) - first_diagonal_row + 1
-
             # Locally-owned rows/column to be copied into row_buffer
             first_storage_row = (panel_k - 1) * tile_size + 1
             last_storage_row = panel_k * tile_size
-            first_storage_col = (panel_l - 1) * tile_size + 1
+            if group_l ≤ group_L
+                first_storage_col = panel_l * tile_size + 1
+            else
+                first_storage_col = (panel_l - 1) * tile_size + 1
+            end
             last_storage_col = min(panel_l * tile_size, size(matrix_storage, 2))
 
             n_rows = last_storage_row - first_storage_row + 1
@@ -666,6 +665,101 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
             # Diagonal rank can now ensure all communications have completed.
             MPI.Waitall(@view(reqs[1:req_counter]))
         end
+    end
+
+    return nothing
+end
+
+function update_bottom_right_block!(A_lu, panel)
+    n_tiles = A_lu.factorization_n_tiles
+    if panel == n_tiles
+        # No remaining matix to update.
+        return nothing
+    end
+    tile_size = A_lu.tile_size
+    group_k = A_lu.group_k
+    group_K = A_lu.group_K
+    group_l = A_lu.group_l
+    group_L = A_lu.group_L
+    reqs = A_lu.comm_requests
+
+    row_buffers = A_lu.factorization_row_swap_buffers
+    # Can reuse this buffer as a column buffer, as it is big enough.
+    col_buffers = A_lu.factorization_pivoting_buffer
+
+    panel_group_row, panel_k = divrem(panel - 1, group_K) .+ 1
+    panel_group_col, panel_l = divrem(panel - 1, group_L) .+ 1
+
+    # The left panel and top panel are currently stored in contiguous buffers on the
+    # panel_l sub-column and panel_k sub-row. We need to broadcast these buffers to all
+    # ranks in the same row and column respectively.
+
+    left_panel_first_storage_row = panel_group_row * tile_size + 1
+    left_panel_last_storage_row = size(matrix_storage, 1)
+    left_panel_first_storage_col = (panel_group_col - 1) * tile_size + 1
+    left_panel_last_storage_col = min(panel_group_col * tile_size, size(matrix_storage, 2))
+    left_n_panel_rows = left_panel_last_storage_row - left_panel_first_storage_row + 1
+    left_n_panel_cols = left_panel_last_storage_col - left_panel_first_storage_col + 1
+    left_panel_buffer_size = left_panel_n_rows * left_panel_n_cols
+
+    # We are using a transposed buffer to improve efficiency in
+    # update_sub_panel_off_diagonals!().
+    left_panel_buffer = transpose(reshape(@view col_buffers[1:left_panel_buffer_size],
+                                          n_cols, n_rows))
+
+    # Locally-owned rows/column to be copied into row_buffer
+    top_panel_first_storage_row = (panel_k - 1) * tile_size + 1
+    top_panel_last_storage_row = panel_k * tile_size
+    if group_l ≤ group_L
+        top_panel_first_storage_col = panel_l * tile_size + 1
+    else
+        top_panel_first_storage_col = (panel_l - 1) * tile_size + 1
+    end
+    top_panel_last_storage_col = min(panel_l * tile_size, size(matrix_storage, 2))
+    top_panel_n_rows = top_panel_last_storage_row - top_panel_first_storage_row + 1
+    top_panel_n_cols = top_panel_last_storage_col - top_panel_first_storage_col + 1
+    top_panel_buffer_size = top_panel_n_rows * top_panel_n_cols
+    top_panel_buffer = reshape(@view col_buffers[1:top_panel_buffer_size],
+                               top_panel_n_rows, top_panel_n_cols)
+
+    if shared_comm_rank == 0
+        request_counter = 0
+        if group_l == panel_l
+            # Send left panel to all ranks in the same row.
+            for l ∈ 1:group_L
+                if l == panel_l
+                    # Don't need to send from this rank to itself.
+                    continue
+                end
+                r = (l - 1) * group_K + group_k
+                reqs[request_counter+=1] = MPI.Isend(left_panel_buffer, comm; dest=r)
+            end
+        else
+            left_panel_r = (panel_l - 1) * group_K + group_k
+            reqs[request_counter+=1] = MPI.Irecv!(left_panel_buffer, comm; dest=r)
+        end
+
+        if group_k == panel_k
+            # Send top panel to all ranks in the same column.
+            for k ∈ 1:group_K
+                if k == panel_k
+                    # Don't need to send from this rank to itself.
+                    continue
+                end
+                r = (group_l - 1) * group_K + k
+                reqs[request_counter+=1] = MPI.Isend(top_panel_buffer, comm; dest=r)
+            end
+        else
+            top_panel_r = (group_l - 1) * group_K + panel_k
+            reqs[request_counter+=1] = MPI.Irecv!(top_panel_buffer, comm; dest=r)
+        end
+
+        MPI.Waitall(reqs[1:request_counter])
+
+        # Perform the update of the bottom-right block.
+        remaining_block = @view matrix_storage[top_panel_last_storage_row+1:end,
+                                               left_panel_last_storage_col+1:end]
+        mul!(remaining_block, left_panel, top_panel, 1.0, 1.0)
     end
 
     return nothing
