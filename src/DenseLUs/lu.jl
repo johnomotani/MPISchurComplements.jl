@@ -74,7 +74,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
     factorization_pivoting_reduction_buffer = allocate_shared_float(tile_size * group_K
                                                                     * tile_size)
     factorization_pivoting_reduction_indices = allocate_shared_int(tile_size * group_K)
-    factorization_row_swap_buffers = zeros(datatype, tile_size, local_storage_n)
+    factorization_row_swap_buffers = zeros(datatype, 2 * tile_size, local_storage_n)
     pivot_requests = [MPI.REQUEST_NULL for _ ∈ 1:max(2*group_K, group_K + group_L)]
 
     return (; factors, row_permutation, group_K, group_L, group_k, group_l,
@@ -309,28 +309,35 @@ function generate_pivots!(A_lu, panel)
     return nothing
 end
 
-function apply_pivots_from_sub_column!(A_lu, panel, sub_column)
+function apply_pivots_from_sub_column!(A_lu, panel)
     comm = A_lu.comm
     rank = A_lu.comm_rank
     shared_comm_rank = A_lu.shared_comm_rank
     reqs = A_lu.pivot_requests
+    m = A_lu.m
     n_tiles = A_lu.factorization_n_tiles
-    tile_size = A_lu.factorization_tile_size
+    tile_size = A_lu.tile_size
     section_l = A_lu.section_l
-    section_K = A_lu.section_K
+    group_K = A_lu.group_K
     section_width = A_lu.section_width
     this_first_pivot_section_k = A_lu.first_pivot_section_k[sub_column]
     this_rank_section_height = length(A_lu.factorization_matrix_parts_col_ranges[1])
     matrix_parts = A_lu.factorization_matrix_parts
     row_swap_buffers = A_lu.factorization_row_swap_buffers
-    sub_column_pivot_indices = @view pivoting_reduction_indices[1:section_width]
+
+    panel_group_row, panel_k = divrem(panel - 1, group_K) .+ 1
+    first_local_col = (panel_group_col - 1) * tile_size + 1
+    last_local_col = min(panel_group_col * tile_size, size(matrix_storage, 2))
+    this_tile_size = last_local_col - first_local_col + 1
+
+    sub_column_pivot_indices = @view A_lu.factorization_pivoting_reduction_indices[1:this_tile_size]
 
     if shared_comm_rank == 0
-        broadcasting_rank = (sub_column - 1) * section_K + this_first_pivot_section_k
+        diagonal_rank = (panel_l - 1) * group_K + panel_k
         # Broadcast the pivot indices for this sub column to all ranks.
-        MPI.Bcast!(sub_column_pivot_indices, comm; root=broadcasting_rank)
+        MPI.Bcast!(sub_column_pivot_indices, comm; root=diagonal_rank)
 
-        diagonal_block_indices = (sub_column-1)*section_width+1:min(sub_column*section_width, tile_size)
+        diagonal_block_indices = (panel-1)*tile_size+1:min(panel*tile_size, m)
         first_diag = diagonal_block_indices[1]
         last_diag = diagonal_block_indices[end]
 
@@ -365,88 +372,133 @@ function apply_pivots_from_sub_column!(A_lu, panel, sub_column)
         # have started.
         isolated_receive_info = NTuple{3,Int64}[]
 
+        # First copy all the rows to be set into row_swap_buffers, and post sends. We then
+        # do the receives and copies into the matrix rows in a second step, to ensure that
+        # no row is overwritten before being copied out.
         req_counter = 0
         for (iswap, (idiag, isource, idest)) ∈
                 enumerate(zip(diagonal_block_indices, sub_column_pivot_indices,
                               diagonal_block_row_destination_indices))
-            if i1 == i2 == i3
+            if idiag == isource == idest
                 # No swap to do.
                 continue
             end
 
-            row_swap_buffer = @view row_swap_buffers[:,iswap]
+            diag_row_swap_buffer = @view row_swap_buffers[2*(iswap-1)+1,:]
+            source_row_swap_buffer = @view row_swap_buffers[2*(iswap-1)+2,:]
 
-            owning_rank_k_diag, diag_section_row_offset = divrem((idiag - 1) % tile_size, section_height) .+ 1
-            diag_section_row = (panel - 1) * this_rank_section_height + diag_section_row_offset
-            owning_rank_diag = (section_l - 1) * section_K + owning_rank_k_diag
+            diag_tile_row, diag_tile_row_offset = divrem(idiag - 1, tile_size) .+ 1
+            owning_rank_k_diag = (diag_tile_row - 1) % group_K + 1
+            owning_rank_diag = (group_l - 1) * group_K + owning_rank_k_diag
 
-            source_tile, source_tile_offset = divrem(isource - 1, tile-size)
-            owning_rank_k_source, source_section_row_offset = divrem(source_tile_offset, section_height) .+ 1
-            source_section_row = (source_tile - 1) * this_rank_section_height + source_section_row_offset
-            owning_rank_source = (section_l - 1) * section_K + owning_rank_k_source
+            source_tile_row, source_tile_row_offset = divrem(isource - 1, tile_size) .+ 1
+            owning_rank_k_source = (source_tile_row - 1) % group_K + 1
+            owning_rank_source = (group_l - 1) * group_K + owning_rank_k_source
 
-            dest_tile, dest_tile_offset = divrem(idest - 1, tile-size)
-            owning_rank_k_dest, dest_section_row_offset = divrem(dest_tile_offset, section_height) .+ 1
-            dest_section_row = (dest_tile - 1) * this_rank_section_height + dest_section_row_offset
-            owning_rank_dest = (section_l - 1) * section_K + owning_rank_k_dest
+            dest_tile_row, dest_tile_row_offset = divrem(idest - 1, tile_size) .+ 1
+            owning_rank_k_dest = (dest_tile_row - 1) % group_K + 1
+            owning_rank_dest = (group_l - 1) * group_K + owning_rank_k_dest
 
-            if rank == owning_rank_k1 == owning_rank_k2
+            if rank == owning_rank_diag == owning_rank_source == owning_rank_dest
                 # Swaps are all among rows owned by this rank.
 
-                # Copy the diag row into a buffer to send down to i2 afterward.
-                row_swap_buffer .= @view matrix_storage[diag_section_row,:]
+                # Copy the diag row into a buffer to send down to owning_rank_dest
+                # afterward.
+                diag_row_swap_buffer .= @view matrix_storage[diag_section_row,:]
 
                 # source -> diag
                 @views matrix_storage[diag_section_row,:] .=
                     matrix_storage[source_section_row,:]
+            elseif rank == owning_rank_diag == owning_rank_source
+                # Copy out data from the row that we own, to send to owning_rank_dest.
+                diag_row_swap_buffer .= @view matrix_storage[diag_section_row,:]
 
                 # diag -> dest
-                matrix_storage[dest_section_row,:] .= row_swap_buffer
-            elseif rank == owning_rank_k_diag
-                diag_row_data = @view matrix_storage[diag_section_row,:]
-                # Copy out data from the row that we own, to send to owning_rank_k2.
-                row_swap_buffer .= diag_row_data
-
-                # diag -> dest
-                reqs[req_counter+=1] = MPI.Isend(row_swap_buffer, comm;
+                reqs[req_counter+=1] = MPI.Isend(diag_row_swap_buffer, comm;
                                                  dest=owning_rank_dest, tag=iswap)
+
+                # source -> diag
+                @views matrix_storage[diag_section_row,:] .=
+                    matrix_storage[source_section_row,:]
+            elseif rank == owning_rank_diag == owning_rank_dest
+                # Copy out data from the row that we own, to later copy to destination
+                # row.
+                diag_row_swap_buffer .= @view matrix_storage[diag_section_row,:]
+
                 # source -> diag
                 reqs[req_counter+=1] = MPI.Irecv!(diag_row_data, comm;
                                                   source=owning_rank_source, tag=iswap)
-            elseif rank == owning_rank_source && rank == owning_rank_dest
-                source_row_data = @view matrix_storage[source_section_row,:]
-                dest_row_data = @view matrix_storage[dest_section_row,:]
-                # Copy out data from the row that we own, to send to owning_rank_k1.
-                row_swap_buffer .= source_row_data
+            elseif rank == owning_rank_diag
+                diag_row_data = @view matrix_storage[diag_section_row,:]
+
+                # Copy out data from the row that we own, to later copy to destination
+                # row.
+                diag_row_swap_buffer .= diag_row_data
 
                 # source -> diag
-                reqs[req_counter+=1] = MPI.Isend(row_swap_buffer, comm;
-                                                 dest=owning_rank_diag, tag=iswap)
+                reqs[req_counter+=1] = MPI.Irecv!(diag_row_data, comm;
+                                                  source=owning_rank_source, tag=iswap)
                 # diag -> dest
-                reqs[req_counter+=1] = MPI.Irecv!(dest_row_data, comm;
-                                                  source=owning_rank_diag, tag=iswap)
-            elseif rank == owning_rank_source
-                source_row_data = @view matrix_storage[source_section_row,:]
-                # Copy out data from the row that we own, to send to owning_rank_k1.
-                row_swap_buffer .= source_row_data
+                reqs[req_counter+=1] = MPI.Isend!(diag_row_swap_buffer, comm;
+                                                  dest=owning_rank_dest, tag=iswap)
+            elseif rank == owning_rank_source == owning_rank_dest
+                # Copy out data from the row that we own, to send to owning_rank_diag.
+                source_row_swap_buffer .= @view matrix_storage[source_section_row,:]
 
                 # source -> diag
-                reqs[req_counter+=1] = MPI.Isend(row_swap_buffer, comm;
+                reqs[req_counter+=1] = MPI.Isend(source_row_swap_buffer, comm;
                                                  dest=owning_rank_diag, tag=iswap)
-            elseif rank == owning_rank_dest
-                # Must make the MPI.Irecv!() call after the data has been copied out to be
-                # sent (which must be happening at a different `iswap` to enter this
-                # branch). Therefore store the row and the source rank so we can make the
-                # MPI.Irecv!() calls after all the MPI.Isend!() have been made.
-                push!(isolated_receive_info, (dest_section_row, owning_rank_diag, iswap))
+            elseif rank == owning_rank_source
+                # Copy out data from the row that we own, to send to owning_rank_k1.
+                source_row_swap_buffer .= @view matrix_storage[source_section_row,:]
+
+                # source -> diag
+                reqs[req_counter+=1] = MPI.Isend(source_row_swap_buffer, comm;
+                                                 dest=owning_rank_diag, tag=iswap)
             end
         end
-        for (dest_section_row, owning_rank_diag, iswap) ∈ isolated_receive_info
-            dest_row_data = @view matrix_storage[dest_section_row,:]
+        for (iswap, (idiag, isource, idest)) ∈
+                enumerate(zip(diagonal_block_indices, sub_column_pivot_indices,
+                              diagonal_block_row_destination_indices))
+            if idiag == isource == idest
+                # No swap to do.
+                continue
+            end
 
-            # diag -> dest
-            reqs[req_counter+=1] = MPI.Irecv!(dest_row_data, comm;
-                                              source=owning_rank_diag, tag=iswap)
+            diag_row_swap_buffer = @view row_swap_buffers[2*(iswap-1)+1,:]
+
+            diag_tile_row, diag_tile_row_offset = divrem(idiag - 1, tile_size) .+ 1
+            owning_rank_k_diag = (diag_tile_row - 1) % group_K + 1
+            owning_rank_diag = (group_l - 1) * group_K + owning_rank_k_diag
+
+            source_tile_row, source_tile_row_offset = divrem(isource - 1, tile_size) .+ 1
+            owning_rank_k_source = (source_tile_row - 1) % group_K + 1
+            owning_rank_source = (group_l - 1) * group_K + owning_rank_k_source
+
+            dest_tile_row, dest_tile_row_offset = divrem(idest - 1, tile_size) .+ 1
+            owning_rank_k_dest = (dest_tile_row - 1) % group_K + 1
+            owning_rank_dest = (group_l - 1) * group_K + owning_rank_k_dest
+
+            if rank == owning_rank_diag == owning_rank_source == owning_rank_dest
+                # Swaps are all among rows owned by this rank.
+
+                # diag -> dest
+                @views matrix_storage[dest_section_row,:] .= diag_row_swap_buffer
+            elseif rank == owning_rank_diag == owning_rank_dest
+                # diag -> dest
+                @views matrix_storage[dest_section_row,:] .=
+                    matrix_storage[diag_section_row,:]
+            elseif rank == owning_rank_source == owning_rank_dest
+                # source -> diag
+                reqs[req_counter+=1] =
+                    MPI.Irecv!(@view matrix_storage[dest_section_row,:], comm;
+                               source=owning_rank_diag, tag=iswap)
+            elseif rank == owning_rank_dest
+                # source -> diag
+                reqs[req_counter+=1] =
+                    MPI.Irecv!(@view matrix_storage[dest_section_row,:], comm;
+                               source=owning_rank_diag, tag=iswap)
+            end
         end
         MPI.Waitall(@view(reqs[1:req_counter]))
     end
