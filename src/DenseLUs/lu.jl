@@ -113,10 +113,10 @@ function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
     redistribute_matrix!(A_lu, A)
 
     for panel ∈ 1:n_tiles
-        pivot_panel_factorization!(A_lu, panel)
-        pivot_remaining_columns!(A_lu, panel)
-        update_top_panel!(A_lu, panel)
-        update_remaining_matrix!(A_lu, panel)
+        generate_pivots!(A_lu, panel)
+        apply_pivots_from_sub_column!(A_lu, panel)
+        update_sub_panel_off_diagonals!(A_lu, panel)
+        update_bottom_right_block!(A_lu, panel)
     end
 
     fill_ldiv_tiles!(A_lu)
@@ -138,15 +138,6 @@ function redistribute_matrix!(A_lu, A)
             @views matrix_parts[i,j] .= A[row_ranges[i],col_ranges[j]]
         end
     end
-
-    return nothing
-end
-
-function pivot_panel_factorization!(A_lu, panel)
-    generate_pivots!(A_lu, panel)
-    apply_pivots_from_sub_column!(A_lu, panel)
-    update_sub_panel_off_diagonals!(A_lu, panel)
-    update_bottom_right_block!(A_lu, panel)
 
     return nothing
 end
