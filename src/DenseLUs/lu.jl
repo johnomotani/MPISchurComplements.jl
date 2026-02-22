@@ -110,8 +110,8 @@ function setup_lu(m::Int64, n::Int64, shared_comm_rank::Int64, shared_comm_size:
         allocate_shared_float(section_width * section_K * section_width)
     factorization_pivoting_reduction_indices =
         allocate_shared_int(section_width * section_K)
-    factorization_row_swap_buffers = zeros(datatype, section_width, section_width)
-    pivot_requests = [MPI.REQUEST_NULL for _ ∈ 1:2*section_K]
+    factorization_row_swap_buffers = zeros(datatype, section_width, local_storage_n)
+    pivot_requests = [MPI.REQUEST_NULL for _ ∈ 1:max(2*section_K, section_K + section_L)]
 
     return (; factors, row_permutation, section_K, section_L, section_k, section_l,
             section_height, section_width, factorization_matrix_storage,
@@ -200,8 +200,8 @@ function pivot_panel_factorization!(A_lu, p)
         end
         generate_pivots!(A_lu, p, sub_column)
         apply_pivots_from_sub_column!(A_lu, p, sub_column)
-        update_below_diagonal_sub_column!(A_lu, p, sub_column)
-        update_right_sub_columns!(A_lu, p, sub_column)
+        update_sub_panel_off_diagonals!(A_lu, p, sub_column)
+        update_bottom_right_block!(A_lu, p, sub_column)
     end
 
     return nothing
@@ -329,6 +329,7 @@ function generate_pivots!(A_lu, p, sub_column)
             reduced_row_indices = @view pivoting_reduction_indices[1:n_reduced_rows]
 
             # Post receives for the rows and row indices from other blocks.
+            req_counter = 0
             for k ∈ 1:section_K
                 if k == section_k
                     # This rank does not need to communicate with itself!
@@ -342,16 +343,16 @@ function generate_pivots!(A_lu, p, sub_column)
                 # communicator `comm` by `section_L`.
                 rank_k = rank + (k - section_k) * section_L
                 if k == 1
-                    reqs[2*(k-1)+1] = MPI.Irecv(@view(reduced_buffer[1:k_rows_end[k],:]),
+                    reqs[req_counter+=1] = MPI.Irecv(@view(reduced_buffer[1:k_rows_end[k],:]),
                                                       comm; source=rank_k, tag=1)
-                    reqs[2*(k-1)+2] =
+                    reqs[req_counter+=1] =
                         MPI.Irecv(@view(reduced_row_indices[1:k_rows_end[k]], comm;
                                         source=rank_k)), tag=2
                 else
-                    reqs[2*(k-1)+1] =
+                    reqs[req_counter+=1] =
                         MPI.Irecv(@view(reduced_buffer[k_rows_end[k-1]+1:k_rows_end[k],:]),
                                         comm; source=rank_k, tag=1)
-                    reqs[2*(k-1)+2] =
+                    reqs[req_counter+=1] =
                         MPI.Irecv(@view(reduced_row_indices[k_rows_end[k-1]+1:k_rows_end[k]],
                                         comm; source=rank_k), tag=2)
                 end
@@ -370,7 +371,7 @@ function generate_pivots!(A_lu, p, sub_column)
                     global_pivot_indices
             end
 
-            MPI.Waitall(reqs)
+            MPI.Waitall(@view(reqs[1:req_counter]))
 
             # Do an LU factorization on the reduced rows. This gives the final pivot
             # indices, and also the (section_width,section_width) top-left block of the LU
@@ -408,6 +409,7 @@ function apply_pivots_from_sub_column!(A_lu, p, sub_column)
     section_K = A_lu.section_K
     section_width = A_lu.section_width
     this_first_pivot_section_k = A_lu.first_pivot_section_k[sub_column]
+    this_rank_section_height = length(A_lu.factorization_matrix_parts_col_ranges[1])
     matrix_parts = A_lu.factorization_matrix_parts
     row_swap_buffers = A_lu.factorization_row_swap_buffers
     sub_column_pivot_indices = @view pivoting_reduction_indices[1:section_width]
@@ -418,83 +420,304 @@ function apply_pivots_from_sub_column!(A_lu, p, sub_column)
         MPI.Bcast!(sub_column_pivot_indices, comm; root=broadcasting_rank)
 
         diagonal_block_indices = (sub_column-1)*section_width+1:min(sub_column*section_width, tile_size)
+        first_diag = diagonal_block_indices[1]
+        last_diag = diagonal_block_indices[end]
 
-        for (iswap, (i1, i2)) ∈ enumerate(zip(diagonal_block_indices, sub_column_pivot_indices))
-            if i1 == i2
+        # By default, just send the row from the diagonal block back to the original
+        # position of the 'pivot row' that is being moved into the diagonal block.
+        # However, if the row in the diagonal block is itself a 'pivot row', then we need
+        # to send it to the correct position within the diagonal block. Here we set up
+        # `diagonal_block_row_destination_indices` with the position where each row of the
+        # diagonal block should be sent to.
+        sorted_pivot_indices = sort(sub_column_pivot_indices)
+
+        # All pivot indices are at or below the first row of the diagonal block, so we can
+        # find the indices that are within the diagonal block from the first entries of
+        # the sorted list of pivot indices.
+        pivot_indices_in_diagonal_block = sorted_pivot_indices[sorted_pivot_indices .≤ last_diag]
+
+        diagonal_block_row_destination_indices = copy(sub_column_pivot_indices)
+        for i ∈ 1:length(sub_column_pivot_indices)
+            diag_index = diagonal_block_indices[i]
+            if diag_index ∈ pivot_indices_in_diagonal_block
+                # Need to send this row to directly to its pivoted position.
+                original_destination = diagonal_block_row_destination_indices[i]
+                i2 = findfirst(x -> x==diag_index, sub_column_pivot_indices)
+                diagonal_block_row_destination_indices[i] = diagonal_block_indices[i2]
+                # Re-insert the original_destination in place of the destination of the
+                # row that is replaced by `diag_index`.
+                diagonal_block_row_destination_indices[i2] = original_destination
+            end
+        end
+
+        # Need to store parameters for receives that must be delayed until after all sends
+        # have started.
+        isolated_receive_info = NTuple{3,Int64}[]
+
+        req_counter = 0
+        for (iswap, (idiag, isource, idest)) ∈
+                enumerate(zip(diagonal_block_indices, sub_column_pivot_indices,
+                              diagonal_block_row_destination_indices))
+            if i1 == i2 == i3
                 # No swap to do.
                 continue
             end
 
             row_swap_buffer = @view row_swap_buffers[:,iswap]
 
-            owning_rank_k1, i1_section_row = divrem((i1 - 1) % tile_size, section_height) .+ 1
-            owning_rank1 = (section_l - 1) * section_K + owning_rank_k1
+            owning_rank_k_diag, diag_section_row_offset = divrem((idiag - 1) % tile_size, section_height) .+ 1
+            diag_section_row = (p - 1) * this_rank_section_height + diag_section_row_offset
+            owning_rank_diag = (section_l - 1) * section_K + owning_rank_k_diag
 
-            owning_rank_k2, i2_section_row = divrem((i2 - 1) % tile_size, section_height) .+ 1
-            owning_rank2 = (section_l - 1) * section_K + owning_rank_k2
+            source_tile, source_tile_offset = divrem(isource - 1, tile-size)
+            owning_rank_k_source, source_section_row_offset = divrem(source_tile_offset, section_height) .+ 1
+            source_section_row = (source_tile - 1) * this_rank_section_height + source_section_row_offset
+            owning_rank_source = (section_l - 1) * section_K + owning_rank_k_source
 
-            # Need to do the same row-swaps in all tile-columns.
-            for tile_j ∈ 1:n_tiles
-                # When this rank is in the sub_column currently being processed
-                # (sub_column==sub_column_l), it only needs to send the diagonal row down to
-                # the pivot row, as the diagonal block was already collected during the pivot
-                # generation.
-                if rank == owning_rank_k1 == owning_rank_k2
-                    # Swaps are all among rows owned by this rank.
+            dest_tile, dest_tile_offset = divrem(idest - 1, tile-size)
+            owning_rank_k_dest, dest_section_row_offset = divrem(dest_tile_offset, section_height) .+ 1
+            dest_section_row = (dest_tile - 1) * this_rank_section_height + dest_section_row_offset
+            owning_rank_dest = (section_l - 1) * section_K + owning_rank_k_dest
 
-                    if sub_column == section_l && tile_j == p
-                        # i1 -> i2
-                        @views matrix_parts[i2_tile,tile_j][i2_section_row,:] .=
-                            matrix_parts[i1_tile,tile_j][i1_section_row,:]
-                    else
-                        # Copy the i1 row into a buffer to send down to i2 afterward.
-                        row_swap_buffer .= @view matrix_parts[i1_tile,tile_j][i1_section_row,:]
+            if rank == owning_rank_k1 == owning_rank_k2
+                # Swaps are all among rows owned by this rank.
 
-                        # i2 -> i1
-                        @views matrix_parts[i1_tile,tile_j][i1_section_row,:] .=
-                            matrix_parts[i2_tile,tile_j][i2_section_row,:]
+                # Copy the diag row into a buffer to send down to i2 afterward.
+                row_swap_buffer .= @view matrix_storage[diag_section_row,:]
 
-                        # i1 -> i2
-                        matrix_parts[i2_tile,tile_j][i2_section_row,:] .= row_swap_buffer
-                    end
-                elseif rank == owning_rank_k1
-                    i1_row_data = @view matrix_parts[i1_tile,tile_j][i1_section_row,:]
-                    if sub_column == section_l && tile_j == p
-                        # i1 -> i2
-                        reqs[2*(iswap-1)+1] = MPI.Isend(i1_row_data, comm;
-                                                        dest=owning_rank_2, tag=iswap)
-                    else
-                        # Copy out data from the row that we own, to send to owning_rank_k2.
-                        row_swap_buffer .= i1_row_data
+                # source -> diag
+                @views matrix_storage[diag_section_row,:] .=
+                    matrix_storage[source_section_row,:]
 
-                        # i1 -> i2
-                        reqs[2*(iswap-1)+1] = MPI.Isend(row_swap_buffer, comm;
-                                                        dest=owning_rank_2, tag=iswap)
-                        # i2 -> i1
-                        reqs[2*(iswap-1)+2] = MPI.Irecv!(i1_row_data, comm;
-                                                         source=owning_rank_2, tag=iswap)
-                    end
-                elseif rank == owning_rank_k2
-                    i2_row_data = @view matrix_parts[i2_tile,tile_j][i2_section_row,:]
-                    if sub_column == section_l && tile_j == p
-                        # i1 -> i2
-                        reqs[2*(iswap-1)+2] = MPI.Irecv!(i2_row_data, comm;
-                                                         source=owning_rank_1, tag=iswap)
-                    else
-                        # Copy out data from the row that we own, to send to owning_rank_k1.
-                        row_swap_buffer .= i2_row_data
+                # diag -> dest
+                matrix_storage[dest_section_row,:] .= row_swap_buffer
+            elseif rank == owning_rank_k_diag
+                diag_row_data = @view matrix_storage[diag_section_row,:]
+                # Copy out data from the row that we own, to send to owning_rank_k2.
+                row_swap_buffer .= diag_row_data
 
-                        # i2 -> i1
-                        reqs[2*(iswap-1)+1] = MPI.Isend(row_swap_buffer, comm;
-                                                        dest=owning_rank_1, tag=iswap)
-                        # i1 -> i2
-                        reqs[2*(iswap-1)+2] = MPI.Irecv!(i2_row_data, comm;
-                                                         source=owning_rank_2, tag=iswap)
-                    end
-                end
+                # diag -> dest
+                reqs[req_counter+=1] = MPI.Isend(row_swap_buffer, comm;
+                                                 dest=owning_rank_dest, tag=iswap)
+                # source -> diag
+                reqs[req_counter+=1] = MPI.Irecv!(diag_row_data, comm;
+                                                  source=owning_rank_source, tag=iswap)
+            elseif rank == owning_rank_source && rank == owning_rank_dest
+                source_row_data = @view matrix_storage[source_section_row,:]
+                dest_row_data = @view matrix_storage[dest_section_row,:]
+                # Copy out data from the row that we own, to send to owning_rank_k1.
+                row_swap_buffer .= source_row_data
+
+                # source -> diag
+                reqs[req_counter+=1] = MPI.Isend(row_swap_buffer, comm;
+                                                 dest=owning_rank_diag, tag=iswap)
+                # diag -> dest
+                reqs[req_counter+=1] = MPI.Irecv!(dest_row_data, comm;
+                                                  source=owning_rank_diag, tag=iswap)
+            elseif rank == owning_rank_source
+                source_row_data = @view matrix_storage[source_section_row,:]
+                # Copy out data from the row that we own, to send to owning_rank_k1.
+                row_swap_buffer .= source_row_data
+
+                # source -> diag
+                reqs[req_counter+=1] = MPI.Isend(row_swap_buffer, comm;
+                                                 dest=owning_rank_diag, tag=iswap)
+            elseif rank == owning_rank_dest
+                # Must make the MPI.Irecv!() call after the data has been copied out to be
+                # sent (which must be happening at a different `iswap` to enter this
+                # branch). Therefore store the row and the source rank so we can make the
+                # MPI.Irecv!() calls after all the MPI.Isend!() have been made.
+                push!(isolated_receive_info, (dest_section_row, owning_rank_diag, iswap))
             end
         end
-        MPI.Waitall(reqs)
+        for (dest_section_row, owning_rank_diag, iswap) ∈ isolated_receive_info
+            dest_row_data = @view matrix_storage[dest_section_row,:]
+
+            # diag -> dest
+            reqs[req_counter+=1] = MPI.Irecv!(dest_row_data, comm;
+                                              source=owning_rank_diag, tag=iswap)
+        end
+        MPI.Waitall(@view(reqs[1:req_counter]))
+    end
+
+    return nothing
+end
+
+function update_sub_panel_off_diagonals!(A_lu, p, sub_column)
+    comm = A_lu.comm
+    rank = A_lu.comm_rank
+    shared_comm_rank = A_lu.shared_comm_rank
+    row_ranges = factorization_matrix_parts_row_ranges
+    col_ranges = factorization_matrix_parts_col_ranges
+    matrix_parts = A_lu.factorization_matrix_parts
+    n_tiles = A_lu.factorization_n_tiles
+    tile_width = A_lu.factorization_tile_width
+    reqs = A_lu.pivot_requests
+    section_k = A_lu.section_k
+    section_K = A_lu.section_K
+    section_L = A_lu.section_L
+    section_width = A_lu.section_width
+    this_first_pivot_section_k = A_lu.first_pivot_section_k[sub_column]
+    pivoting_reduction_buffer = A_lu.factorization_pivoting_reduction_buffer
+
+    diagonal_block_size = min(section_l * section_width, tile_width) -
+                          (section_l - 1) * section_width
+    this_l_width = length(col_ranges[1])
+    # Row buffer will contain entries for the sub-row to the right of the diagonal
+    # sub-tile.
+    row_buffer = @view A_lu.factorization_row_swap_buffers[1:diagonal_block_size,
+                                                           p*this_l_width+1:end]
+
+    req_counter = 0
+    if shared_comm_rank == 0
+        # While updating the sub-column, we also distribute the diagonal sub-tile to ranks
+        # on the same section-row as the rank that owns the diagonal sub-tile, and collect
+        # onto those same ranks the full data for the rows in the diagonal sub-tile. This
+        # collection is needed because these sub-tiles will become the 'U' entries in the
+        # row to the right of the current diagonal sub-tile, and the sub-tile for each
+        # column will need to be communicated to all ranks in that column. This can be
+        # done in parallel with updating the rest of the sub-column.
+        #
+        # It would be nicer to do these communications with collective MPI calls (e.g.
+        # `MPI.Bcast!()`), but that would require many communicators (one for each pattern
+        # of operation), which would be complicated to keep track of. There is also a
+        # hard-coded limit on the maximum number of MPI communicators, so it is best not
+        # to create them too freely.
+
+        diagonal_rank = (sub_column - 1) * section_K + this_first_pivot_section_k 
+
+        if rank == diagonal_rank
+            # The top diagonal_block_size*diagonal_block_size part of pivoting_reduction_buffer on
+            # this rank contains the diagonal sub-tile that was calculated in
+            # `generate_pivots!()`.
+            diagonal_sub_tile = 
+                reshape(@view pivoting_reduction_buffer[1:diagonal_block_size*diagonal_block_size],
+                        diagonal_block_size, diagonal_block_size)
+
+            # Send the diagonal sub-tile to the other ranks in this sub-column.
+            rank_offset = (section_l - 1) * section_K # Offset of ranks in sub-column.
+            for k ∈ 1:section_K
+                if k == section_k
+                    continue
+                end
+                r = rank_offset + k - 1
+                reqs[req_counter+=1] = MPI.Isend(diagonal_sub_tile, comm; dest=r)
+            end
+
+            # Send the diagonal sub-tile to the ranks in the same sub-row.
+            for l ∈ 1:section_L
+                if l == section_l
+                    continue
+                end
+                r = (l - 1) * section_K + section_k - 1
+                reqs[req_counter+=1] = MPI.Isend(diagonal_sub_tile, comm; dest=r)
+            end
+        elseif section_k == this_first_pivot_section_k
+            # Receive the diagonal sub-block and gather the data for all the corresponding
+            # rows in this section_l.
+            diagonal_sub_tile = 
+                reshape(@view pivoting_reduction_buffer[1:diagonal_block_size*diagonal_block_size],
+                        diagonal_block_size, diagonal_block_size)
+            reqs[req_counter+=1] = MPI.Irecv!(diagonal_sub_tile, comm; source=diagonal_rank)
+        elseif section_k == this_first_pivot_section_k + 1
+            # Might need to send part of locally-owned data to rank owning previous row.
+            first_diagonal_row = (sub_column - 1) * diagonal_block_size + 1
+            last_diagonal_row = first_diagonal_row + diagonal_block_size - 1
+            first_row_this_rank = (section_k - 1) * section_height + 1
+            last_row_this_rank = min(section_k * section_height, tile_size)
+            if last_diagonal_row ≥ first_row_this_rank
+                this_k_height = length(row_ranges[1])
+                first_storage_row = (section_k - 1) * this_k_height + 1
+                last_storage_row = first_storage_row + last_diagonal_row - first_row_this_rank
+                # Send to rank on the previous section-row
+                dest = (section_l - 1) * section_K + section_k - 2
+                MPI.Send(@view(matrix_storage[first_storage_row:last_storage_row,
+                                              p*this_l_width+1:end]),
+                         comm; dest=dest)
+            end
+        elseif section_l == sub_column
+            diagonal_sub_tile = 
+                reshape(@view pivoting_reduction_buffer[1:diagonal_block_size*diagonal_block_size],
+                        diagonal_block_size, diagonal_block_size)
+
+            MPI.Recv(diagonal_sub_tile, comm; source=diagonal_rank)
+        end
+
+        if section_l == sub_column
+            # This branch now includes the rank that owns the diagonal sub-tile.
+
+            # diagonal_sub_tile now contains both the L and U factors of the current
+            # diagonal sub-tile. Now need to apply U^-1 from the right to the
+            # locally-owned part of the sub-column that is below the diagonal sub-tile.
+            sub_column_width = diagonal_block_size # because these ranks own the same
+                                                   # sub-column as the diagonal sub-tile
+            last_diagonal_row = first_diagonal_row + diagonal_block_size - 1
+            first_row_this_rank = (section_k - 1) * section_height + 1
+            offset = max(last_diagonal_row + 1, first_row_this_rank) - first_row_this_rank
+
+            local_section_height = length(col_ranges[1])
+            local_below_diagonal_sub_column =
+                @view matrix_storage[(p-1)*local_section_height+offset+1:end,
+                                     (p-1)*sub_column_width+1:p*sub_column_width]
+
+            # Need to solve M*U=A for M, where A are the original matrix elements of the
+            # sub-column, and U is the upper-triangular factor of the diagonal sub-tile.
+            # There does not seem to be a LAPACK routine for this when M and A are
+            # column-major matrices (trsv! works with a transposed U, but if we transposed
+            # M and A they would be row-major, which trsv! does not seem to support).
+            # Therefore just use LinearAlgebra's `rdiv!()`, which does not seem to be as
+            # optimized, but this step is probably not a bottleneck anyway (?).
+            rdiv!(local_below_diagonal_sub_column, UpperTriangular(diagonal_sub_tile))
+        end
+
+        if section_k == this_first_pivot_section_k
+            # This branch now includes the rank that owns the diagonal sub-tile.
+
+            # The whole sub-row to the right of the diagonal sub-block needs to be updated
+            # by solving L*M=A to find M, where A are the original matrix entries and L is
+            # the lower-triangular factor from the diagonal sub-block.
+
+            first_diagonal_row = (sub_column - 1) * diagonal_block_size + 1
+            last_diagonal_row = first_diagonal_row + diagonal_block_size - 1
+            first_row_this_rank = (section_k - 1) * section_height + 1
+            last_row_this_rank = min(section_k * section_height, tile_size)
+            local_n_rows = min(last_diagonal_row, last_row_this_rank) - first_diagonal_row + 1
+
+            # Locally-owned rows to be copied into row_buffer
+            first_storage_row = (section_k - 1) * this_k_height + first_diagonal_row -
+                                first_row_this_rank + 1
+            last_storage_row = first_storage_row + local_n_rows - 1
+
+            if last_diagonal_row > last_row_this_rank
+                # Need to collect some rows from the next rank.
+                source = (section_l - 1) * section_K + section_k
+                reqs[req_counter+=1] =
+                    MPI.Recv!(@view(row_buffer[local_n_rows+1:end,:]), comm; source=source)
+            end
+
+            # Copy locally-owned rows into buffer.
+            @views row_buffer[1:local_n_rows,:] .=
+                matrix_storage[first_storage_row,last_storage_row,p*this_l_width+1:end]
+
+            if rank == diagonal_rank
+                # Only need to wait for last receive to complete.
+                MPI.Wait(reqs[req_counter])
+                req_counter -= 1
+            else
+                # Need to complete both receives before this rank can continue to the next
+                # operations.
+                MPI.Waitall(@view(reqs[1:req_counter]))
+            end
+
+            # Update the 'row' part of the current sub-panel, using the L factor of the
+            # diagonal sub-tile that is stored in `diagonal_sub_tile`.
+            trsv!('L', 'N', 'U', diagonal_sub_tile, row_buffer)
+        end
+
+        if rank == diagonal_rank
+            # Diagonal rank can now wait for all communications to complete.
+            MPI.Waitall(@view(reqs[1:req_counter]))
+        end
     end
 
     return nothing
