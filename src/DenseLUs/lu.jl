@@ -491,40 +491,48 @@ function apply_pivots_from_sub_column!(A_lu, panel)
     return nothing
 end
 
-function update_sub_panel_off_diagonals!(A_lu, panel, sub_column)
+function update_sub_panel_off_diagonals!(A_lu, panel)
+    n_tiles = A_lu.factorization_n_tiles
+    if panel == n_tiles
+        # No remaining matix to update, so no need for communication or off-diagonal
+        # update.
+        return nothing
+    end
     comm = A_lu.comm
     rank = A_lu.comm_rank
     shared_comm_rank = A_lu.shared_comm_rank
     row_ranges = factorization_matrix_parts_row_ranges
     col_ranges = factorization_matrix_parts_col_ranges
     matrix_parts = A_lu.factorization_matrix_parts
-    n_tiles = A_lu.factorization_n_tiles
     tile_width = A_lu.factorization_tile_width
     reqs = A_lu.pivot_requests
-    section_k = A_lu.section_k
-    section_K = A_lu.section_K
-    section_L = A_lu.section_L
+    group_k = A_lu.group_k
+    group_K = A_lu.group_K
+    group_L = A_lu.group_L
     section_width = A_lu.section_width
-    this_first_pivot_section_k = A_lu.first_pivot_section_k[sub_column]
     pivoting_reduction_buffer = A_lu.factorization_pivoting_reduction_buffer
+    row_buffers = A_lu.factorization_row_swap_buffers
+    # Can reuse this buffer as a column buffer, as it is big enough.
+    col_buffers = A_lu.factorization_pivoting_buffer
 
-    diagonal_block_size = min(section_l * section_width, tile_width) -
-                          (section_l - 1) * section_width
     this_l_width = length(col_ranges[1])
-    # Row buffer will contain entries for the sub-row to the right of the diagonal
-    # sub-tile.
-    row_buffer = @view A_lu.factorization_row_swap_buffers[1:diagonal_block_size,
-                                                           panel*this_l_width+1:end]
+
+    panel_group_row, panel_k = divrem(panel - 1, group_K) .+ 1
+    panel_group_col, panel_l = divrem(panel - 1, group_L) .+ 1
+    first_panel_col = (panel_group_col - 1) * tile_size + 1
+    last_panel_col = min(panel_group_col * tile_size, size(matrix_storage, 2))
+    this_tile_size = last_panel_col - first_panel_col + 1
+    # Note that the size of the diagonal tile that we communicate/process here is always
+    # `(tile_size,tile_size)`. The tile can only be smaller than `tile_size` when it is
+    # the last diagonal tile, but that one does not need communication/processing here. So
+    # unlike some other functions, we do not need to calculate `this_tile_size` - we can
+    # just use `tile_size`.
 
     req_counter = 0
     if shared_comm_rank == 0
         # While updating the sub-column, we also distribute the diagonal sub-tile to ranks
-        # on the same section-row as the rank that owns the diagonal sub-tile, and collect
-        # onto those same ranks the full data for the rows in the diagonal sub-tile. This
-        # collection is needed because these sub-tiles will become the 'U' entries in the
-        # row to the right of the current diagonal sub-tile, and the sub-tile for each
-        # column will need to be communicated to all ranks in that column. This can be
-        # done in parallel with updating the rest of the sub-column.
+        # on the same sub-row as the diagonal sub-tile. This can be done in parallel with
+        # updating the rest of the sub-column.
         #
         # It would be nicer to do these communications with collective MPI calls (e.g.
         # `MPI.Bcast!()`), but that would require many communicators (one for each pattern
@@ -532,63 +540,47 @@ function update_sub_panel_off_diagonals!(A_lu, panel, sub_column)
         # hard-coded limit on the maximum number of MPI communicators, so it is best not
         # to create them too freely.
 
-        diagonal_rank = (sub_column - 1) * section_K + this_first_pivot_section_k 
+        diagonal_rank = (panel - 1) * group_K + panel_k 
 
         if rank == diagonal_rank
-            # The top diagonal_block_size*diagonal_block_size part of pivoting_reduction_buffer on
+            # The top tile_size*tile_size part of pivoting_reduction_buffer on
             # this rank contains the diagonal sub-tile that was calculated in
             # `generate_pivots!()`.
             diagonal_sub_tile = 
-                reshape(@view pivoting_reduction_buffer[1:diagonal_block_size*diagonal_block_size],
-                        diagonal_block_size, diagonal_block_size)
+                reshape(@view pivoting_reduction_buffer[1:tile_size*tile_size],
+                        tile_size, tile_size)
 
             # Send the diagonal sub-tile to the other ranks in this sub-column.
+            # Send to below-diagonal ranks in the group first, as these have slightly more
+            # work to do.
             rank_offset = (section_l - 1) * section_K # Offset of ranks in sub-column.
-            for k ∈ 1:section_K
-                if k == section_k
-                    continue
-                end
+            for k ∈ vcat(panel_k+1:group_K, 1:panel_k-1)
                 r = rank_offset + k - 1
                 reqs[req_counter+=1] = MPI.Isend(diagonal_sub_tile, comm; dest=r)
             end
 
             # Send the diagonal sub-tile to the ranks in the same sub-row.
-            for l ∈ 1:section_L
-                if l == section_l
-                    continue
-                end
+            for l ∈ vcat(panel_l+1:group_L, 1:panel_l-1)
                 r = (l - 1) * section_K + section_k - 1
                 reqs[req_counter+=1] = MPI.Isend(diagonal_sub_tile, comm; dest=r)
             end
-        elseif section_k == this_first_pivot_section_k
-            # Receive the diagonal sub-block and gather the data for all the corresponding
-            # rows in this section_l.
+        elseif section_k == panel_k
+            # Receive the diagonal sub-block.
             diagonal_sub_tile = 
-                reshape(@view pivoting_reduction_buffer[1:diagonal_block_size*diagonal_block_size],
-                        diagonal_block_size, diagonal_block_size)
-            reqs[req_counter+=1] = MPI.Irecv!(diagonal_sub_tile, comm; source=diagonal_rank)
-        elseif section_k == this_first_pivot_section_k + 1
-            # Might need to send part of locally-owned data to rank owning previous row.
-            first_diagonal_row = (sub_column - 1) * diagonal_block_size + 1
-            last_diagonal_row = first_diagonal_row + diagonal_block_size - 1
-            first_row_this_rank = (section_k - 1) * section_height + 1
-            last_row_this_rank = min(section_k * section_height, tile_size)
-            if last_diagonal_row ≥ first_row_this_rank
-                this_k_height = length(row_ranges[1])
-                first_storage_row = (section_k - 1) * this_k_height + 1
-                last_storage_row = first_storage_row + last_diagonal_row - first_row_this_rank
-                # Send to rank on the previous section-row
-                dest = (section_l - 1) * section_K + section_k - 2
-                MPI.Send(@view(matrix_storage[first_storage_row:last_storage_row,
-                                              panel*this_l_width+1:end]),
-                         comm; dest=dest)
-            end
+                reshape(@view pivoting_reduction_buffer[1:tile_size*tile_size],
+                        tile_size, tile_size)
+            MPI.Recv!(diagonal_sub_tile, comm; source=diagonal_rank)
         elseif section_l == sub_column
             diagonal_sub_tile = 
-                reshape(@view pivoting_reduction_buffer[1:diagonal_block_size*diagonal_block_size],
-                        diagonal_block_size, diagonal_block_size)
+                reshape(@view pivoting_reduction_buffer[1:tile_size*tile_size],
+                        tile_size, tile_size)
 
             MPI.Recv(diagonal_sub_tile, comm; source=diagonal_rank)
+        end
+
+        if rank == diagonal_rank
+            # Copy diagonal_sub_tile into the matrix storage.
+            matrix_parts[panel_group_row,panel_group_col] .= diagonal_sub_tile
         end
 
         if section_l == sub_column
@@ -597,28 +589,40 @@ function update_sub_panel_off_diagonals!(A_lu, panel, sub_column)
             # diagonal_sub_tile now contains both the L and U factors of the current
             # diagonal sub-tile. Now need to apply U^-1 from the right to the
             # locally-owned part of the sub-column that is below the diagonal sub-tile.
-            sub_column_width = diagonal_block_size # because these ranks own the same
-                                                   # sub-column as the diagonal sub-tile
-            last_diagonal_row = first_diagonal_row + diagonal_block_size - 1
-            first_row_this_rank = (section_k - 1) * section_height + 1
-            offset = max(last_diagonal_row + 1, first_row_this_rank) - first_row_this_rank
+            if group_k ≤ panel_k
+                first_storage_row_this_rank = panel_group_row * tile_size + 1
+            else
+                first_storage_row_this_rank = (panel_group_row - 1) * tile_size + 1
+            end
+            last_storage_row = size(matrix_storage, 1)
+            first_storage_col = (panel_group_col - 1) * tile_size + 1
+            last_storage_col = min(panel_group_col * tile_size, size(matrix_storage, 2))
 
-            local_section_height = length(col_ranges[1])
+            n_rows = last_storage_row - first_storage_row + 1
+            n_cols = last_storage_col - first_storage_col + 1
+            buffer_size = n_rows * n_cols
+
+            # Copy matrix entries into contiguous transposed buffer to improve efficiency
+            # and so we can use the LAPACK trsv!() routine for maximum efficiency.
+            col_buffer = transpose(reshape(@view col_buffers[1:buffer_size], n_cols, n_rows))
+
             local_below_diagonal_sub_column =
-                @view matrix_storage[(panel-1)*local_section_height+offset+1:end,
-                                     (panel-1)*sub_column_width+1:panel*sub_column_width]
+                @view matrix_storage[first_storage_row_this_rank:last_storage_row_this_rank,
+                                     first_storage_col_this_rank:last_storage_col_this_rank]
+
+            col_buffer .= local_below_diagonal_sub_column
 
             # Need to solve M*U=A for M, where A are the original matrix elements of the
             # sub-column, and U is the upper-triangular factor of the diagonal sub-tile.
-            # There does not seem to be a LAPACK routine for this when M and A are
-            # column-major matrices (trsv! works with a transposed U, but if we transposed
-            # M and A they would be row-major, which trsv! does not seem to support).
-            # Therefore just use LinearAlgebra's `rdiv!()`, which does not seem to be as
-            # optimized, but this step is probably not a bottleneck anyway (?).
-            rdiv!(local_below_diagonal_sub_column, UpperTriangular(diagonal_sub_tile))
+            # The LAPACK routine for this requires that M and A are 'transposed' (i.e.
+            # row-major) matrices.
+            trsv!('U', 'T', 'N', diagonal_sub_tile, col_buffer)
+
+            # Copy buffer back into matrix storage.
+            col_buffer .= local_below_diagonal_sub_column
         end
 
-        if section_k == this_first_pivot_section_k
+        if section_k == panel_k
             # This branch now includes the rank that owns the diagonal sub-tile.
 
             # The whole sub-row to the right of the diagonal sub-block needs to be updated
@@ -631,39 +635,35 @@ function update_sub_panel_off_diagonals!(A_lu, panel, sub_column)
             last_row_this_rank = min(section_k * section_height, tile_size)
             local_n_rows = min(last_diagonal_row, last_row_this_rank) - first_diagonal_row + 1
 
-            # Locally-owned rows to be copied into row_buffer
-            first_storage_row = (section_k - 1) * this_k_height + first_diagonal_row -
-                                first_row_this_rank + 1
-            last_storage_row = first_storage_row + local_n_rows - 1
+            # Locally-owned rows/column to be copied into row_buffer
+            first_storage_row = (panel_k - 1) * tile_size + 1
+            last_storage_row = panel_k * tile_size
+            first_storage_col = (panel_l - 1) * tile_size + 1
+            last_storage_col = min(panel_l * tile_size, size(matrix_storage, 2))
 
-            if last_diagonal_row > last_row_this_rank
-                # Need to collect some rows from the next rank.
-                source = (section_l - 1) * section_K + section_k
-                reqs[req_counter+=1] =
-                    MPI.Recv!(@view(row_buffer[local_n_rows+1:end,:]), comm; source=source)
-            end
+            n_rows = last_storage_row - first_storage_row + 1
+            n_cols = last_storage_col - first_storage_col + 1
+            buffer_size = n_rows * n_cols
+            row_buffer = reshape(@view row_buffers[1:buffer_size], n_rows, n_cols)
 
-            # Copy locally-owned rows into buffer.
-            @views row_buffer[1:local_n_rows,:] .=
-                matrix_storage[first_storage_row,last_storage_row,panel*this_l_width+1:end]
+            local_above_diagonal_sub_row =
+                @view matrix_storage[first_storage_row,last_storage_row,
+                                     first_storage_col:last_storage_col]
 
-            if rank == diagonal_rank
-                # Only need to wait for last receive to complete.
-                MPI.Wait(reqs[req_counter])
-                req_counter -= 1
-            else
-                # Need to complete both receives before this rank can continue to the next
-                # operations.
-                MPI.Waitall(@view(reqs[1:req_counter]))
-            end
+            # Copy rows into contiguous buffer, for efficiency and so that we can use the
+            # LAPACK routine that requires this.
+            row_buffer .= local_above_diagonal_sub_row
 
             # Update the 'row' part of the current sub-panel, using the L factor of the
             # diagonal sub-tile that is stored in `diagonal_sub_tile`.
             trsv!('L', 'N', 'U', diagonal_sub_tile, row_buffer)
+
+            # Copy buffer back into matrix storage.
+            local_above_diagonal_sub_row .= row_buffer
         end
 
         if rank == diagonal_rank
-            # Diagonal rank can now wait for all communications to complete.
+            # Diagonal rank can now ensure all communications have completed.
             MPI.Waitall(@view(reqs[1:req_counter]))
         end
     end
