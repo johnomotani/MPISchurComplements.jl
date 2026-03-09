@@ -20,6 +20,7 @@ jobs:
       - uses: julia-actions/setup-julia@latest
         with:
           version: '1.11'
+      - uses: julia-actions/cache@v3
       - name: Build and deploy
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Authenticate with GitHub Actions token
