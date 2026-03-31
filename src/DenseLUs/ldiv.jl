@@ -516,15 +516,10 @@ function ldiv!(x::AbstractVector{T}, A_lu::DenseLU{T}, b::AbstractVector{T}) whe
 
     # Clean up MPI requests. These should all have been completed already, so this should
     # not take any time.
-    if is_root
-        MPI.Waitall(A_lu.L_receive_requests)
-        MPI.Waitall(A_lu.U_receive_requests)
-    elseif shared_comm_rank == 0
-        MPI.Waitall(A_lu.L_send_requests)
-        MPI.Waitall(A_lu.U_send_requests)
-        MPI.Waitall(A_lu.L_receive_requests)
-        MPI.Waitall(A_lu.U_receive_requests)
-    end
+    MPI.Waitall(A_lu.L_send_requests)
+    MPI.Waitall(A_lu.U_send_requests)
+    MPI.Waitall(A_lu.L_receive_requests)
+    MPI.Waitall(A_lu.U_receive_requests)
 
     return x
 end
