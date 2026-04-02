@@ -91,8 +91,8 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
                                                           tile_size)
     factorization_pivoting_reduction_buffer = allocate_shared_float(tile_size * group_K
                                                                     * tile_size)
-    factorization_pivoting_reduction_indices = allocate_shared_int(tile_size * group_K)
-    factorization_row_swap_buffers = zeros(datatype, 2 * tile_size, local_storage_n)
+    factorization_pivoting_reduction_indices = allocate_shared_int(tile_size * group_K * shared_comm_size)
+    factorization_row_swap_buffers = allocate_shared_float(2 * tile_size, local_storage_n)
     comm_requests = [MPI.REQUEST_NULL for _ ∈
                      1:max((1 + tile_size) * group_K, group_K + group_L, 2 * tile_size)]
 
@@ -108,6 +108,7 @@ end
 function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
     n_tiles = A_lu.n_tiles
     shared_comm_rank = A_lu.shared_comm_rank
+    synchronize_shared = A_lu.synchronize_shared
 
     redistribute_matrix!(A_lu, A)
 
@@ -137,18 +138,25 @@ function redistribute_matrix!(A_lu, A)
     matrix_parts = A_lu.factorization_matrix_parts
     row_ranges = A_lu.factorization_matrix_parts_row_ranges
     col_ranges = A_lu.factorization_matrix_parts_col_ranges
+    synchronize_shared = A_lu.synchronize_shared
 
     if size(A) != (A_lu.m, A_lu.n)
         error("Expected `A` to be a $((A_lu.m,A_lu.n)) matrix buffer on every rank")
     end
 
     if shared_comm_rank == 0
+        # As this block is just copying a one matrix into another, it must be memory
+        # bandwidth limited, so not sure that trying to use shared-memory processes would
+        # speed it up. Anyway, it is unlikely to be the main bottleneck, so not worth
+        # performance testing (unless it turns out to be a limiting factor).
         MPI.Bcast!(A, distributed_comm; root=0)
 
         for (tile_j,cr) ∈ enumerate(col_ranges), (tile_i, rr) ∈ enumerate(row_ranges)
             @views matrix_parts[tile_i,tile_j] .= A[rr,cr]
         end
     end
+
+    synchronize_shared()
 
     return nothing
 end
@@ -167,6 +175,10 @@ function gather_factors!(A_lu)
     synchronize_shared = A_lu.synchronize_shared
 
     if shared_comm_rank == 0
+        # As this block is just copying a value or another matrix into a matrix, it must
+        # be memory bandwidth limited, so not sure that trying to use shared-memory
+        # processes would speed it up. Anyway, it is unlikely to be the main bottleneck,
+        # so not worth performance testing (unless it turns out to be a limiting factor).
         factors .= 0.0
         for (tile_j,cr) ∈ enumerate(col_ranges), (tile_i, rr) ∈ enumerate(row_ranges)
             @views factors[rr,cr] .= matrix_parts[tile_i,tile_j]
@@ -189,6 +201,7 @@ function generate_pivots!(A_lu, panel)
     distributed_comm = A_lu.distributed_comm
     distributed_comm_rank = A_lu.distributed_comm_rank
     shared_comm_rank = A_lu.shared_comm_rank
+    shared_comm_size = A_lu.shared_comm_size
     reqs = A_lu.comm_requests
     m = A_lu.m
     n_tiles = A_lu.n_tiles
@@ -200,6 +213,7 @@ function generate_pivots!(A_lu, panel)
     pivoting_reduction_indices = A_lu.factorization_pivoting_reduction_indices
     matrix_storage = A_lu.factorization_matrix_storage
     locally_owned_rows = A_lu.factorization_locally_owned_rows
+    synchronize_shared = A_lu.synchronize_shared
 
     # Find the on-or-below diagonal part of the sub-column that is owned by this rank.
     panel_group_row, panel_k = divrem(panel - 1, group_K) .+ 1
@@ -211,41 +225,87 @@ function generate_pivots!(A_lu, panel)
     end
     first_local_col = (panel_group_col - 1) * tile_size + 1
     last_local_col = min(panel_group_col * tile_size, size(matrix_storage, 2))
-    this_matrix_column = @view matrix_storage[first_local_row:end,
-                                              first_local_col:last_local_col]
     this_tile_size = last_local_col - first_local_col + 1
-    if shared_comm_rank == 0
-        n_panel_rows = max(size(matrix_storage, 1) - first_local_row + 1, 0)
-        # Construct a reshaped view so that lu_panel_buffer is a contiguously-allocated
-        # array. Need this complication because we need a different number of rows for
-        # each `panel`, but we use column-major storage for arrays, so slicing the rows of a
-        # 2D buffer would give non-contiguous storage.
-        lu_panel_buffer = reshape(@view(pivoting_buffer[1:n_panel_rows*this_tile_size]),
-                                  n_panel_rows, this_tile_size)
-        lu_panel_buffer .= this_matrix_column
 
+    # Do 'tournament pivoting' in three stages:
+    #    All processes in each `shared_comm`.
+    # -> Root process of each shared-memory block, which is every process in
+    #    `distributed_comm`.
+    # -> Global root process, which is the root procees of `distributed_comm`.
+    n_local_rows = size(matrix_storage, 1) - first_local_row + 1
+    rows_per_shared_proc = max((n_local_rows + shared_comm_size - 1) ÷ shared_comm_size,
+                               this_tile_size)
+    this_shared_proc_rows =
+        (shared_comm_rank*rows_per_shared_proc+first_local_row:min((shared_comm_rank+1)*rows_per_shared_proc+first_local_row-1,size(matrix_storage,1)))
+
+    # We keep at least one tile per shared-mem process, so sometimes some processes may
+    # have no work to do.
+    n_active_shared_procs = (n_local_rows + rows_per_shared_proc - 1) ÷ rows_per_shared_proc
+    last_proc_n_rows = n_local_rows - (n_active_shared_procs - 1) * rows_per_shared_proc
+    last_proc_missing_rows = max(0, this_tile_size - last_proc_n_rows)
+    if shared_comm_rank < n_active_shared_procs
+        panel_buffer_offset = shared_comm_rank * rows_per_shared_proc * this_tile_size
+        panel_buffer_n_rows = length(this_shared_proc_rows)
+        panel_buffer_size = panel_buffer_n_rows * this_tile_size
+        this_lu_panel_buffer = reshape(@view(pivoting_buffer[panel_buffer_offset+1:panel_buffer_offset+panel_buffer_size]),
+                                       panel_buffer_n_rows, this_tile_size)
+        this_lu_panel_buffer .= @view matrix_storage[this_shared_proc_rows,
+                                                     first_local_col:last_local_col]
         # LU factorize this locally-owned part of the column to get the pivots, we will
-        # then reduce the locally-found pivot rows with those found by all other blocks
-        # that share this column.
+        # then reduce the locally-found pivot rows with those found by all other processes
+        # on the shared-memory communicator.
         # In the tournament pivoting algorithm implemented in `generate_pivots!()`
-        # [Grigori et al. (2011)], the locally-owned block may be singular here - the
-        # first, parallel, step (or if we implemented e.g. a binary tree algorithm, at
-        # every step before the final one where all the 'candidate' pivot rows are
-        # gathered onto a single process). Even if the block is singular, we can still
-        # generate pivots and construct LU factors. These pivot rows can then be used for
-        # the tournament pivoting.
-        local_lu = lu!(lu_panel_buffer; allowsingular=true)
-        # Get the rows for just the first `this_tile_size` pivots (or all the rows, if
-        # less than `this_tile_size`), which is the number need to find in the end, after
-        # reducing over all blocks.
-        # Using the our custom ipiv2perm_truncated is slightly more efficient than
-        # constructing the full permutation vector and then selecting only the first
-        # `section_width` entries from it.
-        local_panel_pivot_indices =
-            ipiv2perm_truncated(local_lu.ipiv, n_panel_rows,
-                                min(this_tile_size, size(lu_panel_buffer, 1)))
-        local_pivot_indices = local_panel_pivot_indices .+ first_local_row .- 1
-        global_pivot_indices = locally_owned_rows[local_pivot_indices]
+        # [Grigori et al. (2011)], the locally-owned block may be singular here. Even if
+        # the block is singular, we can still generate pivots and construct LU factors.
+        # These pivot rows can then be used for the tournament pivoting.
+        shared_local_lu = lu!(this_lu_panel_buffer; allowsingular=true)
+        shared_local_pivot_indices =
+            ipiv2perm_truncated(shared_local_lu.ipiv, panel_buffer_n_rows,
+                                min(this_tile_size, size(this_lu_panel_buffer, 1)))
+        indices_offset = shared_comm_rank * this_tile_size
+        n_indices = min(this_tile_size,length(shared_local_pivot_indices))
+        @views @. pivoting_reduction_indices[indices_offset+1:indices_offset+n_indices] =
+            shared_local_pivot_indices[1:n_indices] + this_shared_proc_rows[1] - 1
+    end
+    synchronize_shared()
+
+    if shared_comm_rank == 0
+        candidate_pivot_indices = @view pivoting_reduction_indices[1:n_active_shared_procs*this_tile_size-last_proc_missing_rows]
+        if n_active_shared_procs == 0
+            # Only this process did any work in the previous step, so no need to re-do LU
+            # factorization here.
+            local_pivot_indices = candidate_pivot_indices
+            global_pivot_indices = locally_owned_rows[local_pivot_indices]
+        else
+            n_buffer_rows = length(candidate_pivot_indices)
+            # Construct a reshaped view so that lu_panel_buffer is a contiguously-allocated
+            # array. Need this complication because we need a different number of rows for
+            # each `panel`, but we use column-major storage for arrays, so slicing the rows of a
+            # 2D buffer would give non-contiguous storage.
+            lu_panel_buffer = reshape(@view(pivoting_buffer[1:n_buffer_rows*this_tile_size]),
+                                      n_buffer_rows, this_tile_size)
+            lu_panel_buffer .= @view matrix_storage[candidate_pivot_indices,first_local_col:last_local_col]
+
+            # LU factorize this locally-owned part of the column to get the pivots, we will
+            # then reduce the locally-found pivot rows with those found by all other blocks
+            # that share this column.
+            # In the tournament pivoting algorithm implemented in `generate_pivots!()`
+            # [Grigori et al. (2011)], the locally-owned block may be singular here. Even if
+            # the block is singular, we can still generate pivots and construct LU factors.
+            # These pivot rows can then be used for the tournament pivoting.
+            local_lu = lu!(lu_panel_buffer; allowsingular=true)
+            # Get the rows for just the first `this_tile_size` pivots (or all the rows, if
+            # less than `this_tile_size`), which is the number need to find in the end, after
+            # reducing over all blocks.
+            # Using the our custom ipiv2perm_truncated is slightly more efficient than
+            # constructing the full permutation vector and then selecting only the first
+            # `section_width` entries from it.
+            local_panel_pivot_indices =
+                ipiv2perm_truncated(local_lu.ipiv, n_buffer_rows,
+                                    min(this_tile_size, size(lu_panel_buffer, 1)))
+            local_pivot_indices = candidate_pivot_indices[local_panel_pivot_indices]
+            global_pivot_indices = locally_owned_rows[local_pivot_indices]
+        end
 
         # Collect all the local pivot rows and indices onto the
         # `panel_k` block.
@@ -258,7 +318,7 @@ function generate_pivots!(A_lu, panel)
                 elseif k > panel_k
                     first_group_row = (panel_group_row - 1) * group_K + k
                 else
-                    return length(local_pivot_indices)
+                    return length(local_panel_pivot_indices)
                 end
                 if first_group_row > n_tiles
                     # Next tile owned by this rank would be off the bottom of the
@@ -323,7 +383,7 @@ function generate_pivots!(A_lu, panel)
                 first_row = k_rows_end[k-1]+1
             end
             @views reduced_buffer[first_row:k_rows_end[k],:] .=
-                this_matrix_column[local_panel_pivot_indices,:]
+                matrix_storage[local_pivot_indices,first_local_col:last_local_col]
             @views reduced_row_indices[first_row:k_rows_end[k]] .= global_pivot_indices
 
             MPI.Waitall(reqs[1:req_counter])
@@ -361,14 +421,14 @@ function generate_pivots!(A_lu, panel)
             end
         else
             # Get the local pivot rows ready for collection.
-            if length(local_panel_pivot_indices) > 0
+            if length(local_pivot_indices) > 0
                 collecting_rank = (panel_l - 1) * group_K + panel_k - 1
                 req_counter = 0
-                for row ∈ local_panel_pivot_indices
+                for row ∈ local_pivot_indices
                     req_counter += 1
                     reqs[req_counter] =
-                        MPI.Isend(@view(this_matrix_column[row,:]), distributed_comm;
-                                  dest=collecting_rank, tag=req_counter)
+                        MPI.Isend(@view(matrix_storage[row,first_local_col:last_local_col]),
+                                  distributed_comm; dest=collecting_rank, tag=req_counter)
                 end
                 req_counter += 1
                 reqs[req_counter] =
@@ -378,6 +438,7 @@ function generate_pivots!(A_lu, panel)
             end
         end
     end
+    synchronize_shared()
 
     return nothing
 end
@@ -410,6 +471,8 @@ function apply_pivots_from_sub_column!(A_lu, panel)
                    root=diagonal_distributed_rank)
     end
 
+    # As this function is just array copies and communication, we do not use any
+    # shared-memory parallelism.
     if shared_comm_rank == 0
         diagonal_block_indices = (panel-1)*tile_size+1:min(panel*tile_size, m)
         first_diag = diagonal_block_indices[1]
@@ -624,6 +687,28 @@ function apply_pivots_from_sub_column!(A_lu, panel)
     return nothing
 end
 
+function get_shared_local_row_range(A_lu, first_local_row)
+    shared_comm_rank = A_lu.shared_comm_rank
+    shared_comm_size = A_lu.shared_comm_size
+
+    total_local_rows = size(A_lu.factorization_matrix_storage, 1)
+    n_local_rows = total_local_rows - first_local_row + 1
+    rows_per_rank = (n_local_rows + shared_comm_size - 1) ÷ shared_comm_size
+    offset = shared_comm_rank * rows_per_rank
+    return first_local_row+offset:min(offset+first_local_row+rows_per_rank-1,total_local_rows), offset
+end
+
+function get_shared_local_col_range(A_lu, first_local_col)
+    shared_comm_rank = A_lu.shared_comm_rank
+    shared_comm_size = A_lu.shared_comm_size
+
+    total_local_cols = size(A_lu.factorization_matrix_storage, 2)
+    n_local_cols = total_local_cols - first_local_col + 1
+    cols_per_rank = (n_local_cols + shared_comm_size - 1) ÷ shared_comm_size
+    offset = shared_comm_rank * cols_per_rank
+    return first_local_col+offset:min(offset+first_local_col+cols_per_rank-1,total_local_cols), offset
+end
+
 function update_sub_panel_off_diagonals!(A_lu, panel)
     n_tiles = A_lu.n_tiles
     distributed_comm_rank = A_lu.distributed_comm_rank
@@ -632,6 +717,8 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
     matrix_parts = A_lu.factorization_matrix_parts
     group_K = A_lu.group_K
     group_L = A_lu.group_L
+    synchronize_shared = A_lu.synchronize_shared
+
     panel_group_row, panel_k = divrem(panel - 1, group_K) .+ 1
     panel_group_col, panel_l = divrem(panel - 1, group_L) .+ 1
     diagonal_distributed_rank = (panel_l - 1) * group_K + panel_k - 1
@@ -671,25 +758,25 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
     # just use `tile_size`.
 
     req_counter = 0
-    if shared_comm_rank == 0
-        # While updating the sub-column, we also distribute the diagonal sub-tile to ranks
-        # on the same sub-row as the diagonal sub-tile. This can be done in parallel with
-        # updating the rest of the sub-column.
-        #
-        # It would be nicer to do these communications with collective MPI calls (e.g.
-        # `MPI.Bcast!()`), but that would require many communicators (one for each pattern
-        # of operation), which would be complicated to keep track of. There is also a
-        # hard-coded limit on the maximum number of MPI communicators, so it is best not
-        # to create them too freely.
+    # While updating the sub-column, we also distribute the diagonal sub-tile to ranks
+    # on the same sub-row as the diagonal sub-tile. This can be done in parallel with
+    # updating the rest of the sub-column.
+    #
+    # It would be nicer to do these communications with collective MPI calls (e.g.
+    # `MPI.Bcast!()`), but that would require many communicators (one for each pattern
+    # of operation), which would be complicated to keep track of. There is also a
+    # hard-coded limit on the maximum number of MPI communicators, so it is best not
+    # to create them too freely.
 
-        if distributed_comm_rank == diagonal_distributed_rank
-            # The top tile_size*tile_size part of pivoting_reduction_buffer on
-            # this rank contains the diagonal sub-tile that was calculated in
-            # `generate_pivots!()`.
-            diagonal_sub_tile =
-                reshape(@view(pivoting_reduction_buffer[1:tile_size*tile_size]),
-                        tile_size, tile_size)
+    if distributed_comm_rank == diagonal_distributed_rank
+        # The top tile_size*tile_size part of pivoting_reduction_buffer on
+        # this rank contains the diagonal sub-tile that was calculated in
+        # `generate_pivots!()`.
+        diagonal_sub_tile =
+            reshape(@view(pivoting_reduction_buffer[1:tile_size*tile_size]),
+                    tile_size, tile_size)
 
+        if shared_comm_rank == 0
             # Send the diagonal sub-tile to the other ranks in this sub-column.
             # Send to below-diagonal ranks in the group first, as these have slightly more
             # work to do.
@@ -712,93 +799,122 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
                 reqs[req_counter+=1] = MPI.Isend(parent(diagonal_sub_tile),
                                                  distributed_comm; dest=r)
             end
-        elseif group_k == panel_k
-            # Receive the diagonal sub-block.
-            diagonal_sub_tile =
-                reshape(@view(pivoting_reduction_buffer[1:tile_size*tile_size]),
-                        tile_size, tile_size)
-            # MPI.jl doesn't like ReshapedArray type, but we only need to communicate the
-            # underlying storage, so use `parent()` to extract a SubArray which MPI.jl can
-            # handle.
-            MPI.Recv!(parent(diagonal_sub_tile), distributed_comm;
-                      source=diagonal_distributed_rank)
-        elseif group_l == panel_l
-            diagonal_sub_tile =
-                reshape(@view(pivoting_reduction_buffer[1:tile_size*tile_size]),
-                        tile_size, tile_size)
+        end
+    elseif group_k == panel_k
+        # Receive the diagonal sub-block.
+        diagonal_sub_tile =
+            reshape(@view(pivoting_reduction_buffer[1:tile_size*tile_size]),
+                    tile_size, tile_size)
+        if shared_comm_rank == 0
             # MPI.jl doesn't like ReshapedArray type, but we only need to communicate the
             # underlying storage, so use `parent()` to extract a SubArray which MPI.jl can
             # handle.
             MPI.Recv!(parent(diagonal_sub_tile), distributed_comm;
                       source=diagonal_distributed_rank)
         end
-
-        if distributed_comm_rank == diagonal_distributed_rank
-            # Copy diagonal_sub_tile into the matrix storage.
-            matrix_parts[panel_group_row,panel_group_col] .= diagonal_sub_tile
+    elseif group_l == panel_l
+        diagonal_sub_tile =
+            reshape(@view(pivoting_reduction_buffer[1:tile_size*tile_size]),
+                    tile_size, tile_size)
+        if shared_comm_rank == 0
+            # MPI.jl doesn't like ReshapedArray type, but we only need to communicate the
+            # underlying storage, so use `parent()` to extract a SubArray which MPI.jl can
+            # handle.
+            MPI.Recv!(parent(diagonal_sub_tile), distributed_comm;
+                      source=diagonal_distributed_rank)
         end
+    end
 
-        if group_l == panel_l
-            # This branch now includes the rank that owns the diagonal sub-tile.
+    if shared_comm_rank == 0 && distributed_comm_rank == diagonal_distributed_rank
+        # Copy diagonal_sub_tile into the matrix storage.
+        matrix_parts[panel_group_row,panel_group_col] .= diagonal_sub_tile
+    end
 
-            # diagonal_sub_tile now contains both the L and U factors of the current
-            # diagonal sub-tile. Now need to apply U^-1 from the right to the
-            # locally-owned part of the sub-column that is below the diagonal sub-tile.
-            if group_k ≤ panel_k
-                first_storage_row = panel_group_row * tile_size + 1
-            else
-                first_storage_row = (panel_group_row - 1) * tile_size + 1
-            end
-            last_storage_row = size(matrix_storage, 1)
-            first_storage_col = (panel_group_col - 1) * tile_size + 1
-            last_storage_col = min(panel_group_col * tile_size, size(matrix_storage, 2))
+    synchronize_shared()
 
-            n_rows = last_storage_row - first_storage_row + 1
+    if group_l == panel_l
+        # This branch now includes the rank that owns the diagonal sub-tile.
+
+        # diagonal_sub_tile now contains both the L and U factors of the current
+        # diagonal sub-tile. Now need to apply U^-1 from the right to the
+        # locally-owned part of the sub-column that is below the diagonal sub-tile.
+        if group_k ≤ panel_k
+            first_storage_row = panel_group_row * tile_size + 1
+        else
+            first_storage_row = (panel_group_row - 1) * tile_size + 1
+        end
+        first_storage_col = (panel_group_col - 1) * tile_size + 1
+        last_storage_col = min(panel_group_col * tile_size, size(matrix_storage, 2))
+
+        shared_local_row_range, row_offset = get_shared_local_row_range(A_lu, first_storage_row)
+
+        if length(shared_local_row_range) > 0
+            n_rows = length(shared_local_row_range)
             n_cols = last_storage_col - first_storage_col + 1
             buffer_size = n_rows * n_cols
+            buffer_offset = row_offset * n_cols
 
             # Copy matrix entries into contiguous buffer to improve efficiency.
-            col_buffer = reshape(@view(col_buffers[1:buffer_size]), n_rows, n_cols)
+            # Use a transposed buffer here so that the storage is row-major, and the parts
+            # (each of which is contiguous in memory) filled by different processes in
+            # `shared_comm` concatenate together correctly to give the complete 'below
+            # diagonal sub-column'.
+            col_buffer =
+                transpose(reshape(@view(col_buffers[buffer_offset+1:buffer_offset+buffer_size]),
+                                  n_cols, n_rows))
 
             local_below_diagonal_sub_column =
-                @view matrix_storage[first_storage_row:last_storage_row,
+                @view matrix_storage[shared_local_row_range,
                                      first_storage_col:last_storage_col]
 
             col_buffer .= local_below_diagonal_sub_column
 
             # Need to solve M*U=A for M, where A are the original matrix elements of the
             # sub-column, and U is the upper-triangular factor of the diagonal sub-tile.
-            trsm!('R', 'U', 'N', 'N', 1.0, diagonal_sub_tile, col_buffer)
+            # However, as col_buffer is transposed, and `trsm!()` does not support 'M'
+            # being transposed, we need to transpose the whole equation to U'*M'=A'. We
+            # then tell trsm! that U' is transposed (the 'T' third argument) while M' and
+            # A' are the 'transposed' version of col_buffer, but as col_buffer itself is a
+            # 'transpose', they are contiguous, column-major, arrays.
+            trsm!('L', 'U', 'T', 'N', 1.0, diagonal_sub_tile, transpose(col_buffer))
 
             # Copy buffer back into matrix storage.
             local_below_diagonal_sub_column .= col_buffer
         end
+    end
 
-        if group_k == panel_k
-            # This branch now includes the rank that owns the diagonal sub-tile.
+    if group_k == panel_k
+        # This branch now includes the rank that owns the diagonal sub-tile.
 
-            # The whole sub-row to the right of the diagonal sub-block needs to be updated
-            # by solving L*M=A to find M, where A are the original matrix entries and L is
-            # the lower-triangular factor from the diagonal sub-block.
+        # The whole sub-row to the right of the diagonal sub-block needs to be updated
+        # by solving L*M=A to find M, where A are the original matrix entries and L is
+        # the lower-triangular factor from the diagonal sub-block.
 
-            # Locally-owned rows/column to be copied into row_buffer
-            first_storage_row = (panel_group_row - 1) * tile_size + 1
-            last_storage_row = min(panel_group_row * tile_size, size(matrix_storage, 1))
-            if group_l ≤ panel_l
-                first_storage_col = panel_group_col * tile_size + 1
-            else
-                first_storage_col = (panel_group_col - 1) * tile_size + 1
-            end
-            last_storage_col = size(matrix_storage, 2)
+        # Locally-owned rows/column to be copied into row_buffer
+        first_storage_row = (panel_group_row - 1) * tile_size + 1
+        last_storage_row = min(panel_group_row * tile_size, size(matrix_storage, 1))
+        if group_l ≤ panel_l
+            first_storage_col = panel_group_col * tile_size + 1
+        else
+            first_storage_col = (panel_group_col - 1) * tile_size + 1
+        end
 
+        shared_local_col_range, col_offset = get_shared_local_col_range(A_lu, first_storage_col)
+
+        if length(shared_local_col_range) > 0
             n_rows = last_storage_row - first_storage_row + 1
-            n_cols = last_storage_col - first_storage_col + 1
+            n_cols = length(shared_local_col_range)
             buffer_size = n_rows * n_cols
-            row_buffer = reshape(@view(row_buffers[1:buffer_size]), n_rows, n_cols)
+            buffer_offset = col_offset * n_rows
+
+            # Copy matrix entries into contiguous buffer to improve efficiency.
+            row_buffer =
+                reshape(@view(row_buffers[buffer_offset+1:buffer_offset+buffer_size]),
+                        n_rows, n_cols)
 
             local_above_diagonal_sub_row =
                 @view matrix_storage[first_storage_row:last_storage_row,
-                                     first_storage_col:last_storage_col]
+                                     shared_local_col_range]
 
             # Copy rows into contiguous buffer, for efficiency and so that we can use the
             # LAPACK routine that requires this.
@@ -811,11 +927,13 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
             # Copy buffer back into matrix storage.
             local_above_diagonal_sub_row .= row_buffer
         end
+    end
 
-        if distributed_comm_rank == diagonal_distributed_rank
-            # Diagonal rank can now ensure all communications have completed.
-            MPI.Waitall(reqs[1:req_counter])
-        end
+    synchronize_shared()
+
+    if shared_comm_rank == 0 && distributed_comm_rank == diagonal_distributed_rank
+        # Diagonal rank can now ensure all communications have completed.
+        MPI.Waitall(reqs[1:req_counter])
     end
 
     return nothing
@@ -836,6 +954,7 @@ function update_bottom_right_block!(A_lu, panel)
     matrix_storage = A_lu.factorization_matrix_storage
     distributed_comm = A_lu.distributed_comm
     reqs = A_lu.comm_requests
+    synchronize_shared = A_lu.synchronize_shared
 
     row_buffers = A_lu.factorization_row_swap_buffers
     # Can reuse this buffer as a column buffer, as it is big enough.
@@ -860,8 +979,11 @@ function update_bottom_right_block!(A_lu, panel)
     left_panel_n_cols = left_panel_last_storage_col - left_panel_first_storage_col + 1
     left_panel_buffer_size = left_panel_n_rows * left_panel_n_cols
 
-    left_panel_buffer = reshape(@view(col_buffers[1:left_panel_buffer_size]),
-                                left_panel_n_rows, left_panel_n_cols)
+    # Use a transposed buffer to match the column buffer used in
+    # `update_sub_panel_off_diagonals!()`.
+    left_panel_buffer =
+        transpose(reshape(@view(col_buffers[1:left_panel_buffer_size]),
+                          left_panel_n_cols, left_panel_n_rows))
 
     # Locally-owned rows/column to be copied into row_buffer
     top_panel_first_storage_row = (panel_group_row - 1) * tile_size + 1
@@ -888,12 +1010,12 @@ function update_bottom_right_block!(A_lu, panel)
                     continue
                 end
                 r = (l - 1) * group_K + group_k - 1
-                reqs[request_counter+=1] = MPI.Isend(parent(left_panel_buffer),
+                reqs[request_counter+=1] = MPI.Isend(parent(parent(left_panel_buffer)),
                                                      distributed_comm; dest=r)
             end
         else
             left_panel_r = (panel_l - 1) * group_K + group_k - 1
-            reqs[request_counter+=1] = MPI.Irecv!(parent(left_panel_buffer),
+            reqs[request_counter+=1] = MPI.Irecv!(parent(parent(left_panel_buffer)),
                                                   distributed_comm; source=left_panel_r)
         end
 
@@ -921,12 +1043,31 @@ function update_bottom_right_block!(A_lu, panel)
         end
 
         MPI.Waitall(reqs[1:request_counter])
+    end
+
+    if !(group_l == panel_l && group_k == panel_k)
+        synchronize_shared()
+    end
+
+    shared_local_col_range, col_offset =
+        get_shared_local_col_range(A_lu, top_panel_first_storage_col)
+
+    top_panel_shared_local_n_cols = length(shared_local_col_range)
+    if top_panel_shared_local_n_cols > 0
+        top_panel_shared_local_buffer_size = top_panel_n_rows * top_panel_shared_local_n_cols
+        top_panel_shared_local_buffer_offset = col_offset * top_panel_n_rows
+        top_panel_shared_local_buffer =
+            reshape(@view(row_buffers[top_panel_shared_local_buffer_offset+1:top_panel_shared_local_buffer_offset+top_panel_shared_local_buffer_size]),
+                    top_panel_n_rows, top_panel_shared_local_n_cols)
+
 
         # Perform the update of the bottom-right block.
         remaining_block = @view matrix_storage[left_panel_first_storage_row:end,
-                                               top_panel_first_storage_col:end]
-        mul!(remaining_block, left_panel_buffer, top_panel_buffer, -1.0, 1.0)
+                                               shared_local_col_range]
+        mul!(remaining_block, left_panel_buffer, top_panel_shared_local_buffer, -1.0, 1.0)
     end
+
+    synchronize_shared()
 
     return nothing
 end
