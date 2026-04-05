@@ -45,6 +45,7 @@ function time_lu(filename, n_shared, n, imat)
                             allocate_shared_int; skip_factorization=true, check_lu=false)
 
             if distributed_rank == 0 && shared_rank == 0
+                println(now())
                 println("benchmark: matrix=$mat_name  rhs=$vec_name  file='$filename'")
                 println("  n = $n  nb = $nb  nrhs = $nrhs")
             end
