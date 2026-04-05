@@ -337,13 +337,14 @@ contains
                   max(1, loc_rows_b), info)
     if (info /= 0) stop "ERROR: descinit desc_b"
 
+    call MPI_Barrier(MPI_COMM_WORLD, mpi_err)
+    t0 = MPI_Wtime()
+
     ! ================================================================= !
     ! Step 8 – scatter A from rank 0 to the process grid
     ! ================================================================= !
     call pdgemr2d(n, n, A_global, 1, 1, desc_A_global, &
                        A_local,  1, 1, desc_A,         ictxt_global)
-
-    if (my_rank == 0) deallocate(A_global)
 
     ! ================================================================= !
     ! Step 9 – LU factorisation: pdgetrf  (done once for all RHS)
@@ -352,9 +353,6 @@ contains
     !   ipiv holds the row-pivot permutation for use in every pdgetrs.
     ! ================================================================= !
     allocate(ipiv(loc_rows_A + nb))
-
-    call MPI_Barrier(MPI_COMM_WORLD, mpi_err)
-    t0 = MPI_Wtime()
 
     call pdgetrf(n, n, A_local, 1, 1, desc_A, ipiv, info)
 
@@ -442,6 +440,7 @@ contains
     end do   ! irepeat
     deallocate(x_global)
 
+    if (my_rank == 0) deallocate(A_global)
     if (my_rank == 0) deallocate(B_global)
 
     ! ================================================================= !
