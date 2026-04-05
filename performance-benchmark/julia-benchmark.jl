@@ -1,4 +1,5 @@
 using Combinatorics
+using LinearAlgebra
 using MPI
 using Primes
 
@@ -9,6 +10,10 @@ const matrix_sizes = [128, 143, 256, 263, 512, 1024, 2048, 2057, 4096, 8192, 163
 function main()
     MPI.Init()
     nproc = MPI.Comm_size(MPI.COMM_WORLD)
+
+    # Ensure BLAS only uses 1 thread, to avoid oversubscribing processes as we are already
+    # fully parallelised.
+    BLAS.set_num_threads(1)
 
     for n_shared ∈ [prod(x) for x ∈ unique(combinations(factor(Vector, nproc)))]
         for n ∈ matrix_sizes
