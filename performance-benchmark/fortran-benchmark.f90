@@ -300,6 +300,8 @@ contains
           write(*,'(6A)') "solve_system: matrix='", trim(mat_name), &
               "'  rhs='",    trim(vec_name), &
               "'  file='",   trim(filename), "'"
+          write(*,'(A,I0,A,I0)') &
+              "  nprocs = ", nprocs, "  blas_threads = ", blas_threads
           write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0)') &
               "  Process grid: ", nprow, " x ", npcol, &
               "   n = ", n, "   nb = ", nb, "   nrhs = ", nrhs_total
