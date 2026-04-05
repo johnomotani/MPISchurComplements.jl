@@ -41,8 +41,13 @@ function time_lu(filename, n_shared, n, imat)
             continue
         end
         for irepeatmat ∈ 1:nmat_repeats
+            MPI.Barrier(comm_world)
+            t0 = time_ns()
             A_lu = dense_lu(A, nb, comm, shared_comm, distributed_comm, allocate_shared_float,
                             allocate_shared_int; skip_factorization=true, check_lu=false)
+            MPI.Barrier(comm_world)
+            t1 = time_ns()
+            t_setup = (t1 - t0) / 1e9
 
             if distributed_rank == 0 && shared_rank == 0
                 println(now())
@@ -78,6 +83,7 @@ function time_lu(filename, n_shared, n, imat)
                 t_trisolve_mean = sum(t_trisolve_array) / length(t_trisolve_array)
 
                 println("Timing summary (wall-clock):")
+                println("  DenseLU setup: $t_setup s")
                 println("  LU factorisation: $t_factorisation s")
                 println("  Triangular solve:")
                 println("    min  : $t_trisolve_min s")
