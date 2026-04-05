@@ -5,7 +5,7 @@ file = h5open("matrices-and-rhs.h5", "cw")
 
 matrix_sizes = [128, 143, 256, 263, 512, 1024, 2048, 2057, 4096, 8192, 16384, 16397]
 nmat = 10
-nrhs = 100
+nrhs = 10
 
 rng = StableRNG(6543)
 
