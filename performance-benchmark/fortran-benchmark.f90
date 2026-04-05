@@ -68,17 +68,15 @@ module solver_mod
 contains
 
   ! ------------------------------------------------------------------ !
-  subroutine solve_system(filename, n, nb, imat)
+  subroutine solve_system(filename, n, imat)
   ! ------------------------------------------------------------------ !
   !  Arguments                                                          !
   !    filename – path to the HDF5 file                                 !
   !    n        – global matrix dimension                               !
-  !    nb       – block size                                            !
   !    imat     – counter of test matrices                              !
   ! ------------------------------------------------------------------ !
     character(len=*), intent(in) :: filename
     integer, intent(in) :: n
-    integer, intent(in) :: nb
     integer, intent(in) :: imat
 
     ! ---- MPI -------------------------------------------------------- !
@@ -94,6 +92,10 @@ contains
     integer :: nrhs_total    ! number of RHS vectors (columns of B)
     integer :: nrhs_repeats
     parameter (nrhs_repeats = 10) ! Repeat each rhs to get better statistics
+    integer :: tile_sizes(7)
+    integer :: nb ! block size
+    integer :: nmat_repeats
+    parameter (nmat_repeats = 10) ! Repeat each matrix to get better statistics
 
     ! ---- global arrays (rank 0 only) -------------------------------- !
     real(kind=8), allocatable :: A_global(:,:)    ! n × n
@@ -152,8 +154,10 @@ contains
     integer :: log_unit
 
     ! ---- misc ------------------------------------------------------- !
-    integer :: i, irhs, irepeat
+    integer :: i, irhs, itile, irepeatmat, irepeatrhs
     integer, external :: numroc
+
+    tile_sizes = [32, 64, 128, 256, 512, 1024, 2048]
 
     ! ================================================================= !
     ! Step 1 – query MPI environment (MPI already initialised by caller)
@@ -284,211 +288,221 @@ contains
     end do
     npcol = nprocs / nprow
 
-    if (my_rank == 0) then
-      write(*,'(6A)') "solve_system: matrix='", trim(mat_name), &
-                      "'  rhs='",    trim(vec_name), &
-                      "'  file='",   trim(filename), "'"
-      write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0)') &
-        "  Process grid: ", nprow, " x ", npcol, &
-        "   n = ", n, "   nb = ", nb, "   nrhs = ", nrhs_total
-    end if
-
-    ! ================================================================= !
-    ! Step 5 – initialise BLACS contexts
-    ! ================================================================= !
-    call blacs_get(-1, 0, ictxt_grid)
-    call blacs_gridinit(ictxt_grid, 'R', nprow, npcol)
-    call blacs_gridinfo(ictxt_grid, nprow, npcol, my_row, my_col)
-
-    call blacs_get(-1, 0, ictxt_global)
-    call blacs_gridinit(ictxt_global, 'R', 1, nprocs)
-
-    ! ================================================================= !
-    ! Step 6 – allocate distributed storage
-    ! ================================================================= !
-    loc_rows_A = numroc(n, nb, my_row, 0, nprow)
-    loc_cols_A = numroc(n, nb, my_col, 0, npcol)
-    loc_rows_b = numroc(n, nb, my_row, 0, nprow)
-
-    allocate(A_local(max(1, loc_rows_A), max(1, loc_cols_A)))
-    allocate(b_local(max(1, loc_rows_b)))
-    allocate(t_trisolve_arr(nrhs_total))
-    A_local = 0.0d0
-    t_trisolve_arr = 1.0d20 ! Initialise to some ridiculously large value, so we can use min() sensibly below
-
-    ! ================================================================= !
-    ! Step 7 – build ScaLAPACK array descriptors
-    ! ================================================================= !
-    if (my_rank == 0) then
-      call descinit(desc_A_global, n, n, n, n, 0, 0, ictxt_global, n, info)
-      if (info /= 0) stop "ERROR: descinit desc_A_global"
-      call descinit(desc_b_global, n, 1, n, 1, 0, 0, ictxt_global, n, info)
-      if (info /= 0) stop "ERROR: descinit desc_b_global"
-    else
-      desc_A_global    = 0;  desc_A_global(2) = ictxt_global
-      desc_b_global    = 0;  desc_b_global(2) = ictxt_global
-    end if
-
-    call descinit(desc_A, n, n, nb, nb, 0, 0, ictxt_grid, &
-                  max(1, loc_rows_A), info)
-    if (info /= 0) stop "ERROR: descinit desc_A"
-
-    call descinit(desc_b, n, 1, nb, 1, 0, 0, ictxt_grid, &
-                  max(1, loc_rows_b), info)
-    if (info /= 0) stop "ERROR: descinit desc_b"
-
-    call MPI_Barrier(MPI_COMM_WORLD, mpi_err)
-    t0 = MPI_Wtime()
-
-    ! ================================================================= !
-    ! Step 8 – scatter A from rank 0 to the process grid
-    ! ================================================================= !
-    call pdgemr2d(n, n, A_global, 1, 1, desc_A_global, &
-                       A_local,  1, 1, desc_A,         ictxt_global)
-
-    ! ================================================================= !
-    ! Step 9 – LU factorisation: pdgetrf  (done once for all RHS)
-    !
-    !   A_local is overwritten with L (strictly lower) and U (upper).
-    !   ipiv holds the row-pivot permutation for use in every pdgetrs.
-    ! ================================================================= !
-    allocate(ipiv(loc_rows_A + nb))
-
-    call pdgetrf(n, n, A_local, 1, 1, desc_A, ipiv, info)
-
-    call MPI_Barrier(MPI_COMM_WORLD, mpi_err)
-    t1 = MPI_Wtime()
-    t_factorisation = t1 - t0
-
-    if (info /= 0) then
-      if (my_rank == 0) then
-        if (info < 0) then
-          write(*,'(A,I0)') "ERROR: pdgetrf – illegal argument ", -info
-        else
-          write(*,'(A,I0)') "ERROR: pdgetrf – matrix singular at row ", info
-        end if
+    do itile = 1, size(tile_sizes)
+      nb = tile_sizes(itile)
+      if (nb > n) then
+        cycle
       end if
-      call MPI_Abort(MPI_COMM_WORLD, 1, mpi_err)
-    end if
+      ! Loop repeats outside imat so that matrix elements are not somehow stored in a hot cache, affecting the timings
+      do irepeatmat = 1, nmat_repeats
 
-    ! ================================================================= !
-    ! Step 10 – loop over RHS vectors: scatter → solve → gather → print
-    !
-    !   Repeat nrhs_repeats times - for each column irhs of B_global:
-    !     a) rank 0 scatters that column into b_local via pdgemr2d,
-    !        treating the column as a 1-D global vector.
-    !     b) pdgetrs solves using the L/U factors already in A_local.
-    !     c) the solution is gathered back and rank 0 prints it.
-    !     d) the MPI_MAX wall time is stored in t_trisolve_arr(irhs).
-    ! ================================================================= !
-    if (my_rank == 0) then
-      allocate(x_global(n))
-    end if
-    do irepeat = 1, nrhs_repeats ! Make the repeats the loop outside the irhs loop so that a given rhs is not somehow stored in a hot cache in a way that affects the timings.
-      do irhs = 1, nrhs_total
+        if (my_rank == 0) then
+          write(*,'(6A)') "solve_system: matrix='", trim(mat_name), &
+              "'  rhs='",    trim(vec_name), &
+              "'  file='",   trim(filename), "'"
+          write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0)') &
+              "  Process grid: ", nprow, " x ", npcol, &
+              "   n = ", n, "   nb = ", nb, "   nrhs = ", nrhs_total
+        end if
 
-        ! -- triangular solve -------------------------------------------- !
+        ! ================================================================= !
+        ! Step 5 – initialise BLACS contexts
+        ! ================================================================= !
+        call blacs_get(-1, 0, ictxt_grid)
+        call blacs_gridinit(ictxt_grid, 'R', nprow, npcol)
+        call blacs_gridinfo(ictxt_grid, nprow, npcol, my_row, my_col)
+
+        call blacs_get(-1, 0, ictxt_global)
+        call blacs_gridinit(ictxt_global, 'R', 1, nprocs)
+
+        ! ================================================================= !
+        ! Step 6 – allocate distributed storage
+        ! ================================================================= !
+        loc_rows_A = numroc(n, nb, my_row, 0, nprow)
+        loc_cols_A = numroc(n, nb, my_col, 0, npcol)
+        loc_rows_b = numroc(n, nb, my_row, 0, nprow)
+
+        allocate(A_local(max(1, loc_rows_A), max(1, loc_cols_A)))
+        allocate(b_local(max(1, loc_rows_b)))
+        allocate(t_trisolve_arr(nrhs_total))
+        A_local = 0.0d0
+        t_trisolve_arr = 1.0d20 ! Initialise to some ridiculously large value, so we can use min() sensibly below
+
+        ! ================================================================= !
+        ! Step 7 – build ScaLAPACK array descriptors
+        ! ================================================================= !
+        if (my_rank == 0) then
+          call descinit(desc_A_global, n, n, n, n, 0, 0, ictxt_global, n, info)
+          if (info /= 0) stop "ERROR: descinit desc_A_global"
+          call descinit(desc_b_global, n, 1, n, 1, 0, 0, ictxt_global, n, info)
+          if (info /= 0) stop "ERROR: descinit desc_b_global"
+        else
+          desc_A_global    = 0;  desc_A_global(2) = ictxt_global
+          desc_b_global    = 0;  desc_b_global(2) = ictxt_global
+        end if
+
+        call descinit(desc_A, n, n, nb, nb, 0, 0, ictxt_grid, &
+            max(1, loc_rows_A), info)
+        if (info /= 0) stop "ERROR: descinit desc_A"
+
+        call descinit(desc_b, n, 1, nb, 1, 0, 0, ictxt_grid, &
+            max(1, loc_rows_b), info)
+        if (info /= 0) stop "ERROR: descinit desc_b"
+
         call MPI_Barrier(MPI_COMM_WORLD, mpi_err)
         t0 = MPI_Wtime()
 
-        ! -- scatter column irhs of B_global into b_local --------------- !
-        b_local = 0.0d0
-        if (my_rank == 0) then
-          call pdgemr2d(n, 1, B_global(1, irhs), 1, 1, desc_b_global, &
-                             b_local,            1, 1, desc_b,         ictxt_global)
-        else
-          call pdgemr2d(n, 1, B_global(1, irhs), 1, 1, desc_b_global, &
-                             b_local,            1, 1, desc_b,         ictxt_global)
-        end if
+        ! ================================================================= !
+        ! Step 8 – scatter A from rank 0 to the process grid
+        ! ================================================================= !
+        call pdgemr2d(n, n, A_global, 1, 1, desc_A_global, &
+            A_local,  1, 1, desc_A,         ictxt_global)
 
-        call pdgetrs('N', n, nrhs_one, A_local, 1, 1, desc_A, ipiv, &
-                     b_local, 1, 1, desc_b, info)
+        ! ================================================================= !
+        ! Step 9 – LU factorisation: pdgetrf  (done once for all RHS)
+        !
+        !   A_local is overwritten with L (strictly lower) and U (upper).
+        !   ipiv holds the row-pivot permutation for use in every pdgetrs.
+        ! ================================================================= !
+        allocate(ipiv(loc_rows_A + nb))
+
+        call pdgetrf(n, n, A_local, 1, 1, desc_A, ipiv, info)
+
+        call MPI_Barrier(MPI_COMM_WORLD, mpi_err)
+        t1 = MPI_Wtime()
+        t_factorisation = t1 - t0
 
         if (info /= 0) then
-          if (my_rank == 0) &
-            write(*,'(A,I0,A,I0)') "ERROR: pdgetrs – illegal argument ", &
-                                    -info, " on RHS ", irhs
+          if (my_rank == 0) then
+            if (info < 0) then
+              write(*,'(A,I0)') "ERROR: pdgetrf – illegal argument ", -info
+            else
+              write(*,'(A,I0)') "ERROR: pdgetrf – matrix singular at row ", info
+            end if
+          end if
           call MPI_Abort(MPI_COMM_WORLD, 1, mpi_err)
         end if
 
-        ! -- gather solution to rank 0 and print ------------------------- !
+        ! ================================================================= !
+        ! Step 10 – loop over RHS vectors: scatter → solve → gather → print
+        !
+        !   Repeat nrhs_repeats times - for each column irhs of B_global:
+        !     a) rank 0 scatters that column into b_local via pdgemr2d,
+        !        treating the column as a 1-D global vector.
+        !     b) pdgetrs solves using the L/U factors already in A_local.
+        !     c) the solution is gathered back and rank 0 prints it.
+        !     d) the MPI_MAX wall time is stored in t_trisolve_arr(irhs).
+        ! ================================================================= !
         if (my_rank == 0) then
-          call pdgemr2d(n, 1, b_local,  1, 1, desc_b,       &
-                             x_global, 1, 1, desc_b_global, ictxt_global)
-          !write(*,'(A,I0,A,I0,A)') "Solution x for RHS ", irhs, &
-          !                           " of ", nrhs_total, ":"
-          !do i = 1, n
-          !  write(*,'(A,I0,A,ES22.14)') "  x(", i, ") = ", x_global(i)
-          !end do
-        else
-          call pdgemr2d(n, 1, b_local,  1, 1, desc_b,       &
-                             b_local,  1, 1, desc_b_global, ictxt_global)
+          allocate(x_global(n))
+        end if
+        do irepeatrhs = 1, nrhs_repeats ! Make the repeats the loop outside the irhs loop so that a given rhs is not somehow stored in a hot cache in a way that affects the timings.
+          do irhs = 1, nrhs_total
+
+            ! -- triangular solve -------------------------------------------- !
+            call MPI_Barrier(MPI_COMM_WORLD, mpi_err)
+            t0 = MPI_Wtime()
+
+            ! -- scatter column irhs of B_global into b_local --------------- !
+            b_local = 0.0d0
+            if (my_rank == 0) then
+              call pdgemr2d(n, 1, B_global(1, irhs), 1, 1, desc_b_global, &
+                  b_local,            1, 1, desc_b,         ictxt_global)
+            else
+              call pdgemr2d(n, 1, B_global(1, irhs), 1, 1, desc_b_global, &
+                  b_local,            1, 1, desc_b,         ictxt_global)
+            end if
+
+            call pdgetrs('N', n, nrhs_one, A_local, 1, 1, desc_A, ipiv, &
+                b_local, 1, 1, desc_b, info)
+
+            if (info /= 0) then
+              if (my_rank == 0) &
+                  write(*,'(A,I0,A,I0)') "ERROR: pdgetrs – illegal argument ", &
+                  -info, " on RHS ", irhs
+              call MPI_Abort(MPI_COMM_WORLD, 1, mpi_err)
+            end if
+
+            ! -- gather solution to rank 0 and print ------------------------- !
+            if (my_rank == 0) then
+              call pdgemr2d(n, 1, b_local,  1, 1, desc_b,       &
+                  x_global, 1, 1, desc_b_global, ictxt_global)
+              !write(*,'(A,I0,A,I0,A)') "Solution x for RHS ", irhs, &
+              !                           " of ", nrhs_total, ":"
+              !do i = 1, n
+              !  write(*,'(A,I0,A,ES22.14)') "  x(", i, ") = ", x_global(i)
+              !end do
+            else
+              call pdgemr2d(n, 1, b_local,  1, 1, desc_b,       &
+                  b_local,  1, 1, desc_b_global, ictxt_global)
+            end if
+
+            t1 = MPI_Wtime()
+            t_trisolve_local = t1 - t0
+
+            ! -- just take time on rank 0, as that is where solution is ------ !
+            ! -- gathered to, and take minimum over repeats to minimise system !
+            ! -- noise effect ------------------------------------------------ !
+            t_trisolve_arr(irhs) = min(t_trisolve_arr(irhs), t_trisolve_local)
+
+          end do   ! irhs
+        end do   ! irepeatrhs
+        deallocate(x_global)
+
+        ! ================================================================= !
+        ! Step 11 – compute trisolve statistics on rank 0
+        ! ================================================================= !
+        if (my_rank == 0) then
+          t_trisolve_min  = minval(t_trisolve_arr)
+          t_trisolve_max  = maxval(t_trisolve_arr)
+          t_trisolve_mean = sum(t_trisolve_arr) / real(nrhs_total, kind=8)
         end if
 
-        t1 = MPI_Wtime()
-        t_trisolve_local = t1 - t0
+        ! ================================================================= !
+        ! Step 12 – rank 0 prints the timing summary, then appends the log  !
+        ! ================================================================= !
+        if (my_rank == 0) then
 
-        ! -- just take time on rank 0, as that is where solution is ------ !
-        ! -- gathered to, and take minimum over repeats to minimise system !
-        ! -- noise effect ------------------------------------------------ !
-        t_trisolve_arr(irhs) = min(t_trisolve_arr(irhs), t_trisolve_local)
+          write(*,*)
+          write(*,'(A)') "Timing summary (wall-clock):"
+          write(*,'(A,ES12.4,A)') &
+              "  LU factorisation  (pdgetrf)       : ", t_factorisation,  " s"
+          write(*,'(A,I0,A)') &
+              "  Triangular solve  (pdgetrs, n=", nrhs_total, " RHS):"
+          write(*,'(A,ES12.4,A)') &
+              "    min  : ", t_trisolve_min,  " s"
+          write(*,'(A,ES12.4,A)') &
+              "    mean : ", t_trisolve_mean, " s"
+          write(*,'(A,ES12.4,A)') &
+              "    max  : ", t_trisolve_max,  " s"
+          write(*,'(A,ES12.4,A)') &
+              "  Total (factorisation + mean solve) : ", &
+              t_factorisation + t_trisolve_mean, " s"
 
-      end do   ! irhs
-    end do   ! irepeat
-    deallocate(x_global)
+          ! -- log file --------------------------------------------------- !
+          ! One space-separated line, no text:                              !
+          !   n imat nprocs  blas_threads  t_factorisation                  !
+          !   t_trisolve_min  t_trisolve_mean  t_trisolve_max  t_total_mean !
+          open(newunit=log_unit, file=LOG_FILE, &
+              status='unknown', position='append', action='write')
+          write(log_unit, '(I0,1X,I0,1X,I0,1X,I0,5(1X,ES24.16))') &
+              n, imat, nprocs, blas_threads, &
+              t_factorisation, &
+              t_trisolve_min, t_trisolve_mean, t_trisolve_max, &
+              t_factorisation + t_trisolve_mean
+          close(log_unit)
 
-    if (my_rank == 0) deallocate(A_global)
-    if (my_rank == 0) deallocate(B_global)
+        end if
 
-    ! ================================================================= !
-    ! Step 11 – compute trisolve statistics on rank 0
-    ! ================================================================= !
-    if (my_rank == 0) then
-      t_trisolve_min  = minval(t_trisolve_arr)
-      t_trisolve_max  = maxval(t_trisolve_arr)
-      t_trisolve_mean = sum(t_trisolve_arr) / real(nrhs_total, kind=8)
-    end if
-
-    ! ================================================================= !
-    ! Step 12 – rank 0 prints the timing summary, then appends the log  !
-    ! ================================================================= !
-    if (my_rank == 0) then
-
-      write(*,*)
-      write(*,'(A)') "Timing summary (wall-clock):"
-      write(*,'(A,ES12.4,A)') &
-        "  LU factorisation  (pdgetrf)       : ", t_factorisation,  " s"
-      write(*,'(A,I0,A)') &
-        "  Triangular solve  (pdgetrs, n=", nrhs_total, " RHS):"
-      write(*,'(A,ES12.4,A)') &
-        "    min  : ", t_trisolve_min,  " s"
-      write(*,'(A,ES12.4,A)') &
-        "    mean : ", t_trisolve_mean, " s"
-      write(*,'(A,ES12.4,A)') &
-        "    max  : ", t_trisolve_max,  " s"
-      write(*,'(A,ES12.4,A)') &
-        "  Total (factorisation + mean solve) : ", &
-        t_factorisation + t_trisolve_mean, " s"
-
-      ! -- log file --------------------------------------------------- !
-      ! One space-separated line, no text:                              !
-      !   n imat nprocs  blas_threads  t_factorisation                  !
-      !   t_trisolve_min  t_trisolve_mean  t_trisolve_max  t_total_mean !
-      open(newunit=log_unit, file=LOG_FILE, &
-           status='unknown', position='append', action='write')
-      write(log_unit, '(I0,1X,I0,1X,I0,1X,I0,5(1X,ES24.16))') &
-        n, imat, nprocs, blas_threads, &
-        t_factorisation, &
-        t_trisolve_min, t_trisolve_mean, t_trisolve_max, &
-        t_factorisation + t_trisolve_mean
-      close(log_unit)
-
-    end if
+        deallocate(A_local, b_local, ipiv, t_trisolve_arr)
+      end do ! irepeatmat
+    end do ! itile
 
     ! ================================================================= !
     ! Step 13 – release BLACS contexts and local storage
     ! ================================================================= !
-    deallocate(A_local, b_local, ipiv, t_trisolve_arr)
+    if (my_rank == 0) deallocate(A_global)
+    if (my_rank == 0) deallocate(B_global)
     call blacs_gridexit(ictxt_grid)
     call blacs_gridexit(ictxt_global)
 
@@ -505,14 +519,11 @@ program main
   use solver_mod
   implicit none
 
-  integer            :: my_rank, mpi_err, i, itile, irepeat, imat, matrix_size, tile_size
-  integer            :: matrix_sizes(12), tile_sizes(7)
+  integer            :: my_rank, mpi_err, i, imat, matrix_size
+  integer            :: matrix_sizes(12)
   character(len=256) :: filename
-  integer            :: nmat_repeats
-  parameter (nmat_repeats = 10) ! Repeat each matrix to get better statistics
 
   matrix_sizes = [128, 143, 256, 263, 512, 1024, 2048, 2057, 4096, 8192, 16384, 16397]
-  tile_sizes = [32, 64, 128, 256, 512, 1024, 2048]
 
   ! ---- MPI lifecycle (owned here, not inside the subroutine) -------- !
   call MPI_Init(mpi_err)
@@ -529,17 +540,8 @@ program main
   ! ---- call the solver ----------- !
   do i = 1, size(matrix_sizes)
     matrix_size = matrix_sizes(i)
-    do itile = 1, size(tile_sizes)
-      tile_size = tile_sizes(itile)
-      if (tile_size > matrix_size) then
-        cycle
-      end if
-      ! Loop repeats outside imat so that matrix elements are not somehow stored in a hot cache, affecting the timings
-      do irepeat = 1, nmat_repeats
-        do imat = 1, 10
-          call solve_system(trim(filename), matrix_size, tile_size, imat)
-        end do
-      end do
+    do imat = 1, 10
+      call solve_system(trim(filename), matrix_size, imat)
     end do
   end do
 
