@@ -53,7 +53,7 @@ function time_lu(filename, n_shared, n, imat)
             if distributed_rank == 0 && shared_rank == 0
                 println(now())
                 println("benchmark: matrix=$mat_name  rhs=$vec_name  file='$filename'")
-                println("  n = $n  nb = $nb  nrhs = $nrhs")
+                println("  nproc = $(distributed_nproc * shared_nproc)  n_shared=$n_shared  n = $n  nb = $nb  nrhs = $nrhs")
             end
 
             t_trisolve_array = fill(Float64(Inf), nrhs)
