@@ -94,7 +94,7 @@ function time_lu(filename, n_shared, n, imat)
                 println()
 
                 open(logfile, "a") do io
-                    println(io, "$n $imat $distributed_nproc $shared_nproc $t_factorisation $t_trisolve_min $t_trisolve_mean $t_trisolve_max $(t_factorisation + t_trisolve_mean)")
+                    println(io, "$n $nb $imat $distributed_nproc $shared_nproc $t_factorisation $t_trisolve_min $t_trisolve_mean $t_trisolve_max $(t_factorisation + t_trisolve_mean)")
                 end
             end
         end
