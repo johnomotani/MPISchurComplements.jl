@@ -387,6 +387,10 @@ contains
     do irepeat = 1, nrhs_repeats ! Make the repeats the loop outside the irhs loop so that a given rhs is not somehow stored in a hot cache in a way that affects the timings.
       do irhs = 1, nrhs_total
 
+        ! -- triangular solve -------------------------------------------- !
+        call MPI_Barrier(MPI_COMM_WORLD, mpi_err)
+        t0 = MPI_Wtime()
+
         ! -- scatter column irhs of B_global into b_local --------------- !
         b_local = 0.0d0
         if (my_rank == 0) then
@@ -396,10 +400,6 @@ contains
           call pdgemr2d(n, 1, B_global(1, irhs), 1, 1, desc_b_global, &
                              b_local,            1, 1, desc_b,         ictxt_global)
         end if
-
-        ! -- triangular solve -------------------------------------------- !
-        call MPI_Barrier(MPI_COMM_WORLD, mpi_err)
-        t0 = MPI_Wtime()
 
         call pdgetrs('N', n, nrhs_one, A_local, 1, 1, desc_A, ipiv, &
                      b_local, 1, 1, desc_b, info)
@@ -455,7 +455,7 @@ contains
     if (my_rank == 0) then
 
       write(*,*)
-      write(*,'(A)') "Timing summary (wall-clock, max over all ranks):"
+      write(*,'(A)') "Timing summary (wall-clock):"
       write(*,'(A,ES12.4,A)') &
         "  LU factorisation  (pdgetrf)       : ", t_factorisation,  " s"
       write(*,'(A,I0,A)') &
