@@ -1,0 +1,11 @@
+[deps]
+HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
+MPIPreferences = "3da0fdf6-3ccc-4f1b-acd9-58baa6c99267"
+MPISchurComplements = "586db363-8230-43f3-b4b3-2c5432ab38c6"
+StableRNGs = "860ef19b-820b-49d6-a774-d7a799459cd3"
+
+[extras]
+HDF5_jll = "0234f1f7-429e-5d53-9886-15a909be8d59"
+
+[sources.MPISchurComplements]
+path = ".."
