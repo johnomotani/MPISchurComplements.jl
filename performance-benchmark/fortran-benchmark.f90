@@ -358,7 +358,7 @@ contains
 
     call MPI_Barrier(MPI_COMM_WORLD, mpi_err)
     t1 = MPI_Wtime()
-    t_factorisation_local = t1 - t0
+    t_factorisation = t1 - t0
 
     if (info /= 0) then
       if (my_rank == 0) then
@@ -370,9 +370,6 @@ contains
       end if
       call MPI_Abort(MPI_COMM_WORLD, 1, mpi_err)
     end if
-
-    call MPI_Reduce(t_factorisation_local, t_factorisation, 1, &
-                    MPI_DOUBLE_PRECISION, MPI_MAX, 0, MPI_COMM_WORLD, mpi_err)
 
     ! ================================================================= !
     ! Step 10 – loop over RHS vectors: scatter → solve → gather → print
@@ -445,9 +442,6 @@ contains
 
     ! ================================================================= !
     ! Step 11 – compute trisolve statistics on rank 0
-    !           (t_trisolve_arr is only meaningful on rank 0 because
-    !            MPI_Reduce with root=0 leaves other ranks' receive
-    !            buffers undefined)
     ! ================================================================= !
     if (my_rank == 0) then
       t_trisolve_min  = minval(t_trisolve_arr)
