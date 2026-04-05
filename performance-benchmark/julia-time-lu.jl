@@ -6,7 +6,7 @@ using MPISchurComplements
 using MPISchurComplements.DenseLUs
 
 const logfile = "timings-julia.log"
-const nrhs = 100
+const nrhs = 10
 const nmat_repeats = 10
 const nrhs_repeats = 10
 const tile_sizes = [32, 64, 128, 256, 512, 1024, 2048]
