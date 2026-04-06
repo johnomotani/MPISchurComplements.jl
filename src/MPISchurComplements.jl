@@ -861,7 +861,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
             dense_lu(schur_complement, schur_tile_size, comm, shared_comm,
                      distributed_comm, allocate_shared_float, allocate_shared_int;
                      synchronize_shared=synchronize_shared, skip_factorization=true,
-                     check_lu=check_lu)
+                     check_lu=check_lu, timer=timer)
     else
         if shared_rank == 0 && distributed_rank == 0
             schur_complement_factorization =
