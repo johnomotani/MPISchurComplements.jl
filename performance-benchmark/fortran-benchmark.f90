@@ -84,6 +84,7 @@ contains
 
     ! ---- BLACS ------------------------------------------------------ !
     integer :: ictxt_global  ! 1×nprocs context (for pdgemr2d scatter/gather)
+    integer :: ictxt_root    ! 1×1 context (for pdgemr2d scatter/gather)
     integer :: ictxt_grid    ! nprow×npcol solver context
     integer :: nprow, npcol
     integer :: my_row, my_col
@@ -317,6 +318,9 @@ contains
         call blacs_get(-1, 0, ictxt_global)
         call blacs_gridinit(ictxt_global, 'R', 1, nprocs)
 
+        call blacs_get(-1, 0, ictxt_root)
+        call blacs_gridinit(ictxt_root, 'R', 1, 1)
+
         ! ================================================================= !
         ! Step 6 – allocate distributed storage
         ! ================================================================= !
@@ -334,13 +338,13 @@ contains
         ! Step 7 – build ScaLAPACK array descriptors
         ! ================================================================= !
         if (my_rank == 0) then
-          call descinit(desc_A_global, n, n, n, n, 0, 0, ictxt_global, n, info)
+          call descinit(desc_A_global, n, n, n, n, 0, 0, ictxt_root, n, info)
           if (info /= 0) stop "ERROR: descinit desc_A_global"
-          call descinit(desc_b_global, n, 1, n, 1, 0, 0, ictxt_global, n, info)
+          call descinit(desc_b_global, n, 1, n, 1, 0, 0, ictxt_root, n, info)
           if (info /= 0) stop "ERROR: descinit desc_b_global"
         else
-          desc_A_global    = 0;  desc_A_global(2) = ictxt_global
-          desc_b_global    = 0;  desc_b_global(2) = ictxt_global
+          desc_A_global    = 0;  desc_A_global(2) = -1
+          desc_b_global    = 0;  desc_b_global(2) = -1
         end if
 
         call descinit(desc_A, n, n, nb, nb, 0, 0, ictxt_grid, &
@@ -449,7 +453,9 @@ contains
 
           end do   ! irhs
         end do   ! irepeatrhs
-        deallocate(x_global)
+        if (my_rank == 0) then
+          deallocate(x_global)
+        end if
 
         ! ================================================================= !
         ! Step 11 – compute trisolve statistics on rank 0
