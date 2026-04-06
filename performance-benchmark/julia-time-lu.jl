@@ -14,10 +14,11 @@ const tile_sizes = [32, 64, 128, 256, 512, 1024, 2048]
 include("../test/utils.jl")
 
 """
-    time_lu(filename, n, imat)
+    time_lu(filename, n_shared, n, imat)
 
 Time the LU factorization and solve for a matrix of size `n` and label `imat` loaded from
-the HDF5 file called `filename`.
+the HDF5 file called `filename`, running with shared-memory blocks of size `n_shared`
+processes.
 """
 function time_lu(filename, n_shared, n, imat)
     comm_world = MPI.COMM_WORLD
