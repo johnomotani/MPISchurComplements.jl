@@ -527,7 +527,7 @@ program main
   use solver_mod
   implicit none
 
-  integer            :: my_rank, mpi_err, i, imat, matrix_size
+  integer            :: comm_size, my_rank, mpi_err, i, imat, matrix_size
   integer            :: matrix_sizes(12)
   character(len=256) :: filename
 
@@ -535,6 +535,7 @@ program main
 
   ! ---- MPI lifecycle (owned here, not inside the subroutine) -------- !
   call MPI_Init(mpi_err)
+  call MPI_Comm_size(MPI_COMM_WORLD, comm_size, mpi_err)
   call MPI_Comm_rank(MPI_COMM_WORLD, my_rank, mpi_err)
 
   ! ---- command-line argument ---------------------------------------- !
@@ -548,6 +549,11 @@ program main
   ! ---- call the solver ----------- !
   do i = 1, size(matrix_sizes)
     matrix_size = matrix_sizes(i)
+    if (comm_size <= 3 .and. matrix_size > 4096) then
+      cycle
+    else if (comm_size <= 8 .and. matrix_size > 8192) then
+      cycle
+    end if
     do imat = 1, 10
       call solve_system(trim(filename), matrix_size, imat)
     end do

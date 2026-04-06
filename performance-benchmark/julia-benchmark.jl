@@ -17,6 +17,11 @@ function main()
 
     for n_shared ∈ [prod(x) for x ∈ unique(combinations(factor(Vector, nproc)))]
         for n ∈ matrix_sizes
+            if nproc ≤ 3 && n > 4096
+                continue
+            elseif nproc ≤ 8 && n > 8192
+                continue
+            end
             for imat ∈ 1:10
                 time_lu(ARGS[1], n_shared, n, imat)
             end
