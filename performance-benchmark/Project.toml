@@ -10,6 +10,7 @@ PackageCompiler = "9b87118b-4619-50d2-8e1e-99f35a4d4d9d"
 Primes = "27ebfcd6-29c5-5fa9-bf4b-fb8fc14df3ae"
 StableRNGs = "860ef19b-820b-49d6-a774-d7a799459cd3"
 TeeStreams = "c24d529b-c83e-40e0-9fc3-05832c05a0ba"
+TimerOutputs = "a759f4b9-e2f1-59dc-863e-4aeb61b1ea8f"
 
 [sources]
 MPISchurComplements = {path = ".."}
