@@ -33,10 +33,10 @@ for NT in {1..3}; do
   OPENBLAS_NUM_THREADS=$NT mpirun -np 10 ./fortran-benchmark matrices-and-rhs.h5
 done
 for NT in {1..2}; do
-  for NP in {11..16} do
+  for NP in {11..16}; do
     OPENBLAS_NUM_THREADS=$NT mpirun -np $NP ./fortran-benchmark matrices-and-rhs.h5
   done
 done
-for NP in {17..32} do
+for NP in {17..32}; do
   OPENBLAS_NUM_THREADS=1 mpirun -np $NP ./fortran-benchmark matrices-and-rhs.h5
 done
