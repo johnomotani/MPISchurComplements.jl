@@ -98,6 +98,22 @@ function time_lu(filename, n_shared, n, imat)
                     println(io, "$n $nb $imat $distributed_nproc $shared_nproc $t_factorisation $t_trisolve_min $t_trisolve_mean $t_trisolve_max $(t_factorisation + t_trisolve_mean)")
                 end
             end
+
+            # Delete all shared arrays except the first 3, which are A, rhs_array, and x.
+            if local_win_store_float !== nothing
+                # Free the MPI.Win objects, because if they are free'd by the garbage collector
+                # it may cause an MPI error or hang.
+                for w ∈ local_win_store_float[4:end]
+                    MPI.free(w)
+                end
+            end
+            if local_win_store_int !== nothing
+                # Free the MPI.Win objects, because if they are free'd by the garbage collector
+                # it may cause an MPI error or hang.
+                for w ∈ local_win_store_int[4:end]
+                    MPI.free(w)
+                end
+            end
         end
     end
 
