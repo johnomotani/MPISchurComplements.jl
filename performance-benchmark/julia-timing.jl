@@ -5,6 +5,7 @@ using MPI
 using TimerOutputs
 using MPISchurComplements
 using MPISchurComplements.DenseLUs
+using TeeStreams
 
 const imat = 1
 const nrhs = 10
@@ -12,13 +13,20 @@ const nrhs_repeats = 10
 
 include("../test/utils.jl")
 
-function time_lu(input_file, mat_size, n_shared, tile_size)
+function time_lu(input_file, mat_size, n_shared, tile_size, logoutput=false)
     comm_world = MPI.COMM_WORLD
     comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
         shared_nproc, shared_rank, allocate_shared_float, allocate_shared_int,
         local_win_store_float, local_win_store_int = get_comms(n_shared, true)
 
     timer = TimerOutput()
+
+    if logoutput && distributed_rank == 0 && shared_rank == 0
+        io = open("log-julia-timing.log", "a")
+        outstream = TeeStream(io, stdout)
+    else
+        outstream = stdout
+    end
 
     A = allocate_shared_float(mat_size, mat_size)
     rhs_array = allocate_shared_float(mat_size, nrhs)
@@ -33,9 +41,9 @@ function time_lu(input_file, mat_size, n_shared, tile_size)
     end
 
     if distributed_rank == 0 && shared_rank == 0
-        println(now())
-        println("benchmark: matrix=$mat_name  rhs=$vec_name  file='$input_file'")
-        println("  nproc = $(distributed_nproc * shared_nproc)  n_shared=$n_shared  mat_size = $mat_size  tile_size = $tile_size  nrhs = $nrhs")
+        println(outstream, now())
+        println(outstream, "benchmark: matrix=$mat_name  rhs=$vec_name  file='$input_file'")
+        println(outstream, "  nproc = $(distributed_nproc * shared_nproc)  n_shared=$n_shared  mat_size = $mat_size  tile_size = $tile_size  nrhs = $nrhs")
     end
 
     MPI.Barrier(comm_world)
@@ -73,18 +81,20 @@ function time_lu(input_file, mat_size, n_shared, tile_size)
         t_trisolve_max = maximum(t_trisolve_array)
         t_trisolve_mean = sum(t_trisolve_array) / length(t_trisolve_array)
 
-        println("Timing summary (wall-clock):")
-        println("  DenseLU setup: $t_setup s")
-        println("  LU factorisation: $t_factorisation s")
-        println("  Triangular solve:")
-        println("    min  : $t_trisolve_min s")
-        println("    mean  : $t_trisolve_mean s")
-        println("    max  : $t_trisolve_max s")
-        println("  Total (factorisation + mean solve) : $(t_factorisation + t_trisolve_mean) s")
-        println()
+        println(outstream, "Timing summary (wall-clock):")
+        println(outstream, "  DenseLU setup: $t_setup s")
+        println(outstream, "  LU factorisation: $t_factorisation s")
+        println(outstream, "  Triangular solve:")
+        println(outstream, "    min  : $t_trisolve_min s")
+        println(outstream, "    mean  : $t_trisolve_mean s")
+        println(outstream, "    max  : $t_trisolve_max s")
+        println(outstream, "  Total (factorisation + mean solve) : $(t_factorisation + t_trisolve_mean) s")
+        println(outstream)
     end
 
-    display(timer)
+    show(outstream, timer)
+    println(outstream)
+    println(outstream)
 
     if local_win_store_float !== nothing
         # Free the MPI.Win objects, because if they are free'd by the garbage collector
@@ -125,7 +135,7 @@ function main()
     end
     time_lu(input_file, mat_size, n_shared, tile_size)
     println("repeat to remove compile timings")
-    time_lu(input_file, mat_size, n_shared, tile_size)
+    time_lu(input_file, mat_size, n_shared, tile_size, true)
 
     MPI.Finalize()
     return nothing
