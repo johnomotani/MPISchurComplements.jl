@@ -30,7 +30,11 @@ import LinearAlgebra: lu!, ldiv!
     factorization_local_left_panel_buffer::Vector{T}
     factorization_pivoting_reduction_buffer::Tvec
     factorization_pivoting_reduction_indices::Tintvec
+    factorization_source_rows::Vector{Int64}
+    factorization_locally_owned_swap_rows::Vector{Int64}
+    factorization_source_swap_labels::Vector{Int64}
     factorization_row_swap_buffers::Tmat
+    factorization_swap_flags::Vector{UInt8}
     comm_requests::Vector{MPI.Request}
     my_L_tiles::Array{T,3}
     my_L_tile_row_ranges::Vector{UnitRange{Int64}}
