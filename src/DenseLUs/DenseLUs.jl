@@ -27,9 +27,10 @@ import LinearAlgebra: lu!, ldiv!
     factorization_matrix_parts_col_ranges::Vector{UnitRange{Int64}}
     factorization_locally_owned_rows::Vector{Int64}
     factorization_pivoting_buffer::Tvec
+    factorization_local_left_panel_buffer::Vector{T}
     factorization_pivoting_reduction_buffer::Tvec
     factorization_pivoting_reduction_indices::Tintvec
-    factorization_row_swap_buffers::Matrix{T}
+    factorization_row_swap_buffers::Tmat
     comm_requests::Vector{MPI.Request}
     my_L_tiles::Array{T,3}
     my_L_tile_row_ranges::Vector{UnitRange{Int64}}

@@ -89,6 +89,13 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
 
     factorization_pivoting_buffer = allocate_shared_float(group_n_rows * tile_size *
                                                           tile_size)
+    if shared_comm_size > 1
+        factorization_local_left_panel_buffer =
+            Vector{datatype}(undef, (group_n_rows * tile_size + shared_comm_size - 1) ÷ shared_comm_size * tile_size)
+    else
+        # Do not need this buffer
+        factorization_local_left_panel_buffer = zeros(datatype, 0)
+    end
     factorization_pivoting_reduction_buffer = allocate_shared_float(tile_size * group_K
                                                                     * tile_size)
     factorization_pivoting_reduction_indices = allocate_shared_int(tile_size * group_K * shared_comm_size)
@@ -100,6 +107,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
             factorization_matrix_storage, factorization_matrix_parts,
             factorization_matrix_parts_row_ranges, factorization_matrix_parts_col_ranges,
             factorization_locally_owned_rows, factorization_pivoting_buffer,
+            factorization_local_left_panel_buffer,
             factorization_pivoting_reduction_buffer,
             factorization_pivoting_reduction_indices, factorization_row_swap_buffers,
             comm_requests)
@@ -732,6 +740,7 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
         matrix_parts = A_lu.factorization_matrix_parts
         group_K = A_lu.group_K
         group_L = A_lu.group_L
+        shared_comm_size = A_lu.shared_comm_size
         synchronize_shared = A_lu.synchronize_shared
 
         panel_group_row, panel_k = divrem(panel - 1, group_K) .+ 1
@@ -762,6 +771,7 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
         row_buffers = A_lu.factorization_row_swap_buffers
         # Can reuse this buffer as a column buffer, as it is big enough.
         col_buffers = A_lu.factorization_pivoting_buffer
+        local_col_buffer_storage = A_lu.factorization_local_left_panel_buffer
 
         first_panel_col = (panel_group_col - 1) * tile_size + 1
         last_panel_col = min(panel_group_col * tile_size, size(matrix_storage, 2))
@@ -864,10 +874,10 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
             shared_local_row_range, row_offset = get_shared_local_row_range(A_lu, first_storage_row)
 
             if length(shared_local_row_range) > 0
-                n_rows = length(shared_local_row_range)
+                n_local_rows = length(shared_local_row_range)
+                n_rows = size(matrix_storage, 1) - first_storage_row + 1
                 n_cols = last_storage_col - first_storage_col + 1
-                buffer_size = n_rows * n_cols
-                buffer_offset = row_offset * n_cols
+                buffer_size = n_local_rows * n_cols
 
                 # Copy matrix entries into contiguous buffer to improve efficiency.
                 # Use a transposed buffer here so that the storage is row-major, and the parts
@@ -875,26 +885,34 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
                 # `shared_comm` concatenate together correctly to give the complete 'below
                 # diagonal sub-column'.
                 col_buffer =
-                    transpose(reshape(@view(col_buffers[buffer_offset+1:buffer_offset+buffer_size]),
-                                      n_cols, n_rows))
+                    @view(reshape(@view(col_buffers[1:n_rows*n_cols]),
+                                  n_rows, n_cols)[row_offset+1:row_offset+n_local_rows,:])
+                if shared_comm_size > 1
+                    # Need a local buffer which is contiguous in memory to copy into, because
+                    # trsm!() cannot handle the non-contiguous col_buffer.
+                    local_col_buffer = reshape(@view(local_col_buffer_storage[1:buffer_size]),
+                                               n_local_rows, n_cols)
+                else
+                    # No shared memory parallelism, so we do not split up col_buffer here, so
+                    # there is no need for local buffers.
+                    local_col_buffer = col_buffer
+                end
 
                 local_below_diagonal_sub_column =
                     @view matrix_storage[shared_local_row_range,
                                          first_storage_col:last_storage_col]
 
-                col_buffer .= local_below_diagonal_sub_column
+                local_col_buffer .= local_below_diagonal_sub_column
 
                 # Need to solve M*U=A for M, where A are the original matrix elements of the
                 # sub-column, and U is the upper-triangular factor of the diagonal sub-tile.
-                # However, as col_buffer is transposed, and `trsm!()` does not support 'M'
-                # being transposed, we need to transpose the whole equation to U'*M'=A'. We
-                # then tell trsm! that U' is transposed (the 'T' third argument) while M' and
-                # A' are the 'transposed' version of col_buffer, but as col_buffer itself is a
-                # 'transpose', they are contiguous, column-major, arrays.
-                trsm!('L', 'U', 'T', 'N', 1.0, diagonal_sub_tile, transpose(col_buffer))
+                trsm!('R', 'U', 'N', 'N', 1.0, diagonal_sub_tile, local_col_buffer)
 
-                # Copy buffer back into matrix storage.
-                local_below_diagonal_sub_column .= col_buffer
+                # Copy buffer back into shared_storage and matrix storage.
+                if shared_comm_size > 1
+                    col_buffer .= local_col_buffer
+                end
+                local_below_diagonal_sub_column .= local_col_buffer
             end
         end
 
@@ -996,11 +1014,9 @@ function update_bottom_right_block!(A_lu, panel)
         left_panel_n_cols = left_panel_last_storage_col - left_panel_first_storage_col + 1
         left_panel_buffer_size = left_panel_n_rows * left_panel_n_cols
 
-        # Use a transposed buffer to match the column buffer used in
-        # `update_sub_panel_off_diagonals!()`.
         left_panel_buffer =
-            transpose(reshape(@view(col_buffers[1:left_panel_buffer_size]),
-                              left_panel_n_cols, left_panel_n_rows))
+            reshape(@view(col_buffers[1:left_panel_buffer_size]), left_panel_n_rows,
+                    left_panel_n_cols)
 
         # Locally-owned rows/column to be copied into row_buffer
         top_panel_first_storage_row = (panel_group_row - 1) * tile_size + 1
