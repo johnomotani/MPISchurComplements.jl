@@ -15,7 +15,7 @@ function main()
     # fully parallelised.
     BLAS.set_num_threads(1)
 
-    for n_shared ∈ [prod(x) for x ∈ unique(combinations(factor(Vector, nproc)))]
+    for n_shared ∈ reverse([prod(x) for x ∈ unique(combinations(factor(Vector, nproc)))])
         for n ∈ matrix_sizes
             if nproc ≤ 3 && n > 4096
                 continue
