@@ -132,11 +132,12 @@ contains
     ! the true wall-clock time for the slowest (critical-path) process.
     ! Per-RHS solve times are stored in t_trisolve_arr; statistics are
     ! derived from that array after the loop.
-    real(kind=8) :: t0, t1
-    real(kind=8) :: t_factorisation_local, t_factorisation
-    real(kind=8) :: t_trisolve_local
-    real(kind=8), allocatable :: t_trisolve_arr(:)  ! (nrhs_total)
+    real(kind=8) :: t0, t1, t2, t3
+    real(kind=8) :: t_factorisation, t_matrix_scatter
+    real(kind=8) :: t_trisolve_local, t_vector_scatter_gather_local
+    real(kind=8), allocatable :: t_trisolve_arr(:), t_vector_scatter_gather_arr(:)  ! (nrhs_total)
     real(kind=8) :: t_trisolve_min, t_trisolve_mean, t_trisolve_max
+    real(kind=8) :: t_vector_scatter_gather_min, t_vector_scatter_gather_mean, t_vector_scatter_gather_max
 
     ! ---- BLAS thread count ------------------------------------------ !
     ! There is no standard API for this; we probe vendor environment
@@ -331,8 +332,10 @@ contains
         allocate(A_local(max(1, loc_rows_A), max(1, loc_cols_A)))
         allocate(b_local(max(1, loc_rows_b)))
         allocate(t_trisolve_arr(nrhs_total))
+        allocate(t_vector_scatter_gather_arr(nrhs_total))
         A_local = 0.0d0
         t_trisolve_arr = 1.0d20 ! Initialise to some ridiculously large value, so we can use min() sensibly below
+        t_vector_scatter_gather_arr = 1.0d20 ! Initialise to some ridiculously large value, so we can use min() sensibly below
 
         ! ================================================================= !
         ! Step 7 – build ScaLAPACK array descriptors
@@ -363,6 +366,7 @@ contains
         ! ================================================================= !
         call pdgemr2d(n, n, A_global, 1, 1, desc_A_global, &
             A_local,  1, 1, desc_A,         ictxt_global)
+        t1 = MPI_Wtime()
 
         ! ================================================================= !
         ! Step 9 – LU factorisation: pdgetrf  (done once for all RHS)
@@ -375,8 +379,9 @@ contains
         call pdgetrf(n, n, A_local, 1, 1, desc_A, ipiv, info)
 
         call MPI_Barrier(MPI_COMM_WORLD, mpi_err)
-        t1 = MPI_Wtime()
-        t_factorisation = t1 - t0
+        t2 = MPI_Wtime()
+        t_matrix_scatter = t1 - t0
+        t_factorisation = t2 - t0
 
         if (info /= 0) then
           if (my_rank == 0) then
@@ -418,6 +423,7 @@ contains
               call pdgemr2d(n, 1, B_global(1, irhs), 1, 1, desc_b_global, &
                   b_local,            1, 1, desc_b,         ictxt_global)
             end if
+            t1 = MPI_Wtime()
 
             call pdgetrs('N', n, nrhs_one, A_local, 1, 1, desc_A, ipiv, &
                 b_local, 1, 1, desc_b, info)
@@ -429,6 +435,7 @@ contains
               call MPI_Abort(MPI_COMM_WORLD, 1, mpi_err)
             end if
 
+            t2 = MPI_Wtime()
             ! -- gather solution to rank 0 and print ------------------------- !
             if (my_rank == 0) then
               call pdgemr2d(n, 1, b_local,  1, 1, desc_b,       &
@@ -443,13 +450,15 @@ contains
                   b_local,  1, 1, desc_b_global, ictxt_global)
             end if
 
-            t1 = MPI_Wtime()
-            t_trisolve_local = t1 - t0
+            t3 = MPI_Wtime()
+            t_trisolve_local = t3 - t0
+            t_vector_scatter_gather_local = (t1 - t0) + (t3 - t2)
 
             ! -- just take time on rank 0, as that is where solution is ------ !
             ! -- gathered to, and take minimum over repeats to minimise system !
             ! -- noise effect ------------------------------------------------ !
             t_trisolve_arr(irhs) = min(t_trisolve_arr(irhs), t_trisolve_local)
+            t_vector_scatter_gather_arr(irhs) = min(t_vector_scatter_gather_arr(irhs), t_vector_scatter_gather_local)
 
           end do   ! irhs
         end do   ! irepeatrhs
@@ -464,6 +473,9 @@ contains
           t_trisolve_min  = minval(t_trisolve_arr)
           t_trisolve_max  = maxval(t_trisolve_arr)
           t_trisolve_mean = sum(t_trisolve_arr) / real(nrhs_total, kind=8)
+          t_vector_scatter_gather_min  = minval(t_vector_scatter_gather_arr)
+          t_vector_scatter_gather_max  = maxval(t_vector_scatter_gather_arr)
+          t_vector_scatter_gather_mean = sum(t_vector_scatter_gather_arr) / real(nrhs_total, kind=8)
         end if
 
         ! ================================================================= !
@@ -475,14 +487,16 @@ contains
           write(*,'(A)') "Timing summary (wall-clock):"
           write(*,'(A,ES12.4,A)') &
               "  LU factorisation  (pdgetrf)       : ", t_factorisation,  " s"
+          write(*,'(A,ES12.4,A)') &
+              "  of which the matrix scatter is    : ", t_matrix_scatter,  " s"
           write(*,'(A,I0,A)') &
               "  Triangular solve  (pdgetrs, n=", nrhs_total, " RHS):"
-          write(*,'(A,ES12.4,A)') &
-              "    min  : ", t_trisolve_min,  " s"
-          write(*,'(A,ES12.4,A)') &
-              "    mean : ", t_trisolve_mean, " s"
-          write(*,'(A,ES12.4,A)') &
-              "    max  : ", t_trisolve_max,  " s"
+          write(*,'(A,ES12.4,A,ES12.4,A)') &
+              "    min  : ", t_trisolve_min,  " s of which scatter/gather is ", t_vector_scatter_gather_min, " s"
+          write(*,'(A,ES12.4,A,ES12.4,A)') &
+              "    mean : ", t_trisolve_mean, " s of which scatter/gather is ", t_vector_scatter_gather_mean, " s"
+          write(*,'(A,ES12.4,A,ES12.4,A)') &
+              "    max  : ", t_trisolve_max,  " s of which scatter/gather is ", t_vector_scatter_gather_max, " s"
           write(*,'(A,ES12.4,A)') &
               "  Total (factorisation + mean solve) : ", &
               t_factorisation + t_trisolve_mean, " s"
@@ -502,7 +516,7 @@ contains
 
         end if
 
-        deallocate(A_local, b_local, ipiv, t_trisolve_arr)
+        deallocate(A_local, b_local, ipiv, t_trisolve_arr, t_vector_scatter_gather_arr)
       end do ! irepeatmat
     end do ! itile
 
