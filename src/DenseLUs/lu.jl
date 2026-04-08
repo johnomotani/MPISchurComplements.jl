@@ -311,11 +311,14 @@ function generate_pivots!(A_lu, panel)
 
         if shared_comm_rank == 0
             candidate_pivot_indices = @view pivoting_reduction_indices[1:n_active_shared_procs*this_tile_size-last_proc_missing_rows]
-            if n_active_shared_procs == 0
+            if n_active_shared_procs == 1
                 # Only this process did any work in the previous step, so no need to re-do LU
                 # factorization here.
-                local_pivot_indices = candidate_pivot_indices
+                local_panel_pivot_indices = shared_local_pivot_indices
+                local_pivot_indices =
+                    candidate_pivot_indices[1:min(this_tile_size,length(candidate_pivot_indices))]
                 global_pivot_indices = locally_owned_rows[local_pivot_indices]
+                lu_panel_buffer = this_lu_panel_buffer
             else
                 n_buffer_rows = length(candidate_pivot_indices)
                 # Construct a reshaped view so that lu_panel_buffer is a contiguously-allocated
@@ -347,113 +350,126 @@ function generate_pivots!(A_lu, panel)
                 global_pivot_indices = locally_owned_rows[local_pivot_indices]
             end
 
-            # Collect all the local pivot rows and indices onto the
-            # `panel_k` block.
-            if group_k == panel_k
-                n_rows_from_k = [get_n_rows_from_k(k, panel_k, panel_group_row, group_K,
-                                                   length(local_panel_pivot_indices),
-                                                   n_tiles, m, tile_size)
-                                 for k ∈ 1:group_K]
-                k_rows_end = cumsum(n_rows_from_k)
-                n_reduced_rows = k_rows_end[end]
-                n_cols = last_local_col - first_local_col + 1
-                reduced_buffer =
-                    reshape(@view(pivoting_reduction_buffer[1:n_reduced_rows*n_cols]),
-                            n_reduced_rows, n_cols)
-                reduced_row_indices = @view pivoting_reduction_indices[1:n_reduced_rows]
+            if group_K == 1
+                # All rows are local to the block, so no need for further reduction or
+                # factorisation.
+                sub_column_pivot_indices = @view pivoting_reduction_indices[1:this_tile_size]
+                sub_column_pivot_indices .= global_pivot_indices
 
-                # Post receives for the rows and row indices from other blocks.
-                req_counter = 0
-                for k ∈ 1:group_K
-                    if k == group_k
-                        # This rank does not need to communicate with itself!
-                        continue
-                    end
-                    if n_rows_from_k[k] == 0
-                        # No rows to colect
-                        continue
-                    end
-                    # Each rank in this column is offset from the next/previous in the
-                    # distributed communicator `distributed_comm` by 1.
-                    rank_k = distributed_comm_rank + (k - group_k)
-                    if k == 1
-                        first_row = 1
-                    else
-                        first_row = k_rows_end[k-1] + 1
-                    end
-                    k_counter = 0
-                    for row ∈ first_row:k_rows_end[k]
+                # For use later, need the factorized diagonal tile.
+                reduced_buffer =
+                    reshape(@view(pivoting_reduction_buffer[1:this_tile_size^2]),
+                            this_tile_size, this_tile_size)
+                @views reduced_buffer .= lu_panel_buffer[1:this_tile_size,1:this_tile_size]
+            else
+                # Collect all the local pivot rows and indices onto the
+                # `panel_k` block.
+                if group_k == panel_k
+                    n_rows_from_k = [get_n_rows_from_k(k, panel_k, panel_group_row, group_K,
+                                                       length(local_panel_pivot_indices),
+                                                       n_tiles, m, tile_size)
+                                     for k ∈ 1:group_K]
+                    k_rows_end = cumsum(n_rows_from_k)
+                    n_reduced_rows = k_rows_end[end]
+                    reduced_buffer =
+                        reshape(@view(pivoting_reduction_buffer[1:n_reduced_rows*this_tile_size]),
+                                n_reduced_rows, this_tile_size)
+                    reduced_row_indices = @view pivoting_reduction_indices[1:n_reduced_rows]
+
+                    # Post receives for the rows and row indices from other blocks.
+                    req_counter = 0
+                    for k ∈ 1:group_K
+                        if k == group_k
+                            # This rank does not need to communicate with itself!
+                            continue
+                        end
+                        if n_rows_from_k[k] == 0
+                            # No rows to colect
+                            continue
+                        end
+                        # Each rank in this column is offset from the next/previous in the
+                        # distributed communicator `distributed_comm` by 1.
+                        rank_k = distributed_comm_rank + (k - group_k)
+                        if k == 1
+                            first_row = 1
+                        else
+                            first_row = k_rows_end[k-1] + 1
+                        end
+                        k_counter = 0
+                        for row ∈ first_row:k_rows_end[k]
+                            k_counter += 1
+                            reqs[req_counter+=1] =
+                                MPI.Irecv!(@view(reduced_buffer[row,:]), distributed_comm;
+                                           source=rank_k, tag=k_counter)
+                        end
                         k_counter += 1
                         reqs[req_counter+=1] =
-                            MPI.Irecv!(@view(reduced_buffer[row,:]), distributed_comm;
-                                       source=rank_k, tag=k_counter)
+                            MPI.Irecv!(@view(reduced_row_indices[first_row:k_rows_end[k]]),
+                                       distributed_comm; source=rank_k, tag=k_counter)
                     end
-                    k_counter += 1
-                    reqs[req_counter+=1] =
-                        MPI.Irecv!(@view(reduced_row_indices[first_row:k_rows_end[k]]),
-                                   distributed_comm; source=rank_k, tag=k_counter)
-                end
 
-                # Copy in the local contributions
-                k = group_k
-                if group_k == 1
-                    first_row = 1
-                else
-                    first_row = k_rows_end[k-1]+1
-                end
-                @views reduced_buffer[first_row:k_rows_end[k],:] .=
-                    matrix_storage[local_pivot_indices,first_local_col:last_local_col]
-                @views reduced_row_indices[first_row:k_rows_end[k]] .= global_pivot_indices
+                    # Copy in the local contributions
+                    k = group_k
+                    if group_k == 1
+                        first_row = 1
+                    else
+                        first_row = k_rows_end[k-1]+1
+                    end
+                    @views reduced_buffer[first_row:k_rows_end[k],:] .=
+                        matrix_storage[local_pivot_indices,first_local_col:last_local_col]
+                    @views reduced_row_indices[first_row:k_rows_end[k]] .= global_pivot_indices
 
-                MPI.Waitall(reqs[1:req_counter])
+                    MPI.Waitall(reqs[1:req_counter])
 
-                # Do an LU factorization on the reduced rows. This gives the final pivot
-                # indices, and also the (section_width,section_width) top-left block of the LU
-                # factors.
-                local_lu = lu!(reduced_buffer)
-                buffer_pivot_indices = ipiv2perm_truncated(local_lu.ipiv, n_reduced_rows,
-                                                           n_cols)
-                # Is OK to re-use the pivoting_reduction_indices buffer, as we are already
-                # finished with `reduced_row_indices`.
-                # The pivot indices stored in this buffer will be broadcast to all ranks in
-                # `apply_pivots_from_sub_column!()`.
-                sub_column_pivot_indices = @view pivoting_reduction_indices[1:this_tile_size]
-                sub_column_pivot_indices .= reduced_row_indices[buffer_pivot_indices]
+                    # Do an LU factorization on the reduced rows. This gives the final pivot
+                    # indices, and also the (section_width,section_width) top-left block of the LU
+                    # factors.
+                    local_lu = lu!(reduced_buffer)
+                    buffer_pivot_indices = ipiv2perm_truncated(local_lu.ipiv, n_reduced_rows,
+                                                               this_tile_size)
+                    # Is OK to re-use the pivoting_reduction_indices buffer, as we are already
+                    # finished with `reduced_row_indices`.
+                    # The pivot indices stored in this buffer will be broadcast to all ranks in
+                    # `apply_pivots_from_sub_column!()`.
+                    sub_column_pivot_indices = @view pivoting_reduction_indices[1:this_tile_size]
+                    sub_column_pivot_indices .= reduced_row_indices[buffer_pivot_indices]
 
-                # For use later, only need the factorized diagonal tile. This is contained in
-                # reduced_buffer, but not contiguously, as reduced_buffer can contain more
-                # than just the diagonal tile. Therefore copy the first n_cols rows from each
-                # column into contiguous storage at the beginning of reduced_buffer.
-                # Note that we copy the entries in a loop rather than copying all the entries
-                # from each column in a broadcast operation because it can happen that the
-                # number of rows is less than 2*n_cols, in which case the source and
-                # destination of the copy would overlap, which might (?) cause problems. This
-                # operation should not be a significant computational cost, so no need to
-                # super-optimize.
-                if size(reduced_buffer, 1) > n_cols
-                    linear_index = n_cols
-                    for col in 2:n_cols
-                        for row in 1:n_cols
-                            reduced_buffer[linear_index+=1] = reduced_buffer[row,col]
+                    # For use later, only need the factorized diagonal tile. This is contained in
+                    # reduced_buffer, but not contiguously, as reduced_buffer can contain more
+                    # than just the diagonal tile. Therefore copy the first this_tile_size
+                    # rows from each column into contiguous storage at the beginning of
+                    # reduced_buffer.  Note that we copy the entries in a loop rather than
+                    # copying all the entries from each column in a broadcast operation
+                    # because it can happen that the number of rows is less than
+                    # 2*this_tile_size, in which case the source and destination of the
+                    # copy would overlap, which might (?) cause problems. This operation
+                    # should not be a significant computational cost, so no need to
+                    # super-optimize.
+                    if size(reduced_buffer, 1) > this_tile_size
+                        linear_index = this_tile_size
+                        for col in 2:this_tile_size
+                            for row in 1:this_tile_size
+                                reduced_buffer[linear_index+=1] = reduced_buffer[row,col]
+                            end
                         end
                     end
-                end
-            else
-                # Get the local pivot rows ready for collection.
-                if length(local_pivot_indices) > 0
-                    collecting_rank = (panel_l - 1) * group_K + panel_k - 1
-                    req_counter = 0
-                    for row ∈ local_pivot_indices
+                else
+                    # Get the local pivot rows ready for collection.
+                    if length(local_pivot_indices) > 0
+                        collecting_rank = (panel_l - 1) * group_K + panel_k - 1
+                        req_counter = 0
+                        for row ∈ local_pivot_indices
+                            req_counter += 1
+                            reqs[req_counter] =
+                                MPI.Isend(@view(matrix_storage[row,first_local_col:last_local_col]),
+                                          distributed_comm; dest=collecting_rank, tag=req_counter)
+                        end
                         req_counter += 1
                         reqs[req_counter] =
-                            MPI.Isend(@view(matrix_storage[row,first_local_col:last_local_col]),
-                                      distributed_comm; dest=collecting_rank, tag=req_counter)
+                            MPI.Isend(global_pivot_indices, distributed_comm;
+                                      dest=collecting_rank, tag=req_counter)
+                        MPI.Waitall(reqs[1:req_counter])
                     end
-                    req_counter += 1
-                    reqs[req_counter] =
-                        MPI.Isend(global_pivot_indices, distributed_comm;
-                                  dest=collecting_rank, tag=req_counter)
-                    MPI.Waitall(reqs[1:req_counter])
                 end
             end
         end
