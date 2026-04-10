@@ -16,7 +16,7 @@ import LinearAlgebra: lu!, ldiv!
     m::Int64
     n::Int64
     factors::Tmat
-    row_permutation::Vector{Int64}
+    col_permutation::Vector{Int64}
     group_K::Int64
     group_L::Int64
     group_k::Int64
@@ -25,15 +25,15 @@ import LinearAlgebra: lu!, ldiv!
     factorization_matrix_parts::Tfmp
     factorization_matrix_parts_row_ranges::Vector{UnitRange{Int64}}
     factorization_matrix_parts_col_ranges::Vector{UnitRange{Int64}}
-    factorization_locally_owned_rows::Vector{Int64}
+    factorization_locally_owned_cols::Vector{Int64}
     factorization_pivoting_buffer::Tvec
-    factorization_local_left_panel_buffer::Vector{T}
+    factorization_local_top_panel_buffer::Vector{T}
     factorization_pivoting_reduction_buffer::Tvec
     factorization_pivoting_reduction_indices::Tintvec
-    factorization_source_rows::Vector{Int64}
-    factorization_locally_owned_swap_rows::Vector{Int64}
+    factorization_source_cols::Vector{Int64}
+    factorization_locally_owned_swap_cols::Vector{Int64}
     factorization_source_swap_labels::Vector{Int64}
-    factorization_row_swap_buffers::Tmat
+    factorization_col_swap_buffers::Tmat
     factorization_swap_flags::Vector{UInt8}
     comm_requests::Vector{MPI.Request}
     my_L_tiles::Array{T,3}

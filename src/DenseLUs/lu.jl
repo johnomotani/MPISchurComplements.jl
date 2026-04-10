@@ -30,9 +30,9 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
     factors = allocate_shared_float(m, n)
 
     if shared_comm_rank == 0
-        row_permutation = zeros(Int64, m)
+        col_permutation = zeros(Int64, m)
     else
-        row_permutation = zeros(Int64, 0)
+        col_permutation = zeros(Int64, 0)
     end
 
     # Each block owns a set of (tile_size,tile_size) tiles in the full matrix - the last
@@ -72,8 +72,8 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
                                              for group_row ∈ 1:group_n_rows]
     factorization_matrix_parts_col_ranges = [get_col_range(group_col)
                                              for group_col ∈ 1:group_n_cols]
-    factorization_locally_owned_rows = vcat((collect(r) for r ∈
-                                             factorization_matrix_parts_row_ranges)...)
+    factorization_locally_owned_cols = vcat((collect(c) for c ∈
+                                             factorization_matrix_parts_col_ranges)...)
 
     # Store the locally-owned parts of the array in a joined-together 2D array
     # `factorization_matrix_storage`. This will be useful for some operations.
@@ -87,36 +87,35 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
                                             (group_col-1)*tile_size+1:min(group_col*tile_size,local_storage_n)])
          for group_row ∈ 1:group_n_rows, group_col ∈ 1:group_n_cols]
 
-    factorization_pivoting_buffer = allocate_shared_float(group_n_rows * tile_size *
+    factorization_pivoting_buffer = allocate_shared_float(group_n_cols * tile_size *
                                                           tile_size)
     if shared_comm_size > 1
-        factorization_local_left_panel_buffer =
-            Vector{datatype}(undef, (group_n_rows * tile_size + shared_comm_size - 1) ÷ shared_comm_size * tile_size)
+        factorization_local_top_panel_buffer =
+            Vector{datatype}(undef, (group_n_cols * tile_size + shared_comm_size - 1) ÷ shared_comm_size * tile_size)
     else
         # Do not need this buffer
-        factorization_local_left_panel_buffer = zeros(datatype, 0)
+        factorization_local_top_panel_buffer = zeros(datatype, 0)
     end
-    factorization_pivoting_reduction_buffer = allocate_shared_float(tile_size * group_K
+    factorization_pivoting_reduction_buffer = allocate_shared_float(tile_size * group_L
                                                                     * tile_size)
     factorization_pivoting_reduction_indices =
-        allocate_shared_int(max(tile_size * group_K * shared_comm_size, 2 * tile_size))
-    factorization_source_rows = zeros(Int64, 2 * tile_size)
-    factorization_locally_owned_swap_rows = zeros(Int64, 2 * tile_size)
+        allocate_shared_int(max(tile_size * group_L * shared_comm_size, 2 * tile_size))
+    factorization_source_cols = zeros(Int64, 2 * tile_size)
+    factorization_locally_owned_swap_cols = zeros(Int64, 2 * tile_size)
     factorization_source_swap_labels = zeros(Int64, 2 * tile_size)
-    factorization_row_swap_buffers = allocate_shared_float(local_storage_n, tile_size)
+    factorization_col_swap_buffers = allocate_shared_float(local_storage_m, tile_size)
     factorization_swap_flags = zeros(UInt8, 2 * tile_size)
     comm_requests = [MPI.REQUEST_NULL for _ ∈
-                     1:max((1 + tile_size) * group_K, group_K + group_L, 2 * tile_size)]
+                     1:max((1 + tile_size) * group_L, group_K + group_L, 2 * tile_size)]
 
-    return (; factors, row_permutation, group_K, group_L, group_k, group_l,
+    return (; factors, col_permutation, group_K, group_L, group_k, group_l,
             factorization_matrix_storage, factorization_matrix_parts,
             factorization_matrix_parts_row_ranges, factorization_matrix_parts_col_ranges,
-            factorization_locally_owned_rows, factorization_pivoting_buffer,
-            factorization_local_left_panel_buffer,
-            factorization_pivoting_reduction_buffer,
-            factorization_pivoting_reduction_indices, factorization_source_rows,
-            factorization_locally_owned_swap_rows, factorization_source_swap_labels,
-            factorization_row_swap_buffers, factorization_swap_flags, comm_requests)
+            factorization_locally_owned_cols, factorization_pivoting_buffer,
+            factorization_local_top_panel_buffer, factorization_pivoting_reduction_buffer,
+            factorization_pivoting_reduction_indices, factorization_source_cols,
+            factorization_locally_owned_swap_cols, factorization_source_swap_labels,
+            factorization_col_swap_buffers, factorization_swap_flags, comm_requests)
 end
 
 function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
@@ -127,9 +126,9 @@ function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
 
         redistribute_matrix!(A_lu, A)
 
-        # Initialize row_permutation, which will be permuted as we generate the pivots.
+        # Initialize col_permutation, which will be permuted as we generate the pivots.
         if shared_comm_rank == 0
-            A_lu.row_permutation .= 1:A_lu.m
+            A_lu.col_permutation .= 1:A_lu.n
         end
 
         for panel ∈ 1:n_tiles
