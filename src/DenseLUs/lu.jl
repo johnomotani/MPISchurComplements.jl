@@ -897,7 +897,7 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
 
         panel_group_row, panel_k = divrem(panel - 1, group_K) .+ 1
         panel_group_col, panel_l = divrem(panel - 1, group_L) .+ 1
-        diagonal_distributed_rank = (panel_l - 1) * group_K + panel_k - 1
+        diagonal_distributed_rank = (panel_k - 1) * group_L + panel_l - 1
         if panel == n_tiles
             # No remaining matix to update, so no need for communication or off-diagonal
             # update. Only need to copy LU-factorized block into matrx_storage
