@@ -485,15 +485,13 @@ function apply_pivots_from_sub_row!(A_lu, panel)
         first_global_row = (panel - 1) * tile_size + 1
         last_global_row = min(panel * tile_size, n)
         this_tile_size = last_global_row - first_global_row + 1
-        local_diagonal_tile_offset = (panel_group_col - 1) * tile_size
-        owning_rank_diag = (panel_k - 1) * group_L + panel_l - 1
+        owning_rank_diag = (group_k - 1) * group_L + panel_l - 1
 
         # Broadcast the pivot indices for this sub column to all ranks.
         sub_row_pivot_indices = @view A_lu.factorization_pivoting_reduction_indices[1:this_tile_size]
         if shared_comm_rank == 0
-            diagonal_distributed_rank = (panel_l - 1) * group_K + panel_k - 1
-            MPI.Bcast!(sub_row_pivot_indices, distributed_comm;
-                       root=diagonal_distributed_rank)
+            owning_rank_diag = (panel_k - 1) * group_L + panel_l - 1
+            MPI.Bcast!(sub_row_pivot_indices, distributed_comm; root=owning_rank_diag)
         end
 
         # As this function is just array copies and communication, we do not use any
