@@ -31,7 +31,7 @@ import LinearAlgebra: lu!, ldiv!
     factorization_pivoting_reduction_buffer::Tvec
     factorization_pivoting_reduction_indices::Tintvec
     factorization_source_cols::Vector{Int64}
-    factorization_locally_owned_swap_cols::Vector{Int64}
+    factorization_panel_row_owned_swap_cols::Vector{Int64}
     factorization_source_swap_labels::Vector{Int64}
     factorization_col_swap_buffers::Tmat
     factorization_swap_flags::Vector{UInt8}

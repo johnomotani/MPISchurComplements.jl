@@ -96,7 +96,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
     factorization_pivoting_reduction_indices =
         allocate_shared_int(max(tile_size * group_L * shared_comm_size, 2 * tile_size))
     factorization_source_cols = zeros(Int64, 2 * tile_size)
-    factorization_locally_owned_swap_cols = zeros(Int64, 2 * tile_size)
+    factorization_panel_row_owned_swap_cols = zeros(Int64, 2 * tile_size)
     factorization_source_swap_labels = zeros(Int64, 2 * tile_size)
     factorization_col_swap_buffers = allocate_shared_float(local_storage_m, tile_size)
     factorization_swap_flags = zeros(UInt8, 2 * tile_size)
@@ -109,7 +109,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
             factorization_locally_owned_cols, factorization_pivoting_buffer,
             factorization_jpiv, factorization_pivoting_reduction_buffer,
             factorization_pivoting_reduction_indices, factorization_source_cols,
-            factorization_locally_owned_swap_cols, factorization_source_swap_labels,
+            factorization_panel_row_owned_swap_cols, factorization_source_swap_labels,
             factorization_col_swap_buffers, factorization_swap_flags, comm_requests)
 end
 
@@ -485,7 +485,8 @@ function apply_pivots_from_sub_row!(A_lu, panel)
         first_global_row = (panel - 1) * tile_size + 1
         last_global_row = min(panel * tile_size, n)
         this_tile_size = last_global_row - first_global_row + 1
-        owning_rank_diag = (group_k - 1) * group_L + panel_l - 1
+        local_panel_column_offset = (panel_group_col - 1) * tile_size
+        owning_rank_panel_column = (group_k - 1) * group_L + panel_l - 1
 
         # Broadcast the pivot indices for this sub column to all ranks.
         sub_row_pivot_indices = @view A_lu.factorization_pivoting_reduction_indices[1:this_tile_size]
@@ -497,86 +498,84 @@ function apply_pivots_from_sub_row!(A_lu, panel)
         # As this function is just array copies and communication, we do not use any
         # shared-memory parallelism.
         if shared_comm_rank == 0
-            diagonal_block_indices = (panel-1)*tile_size+1:min(panel*tile_size, n)
-            first_diag = diagonal_block_indices[1]
-            last_diag = diagonal_block_indices[end]
+            panel_column_indices = (panel-1)*tile_size+1:min(panel*tile_size, n)
+            last_panel_column = panel_column_indices[end]
 
-            # By default, just send the column from the diagonal block back to the
-            # original position of the 'pivot column' that is being moved into the
-            # diagonal block.  However, if the column in the diagonal block is itself a
-            # 'pivot column', then we need to send it to the correct position within the
-            # diagonal block. Here we set up `diagonal_block_col_destination_indices` with
-            # the position where each column of the diagonal block should be sent to.
+            # By default, just send the column from the panel column back to the original
+            # position of the 'pivot column' that is being moved into the panel column.
+            # However, if the column in the panel column is itself a 'pivot column', then
+            # we need to send it to the correct position within the panel column. Here we
+            # set up `panel_col_destination_indices` with the position where each column
+            # of the panel column should be sent to.
             sorted_pivot_indices = sort(sub_row_pivot_indices)
 
-            # All pivot indices are in or right of the first column of the diagonal block,
-            # so we can find the indices that are within the diagonal block from the first
+            # All pivot indices are in or right of the first column of the panel column,
+            # so we can find the indices that are within the panel column from the first
             # entries of the sorted list of pivot indices.
-            split_ind = searchsortedlast(sorted_pivot_indices, last_diag)
-            pivot_indices_inside_diagonal_block = sorted_pivot_indices[1:split_ind]
-            pivot_indices_outside_diagonal_block = sorted_pivot_indices[split_ind+1:end]
-            outside_diagonal_block_counter = 1
+            split_ind = searchsortedlast(sorted_pivot_indices, last_panel_column)
+            pivot_indices_inside_panel_column = sorted_pivot_indices[1:split_ind]
+            pivot_indices_outside_panel_column = sorted_pivot_indices[split_ind+1:end]
+            outside_panel_column_counter = 1
 
-            diagonal_block_col_destination_indices = copy(sub_row_pivot_indices)
+            panel_col_destination_indices = copy(sub_row_pivot_indices)
             for i ∈ 1:length(sub_row_pivot_indices)
-                diag_index = diagonal_block_indices[i]
-                if diag_index ∈ pivot_indices_inside_diagonal_block
-                    # Pivot destination of this column is within the diagonal block, so
-                    # send it directly.
-                    i2 = findfirst(isequal(diag_index), sub_row_pivot_indices)
-                    diagonal_block_col_destination_indices[i] = diagonal_block_indices[i2]
+                panel_index = panel_column_indices[i]
+                if panel_index ∈ pivot_indices_inside_panel_column
+                    # Pivot destination of this column is within the panel_column, so send
+                    # it directly.
+                    i2 = findfirst(isequal(panel_index), sub_row_pivot_indices)
+                    panel_col_destination_indices[i] = panel_column_indices[i2]
                 else
                     # The destination of this column must be set to something that is
-                    # outside the diagonal block.
-                    diagonal_block_col_destination_indices[i] =
-                        pivot_indices_outside_diagonal_block[outside_diagonal_block_counter]
-                    outside_diagonal_block_counter += 1
+                    # outside the panel column block.
+                    panel_col_destination_indices[i] =
+                        pivot_indices_outside_panel_column[outside_panel_column_counter]
+                    outside_panel_column_counter += 1
                 end
             end
 
             # Permute the global pivot vector with the current panel's pivot indices.
-            diag_tile_global_inds = (panel-1)*tile_size+1:min(panel*tile_size,n)
-            diag_tile_unpermuted_inds = col_permutation[diag_tile_global_inds]
+            panel_col_global_inds = (panel-1)*tile_size+1:min(panel*tile_size,n)
+            panel_col_unpermuted_inds = col_permutation[panel_col_global_inds]
             pivot_cols_unpermuted_inds = col_permutation[sub_row_pivot_indices]
-            # Need to use diagonal_block_col_destination_indices to avoid errors when some of
-            # the pivot columns are within the diagonal block.
-            col_permutation[diagonal_block_col_destination_indices] .=
-                diag_tile_unpermuted_inds
-            col_permutation[diag_tile_global_inds] .= pivot_cols_unpermuted_inds
+            # Need to use panel_col_destination_indices to avoid errors when some of
+            # the pivot columns are within the panel column.
+            col_permutation[panel_col_destination_indices] .=
+                panel_col_unpermuted_inds
+            col_permutation[panel_col_global_inds] .= pivot_cols_unpermuted_inds
 
             # We aim to minimise the number of copy operations needed to complete the
             # effect of all column swaps from this panel. As we want only one set of MPI
             # communications, we cannot directly use `jpiv` as generated by
             # column_pivot_lu!(), as that would mean doing sequentially a set of column
             # swaps. Instead we have generated the complete set of sources and
-            # destinations of each diagonal column.  To make sure all operations are
-            # completed, we define a vector of flags for each diagonal column involved in
-            # the swaps (any off-diagonal columns owned by the diagonal-owning rank are
-            # always to be swapped to/from diagonal columns, and off-diagonal columns on
-            # other ranks the column must be both sent and received over MPI so in either
-            # case we do not need to track their states) where the flag can indicate that
-            # the buffer is not yet updated, has been emptied (into a column buffer or
-            # transferred to another column), or has been completed (final data has been
-            # transferred in, or no change is needed).
+            # destinations of each panel column.  To make sure all operations are
+            # completed, we define a vector of flags for each panel column involved in the
+            # swaps (any off-panel columns owned by the panel-owning rank are always to be
+            # swapped to/from panel columns, and off-panel columns on other ranks the
+            # column must be both sent and received over MPI so in either case we do not
+            # need to track their states) where the flag can indicate that the buffer is
+            # not yet updated, has been emptied (into a column buffer or transferred to
+            # another column), or has been completed (final data has been transferred in,
+            # or no change is needed).
             # We first set up the MPI communications that are needed:
             #   * For every column sent and/or received over MPI, copy the original data
             #     into a column buffer, then start an MPI.Isend of the data in the column
             #     buffer and/or an MPI.Irecv into the column.
-            #   * If this diagonal column receieves over MPI, mark column as completed, as
-            #     no other data needs to be transferred into the column, we only have to
-            #     wait for all MPI transfers to complete, which we will do at the end of
-            #     this function.
-            #   * If the diagonal column sends but does not receive, mark the column as
+            #   * If this panel column receieves over MPI, mark column as completed, as no
+            #     other data needs to be transferred into the column, we only have to wait
+            #     for all MPI transfers to complete, which we will do at the end of this
+            #     function.
+            #   * If the panel column sends but does not receive, mark the column as
             #     empty, as the data has been transferred out into the column buffer, but
             #     the column is not filled with the final data yet.
             #   * If the column has no MPI communications, but does not need any swap,
             #     mark as completed.
-            # In second and third passes that only involves the diagonal-owning rank, we
-            # transfer all the locally-owned data as needed. Second pass:
-            #   * Loop through the diagonal-tile columns until the first empty column is
-            #     found (restarting the loop on the following column after processing each
-            #     empty column). Note that columns outside the diagonal tile cannot be
-            #     'empty'.
+            # In second and third passes that only involves the panel-column-owning rank,
+            # we transfer all the locally-owned data as needed. Second pass:
+            #   * Loop through the panel columns until the first empty column is found
+            #     (restarting the loop on the following column after processing each empty
+            #     column). Note that columns outside the panel column cannot be 'empty'.
             #   * Starting from that first empty column, transfer the data from the
             #     'source' column into the empty column, and mark the column as
             #     'completed'. Since the source column is now empty, transfer data into
@@ -586,11 +585,11 @@ function apply_pivots_from_sub_row!(A_lu, panel)
             #     from `matrix_storage`).
             # After the second pass there are no empty columns, but it may be that there
             # are columns that are not 'complete' because they are part of a cycle of
-            # swaps among columns owned by the diagonal-owning rank. Therefore we need a
-            # third pass:
-            #   * Loop through the diagonal columns until the first incomplete column
+            # swaps among columns owned by the panel column owning rank. Therefore we need
+            # a third pass:
+            #   * Loop through the panel columns until the first incomplete column
             #     (restarting the loop from the column after this until there are no more
-            #     incomplete columns). Note that columns outside the diagonal tile cannot
+            #     incomplete columns). Note that columns outside the panel column cannot
             #     be 'incomplete'.
             #   * Copy the incomplete column into a column buffer (and mark it as
             #     complete), and save which column it is.  Copy the data from this columns
@@ -620,22 +619,22 @@ function apply_pivots_from_sub_row!(A_lu, panel)
             source_cols .= -1
             # We also need to record which locally-owned columns are involved in the
             # swaps.
-            locally_owned_swap_cols = A_lu.factorization_locally_owned_swap_cols
-            @views locally_owned_swap_cols[1:this_tile_size] .=
-                local_diagonal_tile_offset+1:local_diagonal_tile_offset+this_tile_size
-            @views locally_owned_swap_cols[this_tile_size+1:end] .= -1
-            n_off_diagonal_dest_cols = 0
+            panel_row_owned_swap_cols = A_lu.factorization_panel_row_owned_swap_cols
+            @views panel_row_owned_swap_cols[1:this_tile_size] .=
+                local_panel_column_offset+1:local_panel_column_offset+this_tile_size
+            @views panel_row_owned_swap_cols[this_tile_size+1:end] .= -1
+            n_off_panel_dest_cols = 0
 
-            for (iswap, (idiag, isource, idest)) ∈
-                    enumerate(zip(diagonal_block_indices, sub_row_pivot_indices,
-                                  diagonal_block_col_destination_indices))
-                if idiag == isource == idest
+            for (iswap, (ipanel, isource, idest)) ∈
+                    enumerate(zip(panel_column_indices, sub_row_pivot_indices,
+                                  panel_col_destination_indices))
+                if ipanel == isource == idest
                     # No swap to do.
                     swap_flags[iswap] = 0x0
                     continue
                 end
 
-                diag_tile_col_offset = (idiag - 1) % tile_size + 1
+                panel_col_offset = (ipanel - 1) % tile_size + 1
 
                 source_tile_col, source_tile_col_offset = divrem(isource - 1, tile_size) .+ 1
                 owning_rank_l_source = (source_tile_col - 1) % group_L
@@ -645,29 +644,29 @@ function apply_pivots_from_sub_row!(A_lu, panel)
                 owning_rank_l_dest = (dest_tile_col - 1) % group_L
                 owning_rank_dest = (group_k - 1) * group_L + owning_rank_l_dest
 
-                if distributed_comm_rank == owning_rank_diag == owning_rank_source == owning_rank_dest
+                if distributed_comm_rank == owning_rank_panel_column == owning_rank_source == owning_rank_dest
                     source_storage_col = ((source_tile_col - 1) ÷ group_L) * tile_size + source_tile_col_offset
                     source_cols[iswap] = source_storage_col
                     if dest_tile_col > panel_group_col
-                        # The 'destination column' is owned by the diagonal-tile-owning
-                        # rank, but is not in the diagonal tile. Therefore the 'source
-                        # column' of 'destination column' is within the diagonal tile, and
+                        # The 'destination column' is owned by the panel-column-owning
+                        # rank, but is not in the panel column. Therefore the 'source
+                        # column' of 'destination column' is within the panel column, and
                         # we want to record which column it is.
-                        n_off_diagonal_dest_cols += 1
-                        diag_storage_col = ((panel - 1) ÷ group_L) * tile_size + diag_tile_col_offset
-                        source_cols[this_tile_size+n_off_diagonal_dest_cols] = diag_storage_col
+                        n_off_panel_dest_cols += 1
+                        panel_storage_col = ((panel - 1) ÷ group_L) * tile_size + panel_col_offset
+                        source_cols[this_tile_size+n_off_panel_dest_cols] = panel_storage_col
                         dest_storage_col = ((dest_tile_col - 1) ÷ group_L) * tile_size + dest_tile_col_offset
-                        locally_owned_swap_cols[this_tile_size+n_off_diagonal_dest_cols] = dest_storage_col
+                        panel_row_owned_swap_cols[this_tile_size+n_off_panel_dest_cols] = dest_storage_col
                     end
-                elseif distributed_comm_rank == owning_rank_diag == owning_rank_source
+                elseif distributed_comm_rank == owning_rank_panel_column == owning_rank_source
                     # Copy out data from the colu and start MPI.Isend()
 
-                    diag_storage_col = ((panel - 1) ÷ group_L) * tile_size + diag_tile_col_offset
+                    panel_storage_col = ((panel - 1) ÷ group_L) * tile_size + panel_col_offset
 
                     col_swap_buffer = @view col_swap_buffers[:,iswap]
-                    col_swap_buffer .= @view matrix_storage[:,diag_storage_col]
+                    col_swap_buffer .= @view matrix_storage[:,panel_storage_col]
 
-                    # diag -> dest
+                    # panel -> dest
                     reqs[req_counter+=1] = MPI.Isend(col_swap_buffer, distributed_comm;
                                                      dest=owning_rank_dest, tag=iswap)
 
@@ -676,19 +675,19 @@ function apply_pivots_from_sub_row!(A_lu, panel)
 
                     source_storage_col = ((source_tile_col - 1) ÷ group_L) * tile_size + source_tile_col_offset
                     source_cols[iswap] = source_storage_col
-                elseif distributed_comm_rank == owning_rank_diag == owning_rank_dest
+                elseif distributed_comm_rank == owning_rank_panel_column == owning_rank_dest
                     # Copy out data from the column that we own, to later copy to
                     # destination column.
 
-                    diag_storage_col = ((panel - 1) ÷ group_L) * tile_size + diag_tile_col_offset
+                    panel_storage_col = ((panel - 1) ÷ group_L) * tile_size + panel_col_offset
 
-                    diag_col_data = @view matrix_storage[:,diag_storage_col]
+                    panel_col_data = @view matrix_storage[:,panel_storage_col]
 
                     col_swap_buffer = @view col_swap_buffers[:,iswap]
-                    col_swap_buffer .= diag_col_data
+                    col_swap_buffer .= panel_col_data
 
-                    # source -> diag
-                    reqs[req_counter+=1] = MPI.Irecv!(diag_col_data, distributed_comm;
+                    # source -> panel
+                    reqs[req_counter+=1] = MPI.Irecv!(panel_col_data, distributed_comm;
                                                       source=owning_rank_source, tag=iswap)
 
                     # Mark as 'complete' because it will be complete once MPI
@@ -696,29 +695,29 @@ function apply_pivots_from_sub_row!(A_lu, panel)
                     swap_flags[iswap] = 0x0
 
                     if dest_tile_col > panel_group_col
-                        # The 'destination column' is owned by the diagonal-tile-owning
-                        # rank, but is not in the diagonal tile. Therefore the 'source
-                        # column' of 'destination column' is within the diagonal tile, and
+                        # The 'destination column' is owned by the panel-column-owning
+                        # rank, but is not in the panel column. Therefore the 'source
+                        # column' of 'destination column' is within the panel column, and
                         # we want to record which column it is.
-                        n_off_diagonal_dest_cols += 1
-                        source_cols[this_tile_size+n_off_diagonal_dest_cols] = diag_storage_col
+                        n_off_panel_dest_cols += 1
+                        source_cols[this_tile_size+n_off_panel_dest_cols] = panel_storage_col
                         dest_storage_col = ((dest_tile_col - 1) ÷ group_L) * tile_size + dest_tile_col_offset
-                        locally_owned_swap_cols[this_tile_size+n_off_diagonal_dest_cols] = dest_storage_col
+                        panel_row_owned_swap_cols[this_tile_size+n_off_panel_dest_cols] = dest_storage_col
                     end
-                elseif distributed_comm_rank == owning_rank_diag
-                    diag_storage_col = ((panel - 1) ÷ group_L) * tile_size + diag_tile_col_offset
+                elseif distributed_comm_rank == owning_rank_panel_column
+                    panel_storage_col = ((panel - 1) ÷ group_L) * tile_size + panel_col_offset
 
-                    diag_col_data = @view matrix_storage[:,diag_storage_col]
+                    panel_col_data = @view matrix_storage[:,panel_storage_col]
 
                     # Copy out data from the column that we own, to later copy to
                     # destination column.
                     col_swap_buffer = @view col_swap_buffers[:,iswap]
-                    col_swap_buffer .= diag_col_data
+                    col_swap_buffer .= panel_col_data
 
-                    # source -> diag
-                    reqs[req_counter+=1] = MPI.Irecv!(diag_col_data, distributed_comm;
+                    # source -> panel
+                    reqs[req_counter+=1] = MPI.Irecv!(panel_col_data, distributed_comm;
                                                       source=owning_rank_source, tag=iswap)
-                    # diag -> dest
+                    # panel -> dest
                     reqs[req_counter+=1] = MPI.Isend(col_swap_buffer, distributed_comm;
                                                      dest=owning_rank_dest, tag=iswap)
 
@@ -727,31 +726,28 @@ function apply_pivots_from_sub_row!(A_lu, panel)
                     swap_flags[iswap] = 0x0
                 elseif distributed_comm_rank == owning_rank_source
                     # Copy out data from the column that we own, to send to
-                    # owning_rank_diag.
+                    # owning_rank_panel_column.
 
                     source_storage_col = ((source_tile_col - 1) ÷ group_L) * tile_size + source_tile_col_offset
 
                     col_swap_buffer = @view col_swap_buffers[:,iswap]
                     col_swap_buffer .= @view matrix_storage[:,source_storage_col]
 
-                    # source -> diag
+                    # source -> panel
                     reqs[req_counter+=1] = MPI.Isend(col_swap_buffer, distributed_comm;
-                                                     dest=owning_rank_diag, tag=iswap)
+                                                     dest=owning_rank_panel_column, tag=iswap)
                 end
             end
-            if distributed_comm_rank != owning_rank_diag
+            if distributed_comm_rank != owning_rank_panel_column
                 # Now that all columns on this rank have been copied out into buffers to
                 # send, can call MPI.IRecv!() for all of them.
-                for (iswap, (idiag, isource, idest)) ∈
-                        enumerate(zip(diagonal_block_indices, sub_row_pivot_indices,
-                                      diagonal_block_col_destination_indices))
-                    if idiag == isource == idest
+                for (iswap, (ipanel, isource, idest)) ∈
+                        enumerate(zip(panel_column_indices, sub_row_pivot_indices,
+                                      panel_col_destination_indices))
+                    if ipanel == isource == idest
                         # No swap to do.
                         continue
                     end
-
-                    panel = (idiag - 1) ÷ tile_size + 1
-                    owning_rank_l_diag = (panel - 1) % group_L
 
                     dest_tile_col, dest_tile_col_offset = divrem(idest - 1, tile_size) .+ 1
                     owning_rank_l_dest = (dest_tile_col - 1) % group_L
@@ -760,21 +756,21 @@ function apply_pivots_from_sub_row!(A_lu, panel)
                     if distributed_comm_rank == owning_rank_dest
                         dest_storage_col = ((dest_tile_col - 1) ÷ group_L) * tile_size + dest_tile_col_offset
 
-                        # source -> diag
+                        # source -> panel
                         reqs[req_counter+=1] =
                             MPI.Irecv!(@view(matrix_storage[:,dest_storage_col]),
-                                       distributed_comm; source=owning_rank_diag, tag=iswap)
+                                       distributed_comm; source=owning_rank_panel_column, tag=iswap)
                     end
                 end
             end
 
-            if distributed_comm_rank == owning_rank_diag
-                source_cols = @view source_cols[1:this_tile_size+n_off_diagonal_dest_cols]
-                locally_owned_swap_cols = @view locally_owned_swap_cols[1:this_tile_size+n_off_diagonal_dest_cols]
-                swap_flags = @view swap_flags[1:this_tile_size+n_off_diagonal_dest_cols]
-                source_swap_labels = @view A_lu.factorization_source_swap_labels[1:this_tile_size+n_off_diagonal_dest_cols]
+            if distributed_comm_rank == owning_rank_panel_column
+                source_cols = @view source_cols[1:this_tile_size+n_off_panel_dest_cols]
+                panel_row_owned_swap_cols = @view panel_row_owned_swap_cols[1:this_tile_size+n_off_panel_dest_cols]
+                swap_flags = @view swap_flags[1:this_tile_size+n_off_panel_dest_cols]
+                source_swap_labels = @view A_lu.factorization_source_swap_labels[1:this_tile_size+n_off_panel_dest_cols]
 
-                # Figure out the index within locally_owned_swap_cols of each source
+                # Figure out the index within panel_row_owned_swap_cols of each source
                 # column, and store in source_swap_labels.
                 for (i, source_col) ∈ enumerate(source_cols)
                     # Operation like `findfirst()`, but some entries will not be found.
@@ -782,8 +778,8 @@ function apply_pivots_from_sub_row!(A_lu, panel)
                     # that would introduce type instability, so search with a loop
                     # instead.
                     source_label = -1
-                    for i ∈ 1:length(locally_owned_swap_cols)
-                        if locally_owned_swap_cols[i] == source_col
+                    for i ∈ 1:length(panel_row_owned_swap_cols)
+                        if panel_row_owned_swap_cols[i] == source_col
                             source_label = i
                             break
                         end
@@ -799,18 +795,18 @@ function apply_pivots_from_sub_row!(A_lu, panel)
                         source_label = source_swap_labels[label]
                         while true
                             if swap_flags[source_label] == 0x0
-                                # 'Completed' column, which must be within the diagonal
-                                # tile.
+                                # 'Completed' column, which must be within the panel
+                                # column.
                                 # Copy data from the column swap buffers.
-                                icol = locally_owned_swap_cols[label]
+                                icol = panel_row_owned_swap_cols[label]
                                 @views matrix_storage[:,icol] .=
                                     col_swap_buffers[:,source_label]
                                 swap_flags[label] = 0x0
                                 break
                             elseif swap_flags[source_label] == 0x2
                                 # 'Not-completed' column, copy data matrix storage.
-                                icol = locally_owned_swap_cols[label]
-                                isource = locally_owned_swap_cols[source_label]
+                                icol = panel_row_owned_swap_cols[label]
+                                isource = panel_row_owned_swap_cols[source_label]
                                 @views matrix_storage[:,icol] .=
                                     matrix_storage[:,isource]
                                 swap_flags[label] = 0x0
@@ -832,15 +828,15 @@ function apply_pivots_from_sub_row!(A_lu, panel)
                         col_buffer = @view col_swap_buffers[:,next_potential_incomplete_label]
                         # Copy out data from this column so that we can put it back into
                         # the last column in the cycle.
-                        icol = locally_owned_swap_cols[next_potential_incomplete_label]
+                        icol = panel_row_owned_swap_cols[next_potential_incomplete_label]
                         col_buffer .= @view matrix_storage[:,icol]
 
                         label = next_potential_incomplete_label
                         next_label = source_swap_labels[label]
                         swap_flags[next_potential_incomplete_label] = 0x0
                         while next_label != next_potential_incomplete_label
-                            this_col = locally_owned_swap_cols[label]
-                            next_col = locally_owned_swap_cols[next_label]
+                            this_col = panel_row_owned_swap_cols[label]
+                            next_col = panel_row_owned_swap_cols[next_label]
                             @views matrix_storage[:,this_col] .= matrix_storage[:,next_col]
                             swap_flags[next_label] = 0x0
                             label = next_label
@@ -849,7 +845,7 @@ function apply_pivots_from_sub_row!(A_lu, panel)
 
                         # Copy in the data from start_col to this final column to complete
                         # the cycle.
-                        this_col = locally_owned_swap_cols[label]
+                        this_col = panel_row_owned_swap_cols[label]
                         @views matrix_storage[:,this_col] .= col_buffer
                     end
                 end
