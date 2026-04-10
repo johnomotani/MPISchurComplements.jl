@@ -1129,9 +1129,9 @@ function update_bottom_right_block!(A_lu, panel)
         reqs = A_lu.comm_requests
         synchronize_shared = A_lu.synchronize_shared
 
-        row_buffers = A_lu.factorization_row_swap_buffers
-        # Can reuse this buffer as a column buffer, as it is big enough.
-        col_buffers = A_lu.factorization_pivoting_buffer
+        # Can reuse this buffer as a row buffer, as it is big enough.
+        row_buffers = A_lu.factorization_pivoting_buffer
+        col_buffers = A_lu.factorization_col_swap_buffers
 
         panel_group_row, panel_k = divrem(panel - 1, group_K) .+ 1
         panel_group_col, panel_l = divrem(panel - 1, group_L) .+ 1
@@ -1180,12 +1180,12 @@ function update_bottom_right_block!(A_lu, panel)
                         # Don't need to send from this rank to itself.
                         continue
                     end
-                    r = (l - 1) * group_K + group_k - 1
+                    r = (group_k - 1) * group_L + l - 1
                     reqs[request_counter+=1] = MPI.Isend(parent(parent(left_panel_buffer)),
                                                          distributed_comm; dest=r)
                 end
             else
-                left_panel_r = (panel_l - 1) * group_K + group_k - 1
+                left_panel_r = (group_k - 1) * group_L + panel_l - 1
                 reqs[request_counter+=1] = MPI.Irecv!(parent(parent(left_panel_buffer)),
                                                       distributed_comm; source=left_panel_r)
             end
@@ -1197,7 +1197,7 @@ function update_bottom_right_block!(A_lu, panel)
                         # Don't need to send from this rank to itself.
                         continue
                     end
-                    r = (group_l - 1) * group_K + k - 1
+                    r = (k - 1) * group_L + group_l - 1
                     # MPI.jl doesn't like ReshapedArray type, but we only need to communicate
                     # the underlying storage, so use `parent()` to extract a SubArray which
                     # MPI.jl can handle.
@@ -1205,7 +1205,7 @@ function update_bottom_right_block!(A_lu, panel)
                                                          distributed_comm; dest=r)
                 end
             else
-                top_panel_r = (group_l - 1) * group_K + panel_k - 1
+                top_panel_r = (panel_k - 1) * group_L + group_l - 1
                 # MPI.jl doesn't like ReshapedArray type, but we only need to communicate the
                 # underlying storage, so use `parent()` to extract a SubArray which MPI.jl can
                 # handle.
