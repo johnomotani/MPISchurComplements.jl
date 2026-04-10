@@ -498,7 +498,6 @@ end
 
 function ldiv!(x::AbstractVector{T}, A_lu::DenseLU{T}, b::AbstractVector{T}) where T
     @sc_timeit A_lu.timer "ldiv!" begin
-        is_root = A_lu.is_root
         col_permutation = A_lu.col_permutation
         y = A_lu.vec_buffer1
         x_permuted = A_lu.vec_buffer2
@@ -508,20 +507,20 @@ function ldiv!(x::AbstractVector{T}, A_lu::DenseLU{T}, b::AbstractVector{T}) whe
         L_solve!(y, A_lu, b)
         U_solve!(x_permuted, A_lu, y)
 
-        # Permute the solution, storing in buffer2. This accounts for 'column
-        # permutations' that were generated/used for 'pivoting' when the L and U factors
-        # were computed.
-        if is_root
-            # Could parallelise this?
-            @views x[col_permutation] .= x_permuted
-        end
-
         # Clean up MPI requests. These should all have been completed already, so this should
         # not take any time.
         MPI.Waitall(A_lu.L_send_requests)
         MPI.Waitall(A_lu.U_send_requests)
         MPI.Waitall(A_lu.L_receive_requests)
         MPI.Waitall(A_lu.U_receive_requests)
+
+        # Permute the solution, storing in buffer2. This accounts for 'column
+        # permutations' that were generated/used for 'pivoting' when the L and U factors
+        # were computed.
+        if shared_comm_rank == 0
+            # Could parallelise this?
+            @views x[col_permutation] .= x_permuted
+        end
     end
 
     return x

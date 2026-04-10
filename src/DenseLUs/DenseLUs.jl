@@ -26,7 +26,7 @@ import LinearAlgebra: lu!, ldiv!
     factorization_matrix_parts_row_ranges::Vector{UnitRange{Int64}}
     factorization_matrix_parts_col_ranges::Vector{UnitRange{Int64}}
     factorization_locally_owned_cols::Vector{Int64}
-    factorization_pivoting_buffer::Tmat
+    factorization_pivoting_buffer::Tvec
     factorization_jpiv::Vector{Int64}
     factorization_pivoting_reduction_buffer::Tvec
     factorization_pivoting_reduction_indices::Tintvec

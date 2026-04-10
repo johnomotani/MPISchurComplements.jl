@@ -306,7 +306,7 @@ function generate_pivots!(A_lu, panel)
             indices_offset = shared_comm_rank * this_tile_size
             n_indices = min(this_tile_size,length(shared_local_pivot_indices))
             @views @. pivoting_reduction_indices[indices_offset+1:indices_offset+n_indices] =
-                shared_local_pivot_indices[1:n_indices] + this_shared_proc_rows[1] - 1
+                shared_local_pivot_indices[1:n_indices] + this_shared_proc_cols[1] - 1
         end
         synchronize_shared()
 
@@ -326,7 +326,7 @@ function generate_pivots!(A_lu, panel)
                 # array. Need this complication because the number of rows can be
                 # different for the last `panel`, and slicing the rows of a 2D buffer
                 # would give non-contiguous storage.
-                lu_panel_buffer = reshape(@view(pivoting_buffer[1:n_buffer_rows*this_tile_size]),
+                lu_panel_buffer = reshape(@view(pivoting_buffer[1:n_buffer_cols*this_tile_size]),
                                           this_tile_size, n_buffer_cols)
                 lu_panel_buffer .= @view matrix_storage[first_local_row:last_local_row,candidate_pivot_indices]
 
@@ -402,7 +402,7 @@ function generate_pivots!(A_lu, panel)
                             l_counter += 1
                             reqs[req_counter+=1] =
                                 MPI.Irecv!(@view(reduced_buffer[:,col]), distributed_comm;
-                                           source=rank_l, tag=k_counter)
+                                           source=rank_l, tag=l_counter)
                         end
                         l_counter += 1
                         reqs[req_counter+=1] =

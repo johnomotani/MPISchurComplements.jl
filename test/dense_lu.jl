@@ -45,10 +45,10 @@ function dense_lu_test(n_shared)
                            allocate_array_float, allocate_array_int)
 
             function test_once()
-                ldiv!(x, Alu, b)
+                ldiv!(x, Alu, copy(b))
                 # LU factorise using the row permutation calculated for Alu, to compare
                 # the factors.
-                check_factors_lu = lu(A[Alu.row_permutation,:], NoPivot())
+                check_factors_lu = lu(A[:,Alu.col_permutation], NoPivot())
                 if shared_rank == 0
                     tol = 2.0e-10
                     @test isapprox(A * x, b; norm=(x)->NaN, rtol=tol, atol=tol)
