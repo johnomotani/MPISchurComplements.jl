@@ -90,13 +90,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
 
     factorization_pivoting_buffer = allocate_shared_float(group_n_cols * tile_size *
                                                           tile_size)
-    if shared_comm_size > 1
-        factorization_local_top_panel_buffer =
-            Vector{datatype}(undef, (group_n_cols * tile_size + shared_comm_size - 1) ÷ shared_comm_size * tile_size)
-    else
-        # Do not need this buffer
-        factorization_local_top_panel_buffer = zeros(datatype, 0)
-    end
+    factorization_jpiv = Vector{Int64}(undef, tile_size)
     factorization_pivoting_reduction_buffer = allocate_shared_float(tile_size * group_L
                                                                     * tile_size)
     factorization_pivoting_reduction_indices =
@@ -113,7 +107,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
             factorization_matrix_storage, factorization_matrix_parts,
             factorization_matrix_parts_row_ranges, factorization_matrix_parts_col_ranges,
             factorization_locally_owned_cols, factorization_pivoting_buffer,
-            factorization_local_top_panel_buffer, factorization_pivoting_reduction_buffer,
+            factorization_jpiv, factorization_pivoting_reduction_buffer,
             factorization_pivoting_reduction_indices, factorization_source_cols,
             factorization_locally_owned_swap_cols, factorization_source_swap_labels,
             factorization_col_swap_buffers, factorization_swap_flags, comm_requests)
@@ -238,9 +232,9 @@ end
 
 function generate_pivots!(A_lu, panel)
     @sc_timeit A_lu.timer "generate_pivots!" begin
-        group_l = A_lu.group_l
-        group_L = A_lu.group_L
-        if (panel - 1) % group_L + 1 != group_l
+        group_k = A_lu.group_k
+        group_K = A_lu.group_K
+        if (panel - 1) % group_K + 1 != group_k
             # This rank does not participate in pivot generation for this panel.
             return nothing
         end
@@ -249,65 +243,66 @@ function generate_pivots!(A_lu, panel)
         shared_comm_rank = A_lu.shared_comm_rank
         shared_comm_size = A_lu.shared_comm_size
         reqs = A_lu.comm_requests
-        m = A_lu.m
+        n = A_lu.n
         n_tiles = A_lu.n_tiles
         tile_size = A_lu.tile_size
-        group_k = A_lu.group_k
-        group_K = A_lu.group_K
+        group_l = A_lu.group_l
+        group_L = A_lu.group_L
         pivoting_buffer = A_lu.factorization_pivoting_buffer
+        jpiv = A_lu.factorization_jpiv
         pivoting_reduction_buffer = A_lu.factorization_pivoting_reduction_buffer
         pivoting_reduction_indices = A_lu.factorization_pivoting_reduction_indices
         matrix_storage = A_lu.factorization_matrix_storage
-        locally_owned_rows = A_lu.factorization_locally_owned_rows
+        locally_owned_cols = A_lu.factorization_locally_owned_cols
         synchronize_shared = A_lu.synchronize_shared
 
         # Find the on-or-below diagonal part of the sub-column that is owned by this rank.
         panel_group_row, panel_k = divrem(panel - 1, group_K) .+ 1
         panel_group_col, panel_l = divrem(panel - 1, group_L) .+ 1
-        if group_k < panel_k
-            first_local_row = panel_group_row * tile_size + 1
+        if group_l < panel_l
+            first_local_col = panel_group_col * tile_size + 1
         else
-            first_local_row = (panel_group_row - 1) * tile_size + 1
+            first_local_col = (panel_group_col - 1) * tile_size + 1
         end
-        first_local_col = (panel_group_col - 1) * tile_size + 1
-        last_local_col = min(panel_group_col * tile_size, size(matrix_storage, 2))
-        this_tile_size = last_local_col - first_local_col + 1
+        first_local_row = (panel_group_row - 1) * tile_size + 1
+        last_local_row = min(panel_group_row * tile_size, size(matrix_storage, 1))
+        this_tile_size = last_local_row - first_local_row + 1
 
         # Do 'tournament pivoting' in three stages:
         #    All processes in each `shared_comm`.
         # -> Root process of each shared-memory block, which is every process in
         #    `distributed_comm`.
-        # -> Global root process, which is the root procees of `distributed_comm`.
-        n_local_rows = size(matrix_storage, 1) - first_local_row + 1
-        rows_per_shared_proc = max((n_local_rows + shared_comm_size - 1) ÷ shared_comm_size,
+        # -> Global root process, which is the root process of `distributed_comm`.
+        n_local_cols = size(matrix_storage, 2) - first_local_col + 1
+        cols_per_shared_proc = max((n_local_cols + shared_comm_size - 1) ÷ shared_comm_size,
                                    this_tile_size)
-        this_shared_proc_rows =
-            (shared_comm_rank*rows_per_shared_proc+first_local_row:min((shared_comm_rank+1)*rows_per_shared_proc+first_local_row-1,size(matrix_storage,1)))
+        this_shared_proc_cols =
+            (shared_comm_rank*cols_per_shared_proc+first_local_col:min((shared_comm_rank+1)*cols_per_shared_proc+first_local_col-1,size(matrix_storage,2)))
 
         # We keep at least one tile per shared-mem process, so sometimes some processes may
         # have no work to do.
-        n_active_shared_procs = (n_local_rows + rows_per_shared_proc - 1) ÷ rows_per_shared_proc
-        last_proc_n_rows = n_local_rows - (n_active_shared_procs - 1) * rows_per_shared_proc
-        last_proc_missing_rows = max(0, this_tile_size - last_proc_n_rows)
+        n_active_shared_procs = (n_local_cols + cols_per_shared_proc - 1) ÷ cols_per_shared_proc
+        last_proc_n_cols = n_local_cols - (n_active_shared_procs - 1) * cols_per_shared_proc
+        last_proc_missing_cols = max(0, this_tile_size - last_proc_n_cols)
         if shared_comm_rank < n_active_shared_procs
-            panel_buffer_offset = shared_comm_rank * rows_per_shared_proc * this_tile_size
-            panel_buffer_n_rows = length(this_shared_proc_rows)
-            panel_buffer_size = panel_buffer_n_rows * this_tile_size
+            panel_buffer_offset = shared_comm_rank * cols_per_shared_proc * this_tile_size
+            panel_buffer_n_cols = length(this_shared_proc_cols)
+            panel_buffer_size = panel_buffer_n_cols * this_tile_size
             this_lu_panel_buffer = reshape(@view(pivoting_buffer[panel_buffer_offset+1:panel_buffer_offset+panel_buffer_size]),
-                                           panel_buffer_n_rows, this_tile_size)
-            this_lu_panel_buffer .= @view matrix_storage[this_shared_proc_rows,
-                                                         first_local_col:last_local_col]
-            # LU factorize this locally-owned part of the column to get the pivots, we will
-            # then reduce the locally-found pivot rows with those found by all other processes
-            # on the shared-memory communicator.
+                                           this_tile_size, panel_buffer_n_cols)
+            this_lu_panel_buffer .= @view matrix_storage[first_local_row:last_local_row,
+                                                         this_shared_proc_cols]
+            # LU factorize this locally-owned part of the row to get the pivots, we will
+            # then reduce the locally-found pivot columns with those found by all other
+            # processes on the shared-memory communicator.
             # In the tournament pivoting algorithm implemented in `generate_pivots!()`
             # [Grigori et al. (2011)], the locally-owned block may be singular here. Even if
             # the block is singular, we can still generate pivots and construct LU factors.
-            # These pivot rows can then be used for the tournament pivoting.
-            shared_local_lu = lu!(this_lu_panel_buffer; allowsingular=true)
+            # These pivot columns can then be used for the tournament pivoting.
+            column_pivot_lu!(this_lu_panel_buffer, jpiv)
             shared_local_pivot_indices =
-                ipiv2perm_truncated(shared_local_lu.ipiv, panel_buffer_n_rows,
-                                    min(this_tile_size, size(this_lu_panel_buffer, 1)))
+                ipiv2perm_truncated(jpiv, panel_buffer_n_cols,
+                                    min(this_tile_size, size(this_lu_panel_buffer, 2)))
             indices_offset = shared_comm_rank * this_tile_size
             n_indices = min(this_tile_size,length(shared_local_pivot_indices))
             @views @. pivoting_reduction_indices[indices_offset+1:indices_offset+n_indices] =
@@ -316,48 +311,49 @@ function generate_pivots!(A_lu, panel)
         synchronize_shared()
 
         if shared_comm_rank == 0
-            candidate_pivot_indices = @view pivoting_reduction_indices[1:n_active_shared_procs*this_tile_size-last_proc_missing_rows]
+            candidate_pivot_indices = @view pivoting_reduction_indices[1:n_active_shared_procs*this_tile_size-last_proc_missing_cols]
             if n_active_shared_procs == 1
                 # Only this process did any work in the previous step, so no need to re-do LU
                 # factorization here.
                 local_panel_pivot_indices = shared_local_pivot_indices
                 local_pivot_indices =
                     candidate_pivot_indices[1:min(this_tile_size,length(candidate_pivot_indices))]
-                global_pivot_indices = locally_owned_rows[local_pivot_indices]
+                global_pivot_indices = locally_owned_cols[local_pivot_indices]
                 lu_panel_buffer = this_lu_panel_buffer
             else
-                n_buffer_rows = length(candidate_pivot_indices)
+                n_buffer_cols = length(candidate_pivot_indices)
                 # Construct a reshaped view so that lu_panel_buffer is a contiguously-allocated
-                # array. Need this complication because we need a different number of rows for
-                # each `panel`, but we use column-major storage for arrays, so slicing the rows of a
-                # 2D buffer would give non-contiguous storage.
+                # array. Need this complication because the number of rows can be
+                # different for the last `panel`, and slicing the rows of a 2D buffer
+                # would give non-contiguous storage.
                 lu_panel_buffer = reshape(@view(pivoting_buffer[1:n_buffer_rows*this_tile_size]),
-                                          n_buffer_rows, this_tile_size)
-                lu_panel_buffer .= @view matrix_storage[candidate_pivot_indices,first_local_col:last_local_col]
+                                          this_tile_size, n_buffer_cols)
+                lu_panel_buffer .= @view matrix_storage[first_local_row:last_local_row,candidate_pivot_indices]
 
-                # LU factorize this locally-owned part of the column to get the pivots, we will
-                # then reduce the locally-found pivot rows with those found by all other blocks
-                # that share this column.
+                # LU factorize this locally-owned part of the row to get the pivots, we
+                # will then reduce the locally-found pivot columns with those found by all
+                # other blocks that share this row.
                 # In the tournament pivoting algorithm implemented in `generate_pivots!()`
-                # [Grigori et al. (2011)], the locally-owned block may be singular here. Even if
-                # the block is singular, we can still generate pivots and construct LU factors.
-                # These pivot rows can then be used for the tournament pivoting.
-                local_lu = lu!(lu_panel_buffer; allowsingular=true)
-                # Get the rows for just the first `this_tile_size` pivots (or all the rows, if
-                # less than `this_tile_size`), which is the number need to find in the end, after
-                # reducing over all blocks.
+                # [Grigori et al. (2011)], the locally-owned block may be singular. Even
+                # if the local block is singular, we can still generate pivots and
+                # construct LU factors. These pivot columns can then be used for the
+                # tournament pivoting.
+                column_pivot_lu!(lu_panel_buffer, jpiv)
+                # Get the columns for just the first `this_tile_size` pivots (or all the
+                # columns, if less than `this_tile_size`), which is the number need to
+                # find in the end, after reducing over all blocks.
                 # Using the our custom ipiv2perm_truncated is slightly more efficient than
                 # constructing the full permutation vector and then selecting only the first
                 # `section_width` entries from it.
                 local_panel_pivot_indices =
-                    ipiv2perm_truncated(local_lu.ipiv, n_buffer_rows,
-                                        min(this_tile_size, size(lu_panel_buffer, 1)))
+                    ipiv2perm_truncated(jpiv, n_buffer_cols,
+                                        min(this_tile_size, size(lu_panel_buffer, 2)))
                 local_pivot_indices = candidate_pivot_indices[local_panel_pivot_indices]
-                global_pivot_indices = locally_owned_rows[local_pivot_indices]
+                global_pivot_indices = locally_owned_cols[local_pivot_indices]
             end
 
-            if group_K == 1
-                # All rows are local to the block, so no need for further reduction or
+            if group_L == 1
+                # All columns are local to the block, so no need for further reduction or
                 # factorisation.
                 sub_column_pivot_indices = @view pivoting_reduction_indices[1:this_tile_size]
                 sub_column_pivot_indices .= global_pivot_indices
@@ -368,106 +364,89 @@ function generate_pivots!(A_lu, panel)
                             this_tile_size, this_tile_size)
                 @views reduced_buffer .= lu_panel_buffer[1:this_tile_size,1:this_tile_size]
             else
-                # Collect all the local pivot rows and indices onto the
-                # `panel_k` block.
-                if group_k == panel_k
-                    n_rows_from_k = [get_n_rows_from_k(k, panel_k, panel_group_row, group_K,
+                # Collect all the local pivot columns and indices onto the `panel_l`
+                # block.
+                if group_l == panel_l
+                    n_cols_from_l = [get_n_cols_from_l(l, panel_l, panel_group_col, group_L,
                                                        length(local_panel_pivot_indices),
-                                                       n_tiles, m, tile_size)
-                                     for k ∈ 1:group_K]
-                    k_rows_end = cumsum(n_rows_from_k)
-                    n_reduced_rows = k_rows_end[end]
+                                                       n_tiles, n, tile_size)
+                                     for l ∈ 1:group_L]
+                    l_cols_end = cumsum(n_cols_from_l)
+                    n_reduced_cols = l_cols_end[end]
                     reduced_buffer =
-                        reshape(@view(pivoting_reduction_buffer[1:n_reduced_rows*this_tile_size]),
-                                n_reduced_rows, this_tile_size)
-                    reduced_row_indices = @view pivoting_reduction_indices[1:n_reduced_rows]
+                        reshape(@view(pivoting_reduction_buffer[1:this_tile_size*n_reduced_cols]),
+                                this_tile_size, n_reduced_cols)
+                    reduced_col_indices = @view pivoting_reduction_indices[1:n_reduced_cols]
 
-                    # Post receives for the rows and row indices from other blocks.
+                    # Post receives for the columns and column indices from other blocks.
                     req_counter = 0
-                    for k ∈ 1:group_K
-                        if k == group_k
+                    for l ∈ 1:group_L
+                        if l == group_l
                             # This rank does not need to communicate with itself!
                             continue
                         end
-                        if n_rows_from_k[k] == 0
-                            # No rows to colect
+                        if n_cols_from_l[l] == 0
+                            # No cols to colect
                             continue
                         end
-                        # Each rank in this column is offset from the next/previous in the
-                        # distributed communicator `distributed_comm` by 1.
-                        rank_k = distributed_comm_rank + (k - group_k)
-                        if k == 1
-                            first_row = 1
+                        # Each rank in this row is offset from the next/previous in the
+                        # distributed communicator `distributed_comm` by group_K.
+                        rank_l = distributed_comm_rank + (l - group_l) * group_K
+                        if l == 1
+                            first_col = 1
                         else
-                            first_row = k_rows_end[k-1] + 1
+                            first_col = l_cols_end[l-1] + 1
                         end
-                        k_counter = 0
-                        for row ∈ first_row:k_rows_end[k]
-                            k_counter += 1
+                        l_counter = 0
+                        for col ∈ first_col:l_cols_end[l]
+                            l_counter += 1
                             reqs[req_counter+=1] =
-                                MPI.Irecv!(@view(reduced_buffer[row,:]), distributed_comm;
+                                MPI.Irecv!(@view(reduced_buffer[:,col]), distributed_comm;
                                            source=rank_k, tag=k_counter)
                         end
-                        k_counter += 1
+                        l_counter += 1
                         reqs[req_counter+=1] =
-                            MPI.Irecv!(@view(reduced_row_indices[first_row:k_rows_end[k]]),
-                                       distributed_comm; source=rank_k, tag=k_counter)
+                            MPI.Irecv!(@view(reduced_col_indices[first_col:l_cols_end[l]]),
+                                       distributed_comm; source=rank_l, tag=l_counter)
                     end
 
                     # Copy in the local contributions
-                    k = group_k
-                    if group_k == 1
-                        first_row = 1
+                    l = group_l
+                    if group_l == 1
+                        first_col = 1
                     else
-                        first_row = k_rows_end[k-1]+1
+                        first_col = l_cols_end[l-1]+1
                     end
-                    @views reduced_buffer[first_row:k_rows_end[k],:] .=
-                        matrix_storage[local_pivot_indices,first_local_col:last_local_col]
-                    @views reduced_row_indices[first_row:k_rows_end[k]] .= global_pivot_indices
+                    @views reduced_buffer[:,first_col:l_cols_end[l]] .=
+                        matrix_storage[first_local_row:last_local_row,local_pivot_indices]
+                    @views reduced_col_indices[first_col:l_cols_end[l]] .= global_pivot_indices
 
                     MPI.Waitall(reqs[1:req_counter])
 
-                    # Do an LU factorization on the reduced rows. This gives the final pivot
-                    # indices, and also the (section_width,section_width) top-left block of the LU
-                    # factors.
-                    local_lu = lu!(reduced_buffer)
-                    buffer_pivot_indices = ipiv2perm_truncated(local_lu.ipiv, n_reduced_rows,
+                    # Do an LU factorization on the reduced columnss. This gives the final
+                    # pivot indices, and also the (section_width,section_width) top-left
+                    # block of the LU factors.
+                    column_pivot_lu!(reduced_buffer, jpiv)
+                    buffer_pivot_indices = ipiv2perm_truncated(jpiv, n_reduced_cols,
                                                                this_tile_size)
                     # Is OK to re-use the pivoting_reduction_indices buffer, as we are already
-                    # finished with `reduced_row_indices`.
+                    # finished with `reduced_col_indices`.
                     # The pivot indices stored in this buffer will be broadcast to all ranks in
                     # `apply_pivots_from_sub_column!()`.
                     sub_column_pivot_indices = @view pivoting_reduction_indices[1:this_tile_size]
-                    sub_column_pivot_indices .= reduced_row_indices[buffer_pivot_indices]
+                    sub_column_pivot_indices .= reduced_col_indices[buffer_pivot_indices]
 
-                    # For use later, only need the factorized diagonal tile. This is contained in
-                    # reduced_buffer, but not contiguously, as reduced_buffer can contain more
-                    # than just the diagonal tile. Therefore copy the first this_tile_size
-                    # rows from each column into contiguous storage at the beginning of
-                    # reduced_buffer.  Note that we copy the entries in a loop rather than
-                    # copying all the entries from each column in a broadcast operation
-                    # because it can happen that the number of rows is less than
-                    # 2*this_tile_size, in which case the source and destination of the
-                    # copy would overlap, which might (?) cause problems. This operation
-                    # should not be a significant computational cost, so no need to
-                    # super-optimize.
-                    if size(reduced_buffer, 1) > this_tile_size
-                        linear_index = this_tile_size
-                        for col in 2:this_tile_size
-                            for row in 1:this_tile_size
-                                reduced_buffer[linear_index+=1] = reduced_buffer[row,col]
-                            end
-                        end
-                    end
+                    # For use later, only need the factorized diagonal tile, which is
+                    # stored in the first tile_size*tile_size entries of reduced_buffer.
                 else
-                    # Get the local pivot rows ready for collection.
+                    # Get the local pivot columns ready for collection.
                     if length(local_pivot_indices) > 0
                         collecting_rank = (panel_l - 1) * group_K + panel_k - 1
                         req_counter = 0
-                        for row ∈ local_pivot_indices
+                        for col ∈ local_pivot_indices
                             req_counter += 1
                             reqs[req_counter] =
-                                MPI.Isend(@view(matrix_storage[row,first_local_col:last_local_col]),
+                                MPI.Isend(@view(matrix_storage[first_local_row:last_local_row,col]),
                                           distributed_comm; dest=collecting_rank, tag=req_counter)
                         end
                         req_counter += 1
