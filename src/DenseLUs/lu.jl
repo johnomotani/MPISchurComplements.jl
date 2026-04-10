@@ -210,27 +210,27 @@ function gather_factors!(A_lu)
     return nothing
 end
 
-function get_n_rows_from_k(k, panel_k, panel_group_row, group_K, n_local_pivots, n_tiles, m, tile_size)
-    # first_group_row is the global group-row index of the first group-row
-    # owned by the rank with row-index k that contributes to this panel.
-    if k < panel_k
-        first_group_row = panel_group_row * group_K + k
-    elseif k > panel_k
-        first_group_row = (panel_group_row - 1) * group_K + k
+function get_n_cols_from_l(l, panel_l, panel_group_col, group_L, n_local_pivots, n_tiles, n, tile_size)
+    # first_group_col is the global group-column index of the first group-column owned by
+    # the rank with column-index l that contributes to this panel.
+    if l < panel_l
+        first_group_col = panel_group_col * group_L + l
+    elseif l > panel_l
+        first_group_col = (panel_group_col - 1) * group_L + l
     else
         return n_local_pivots
     end
-    if first_group_row > n_tiles
-        # Next tile owned by this rank would be off the bottom of the
-        # matrix, so no rows.
+    if first_group_col > n_tiles
+        # Next tile owned by this rank would be off the right of the
+        # matrix, so no cols.
         return 0
-    elseif first_group_row == n_tiles
+    elseif first_group_col == n_tiles
         # The next tile owned by this rank is the last one, which may not
-        # be full height.
-        return m - (n_tiles - 1) * tile_size
+        # be full width.
+        return n - (n_tiles - 1) * tile_size
     else
         # This block cannot own only the last section, so it will provide
-        # a full tile-worth of rows.
+        # a full tile-worth of columns.
         return tile_size
     end
 end
