@@ -103,7 +103,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
     factorization_source_rows = zeros(Int64, 2 * tile_size)
     factorization_locally_owned_swap_rows = zeros(Int64, 2 * tile_size)
     factorization_source_swap_labels = zeros(Int64, 2 * tile_size)
-    factorization_row_swap_buffers = allocate_shared_float(tile_size, local_storage_n)
+    factorization_row_swap_buffers = allocate_shared_float(local_storage_n, tile_size)
     factorization_swap_flags = zeros(UInt8, 2 * tile_size)
     comm_requests = [MPI.REQUEST_NULL for _ ∈
                      1:max((1 + tile_size) * group_K, group_K + group_L, 2 * tile_size)]
@@ -498,7 +498,9 @@ function apply_pivots_from_sub_column!(A_lu, panel)
         group_l = A_lu.group_l
         group_L = A_lu.group_L
         matrix_storage = A_lu.factorization_matrix_storage
-        row_swap_buffers = A_lu.factorization_row_swap_buffers
+        # Use a transposed buffer so that `row_swap_buffers` is row-major storage for
+        # efficiency.
+        row_swap_buffers = transpose(A_lu.factorization_row_swap_buffers)
         swap_flags = A_lu.factorization_swap_flags
 
         panel_group_row, panel_k = divrem(panel - 1, group_K) .+ 1
