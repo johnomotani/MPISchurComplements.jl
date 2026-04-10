@@ -922,14 +922,13 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
         reqs = A_lu.comm_requests
         group_k = A_lu.group_k
         group_l = A_lu.group_l
-        row_buffers = A_lu.factorization_row_swap_buffers
-        # Can reuse this buffer as a column buffer, as it is big enough.
-        col_buffers = A_lu.factorization_pivoting_buffer
-        local_col_buffer_storage = A_lu.factorization_local_left_panel_buffer
+        # Can reuse this buffer as a row buffer, as it is big enough.
+        row_buffers = A_lu.factorization_pivoting_buffer
+        col_buffers = A_lu.factorization_col_swap_buffers
 
-        first_panel_col = (panel_group_col - 1) * tile_size + 1
-        last_panel_col = min(panel_group_col * tile_size, size(matrix_storage, 2))
-        this_tile_size = last_panel_col - first_panel_col + 1
+        first_panel_row = (panel_group_row - 1) * tile_size + 1
+        last_panel_row = min(panel_group_row * tile_size, size(matrix_storage, 1))
+        this_tile_size = last_panel_row - first_panel_row + 1
         # Note that the size of the diagonal tile that we communicate/process here is always
         # `(tile_size,tile_size)`. The tile can only be smaller than `tile_size` when it is
         # the last diagonal tile, but that one does not need communication/processing here. So
@@ -959,9 +958,8 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
                 # Send the diagonal sub-tile to the other ranks in this sub-column.
                 # Send to below-diagonal ranks in the group first, as these have slightly more
                 # work to do.
-                rank_offset = (group_l - 1) * group_K # Offset of ranks in sub-column.
                 for k ∈ vcat(panel_k+1:group_K, 1:panel_k-1)
-                    r = rank_offset + k - 1
+                    r = (k - 1) * group_L + group_l - 1
                     # MPI.jl doesn't like ReshapedArray type, but we only need to communicate
                     # the underlying storage, so use `parent()` to extract a SubArray which
                     # MPI.jl can handle.
@@ -970,8 +968,9 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
                 end
 
                 # Send the diagonal sub-tile to the ranks in the same sub-row.
+                rank_offset = (group_k - 1) * group_L # Offset of ranks in sub-row.
                 for l ∈ vcat(panel_l+1:group_L, 1:panel_l-1)
-                    r = (l - 1) * group_K + group_k - 1
+                    r = rank_offset + l - 1
                     # MPI.jl doesn't like ReshapedArray type, but we only need to communicate
                     # the underlying storage, so use `parent()` to extract a SubArray which
                     # MPI.jl can handle.
@@ -1033,40 +1032,25 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
                 n_cols = last_storage_col - first_storage_col + 1
                 buffer_size = n_local_rows * n_cols
 
-                # Copy matrix entries into contiguous buffer to improve efficiency.
-                # Use a transposed buffer here so that the storage is row-major, and the parts
-                # (each of which is contiguous in memory) filled by different processes in
-                # `shared_comm` concatenate together correctly to give the complete 'below
-                # diagonal sub-column'.
                 col_buffer =
                     @view(reshape(@view(col_buffers[1:n_rows*n_cols]),
                                   n_rows, n_cols)[row_offset+1:row_offset+n_local_rows,:])
-                if shared_comm_size > 1
-                    # Need a local buffer which is contiguous in memory to copy into, because
-                    # trsm!() cannot handle the non-contiguous col_buffer.
-                    local_col_buffer = reshape(@view(local_col_buffer_storage[1:buffer_size]),
-                                               n_local_rows, n_cols)
-                else
-                    # No shared memory parallelism, so we do not split up col_buffer here, so
-                    # there is no need for local buffers.
-                    local_col_buffer = col_buffer
-                end
 
                 local_below_diagonal_sub_column =
                     @view matrix_storage[shared_local_row_range,
                                          first_storage_col:last_storage_col]
 
-                local_col_buffer .= local_below_diagonal_sub_column
+                col_buffer .= local_below_diagonal_sub_column
 
                 # Need to solve M*U=A for M, where A are the original matrix elements of the
                 # sub-column, and U is the upper-triangular factor of the diagonal sub-tile.
-                trsm!('R', 'U', 'N', 'N', 1.0, diagonal_sub_tile, local_col_buffer)
+                trsm!('R', 'U', 'N', 'N', 1.0, diagonal_sub_tile, col_buffer)
 
                 # Copy buffer back into shared_storage and matrix storage.
                 if shared_comm_size > 1
-                    col_buffer .= local_col_buffer
+                    col_buffer .= col_buffer
                 end
-                local_below_diagonal_sub_column .= local_col_buffer
+                local_below_diagonal_sub_column .= col_buffer
             end
         end
 
