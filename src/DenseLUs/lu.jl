@@ -1,3 +1,4 @@
+using ColumnPivotLUs
 using Combinatorics
 using Primes
 
