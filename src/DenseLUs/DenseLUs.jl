@@ -26,10 +26,12 @@ import LinearAlgebra: lu!, ldiv!
     factorization_matrix_parts_row_ranges::Vector{UnitRange{Int64}}
     factorization_matrix_parts_col_ranges::Vector{UnitRange{Int64}}
     factorization_locally_owned_cols::Vector{Int64}
+    factorization_pivot_generation_shared_tree_sizes::Vector{Int64}
     factorization_pivoting_buffer::Tvec
     factorization_jpiv::Vector{Int64}
     factorization_pivoting_reduction_buffer::Tvec
     factorization_pivoting_reduction_indices::Tintvec
+    factorization_pivoting_reduction_indices_local::Vector{Int64}
     factorization_source_cols::Vector{Int64}
     factorization_panel_row_owned_swap_cols::Vector{Int64}
     factorization_source_swap_labels::Vector{Int64}

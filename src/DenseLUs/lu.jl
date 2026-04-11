@@ -88,6 +88,19 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
                                             (group_col-1)*tile_size+1:min(group_col*tile_size,local_storage_n)])
          for group_row ∈ 1:group_n_rows, group_col ∈ 1:group_n_cols]
 
+    # Generate a 'binary' tree of shared-memory ranks that will participate in the
+    # shared-memory part of the parallel pivot generation.
+    shared_size_prime_factors = factor(Vector, shared_comm_size)
+    factorization_pivot_generation_shared_tree_sizes = [shared_comm_size]
+    # `reverse()` so that we divide by the largest factors first. Should not affect
+    # overall run time as the order of the factors just shuffles around work between
+    # different levels, but this order minimises the total work done, which might
+    # marginally help power consumption?
+    for f in reverse(shared_size_prime_factors)
+        push!(factorization_pivot_generation_shared_tree_sizes,
+              factorization_pivot_generation_shared_tree_sizes[end] ÷ f)
+    end
+
     factorization_pivoting_buffer = allocate_shared_float(group_n_cols * tile_size *
                                                           tile_size)
     factorization_jpiv = Vector{Int64}(undef, tile_size)
@@ -95,6 +108,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
                                                                     * tile_size)
     factorization_pivoting_reduction_indices =
         allocate_shared_int(max(tile_size * group_L * shared_comm_size, 2 * tile_size))
+    factorization_pivoting_reduction_indices_local = zeros(Int64, tile_size)
     factorization_source_cols = zeros(Int64, 2 * tile_size)
     factorization_panel_row_owned_swap_cols = zeros(Int64, 2 * tile_size)
     factorization_source_swap_labels = zeros(Int64, 2 * tile_size)
@@ -115,9 +129,12 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
     return (; factors, col_permutation, group_K, group_L, group_k, group_l,
             factorization_matrix_storage, factorization_matrix_parts,
             factorization_matrix_parts_row_ranges, factorization_matrix_parts_col_ranges,
-            factorization_locally_owned_cols, factorization_pivoting_buffer,
-            factorization_jpiv, factorization_pivoting_reduction_buffer,
-            factorization_pivoting_reduction_indices, factorization_source_cols,
+            factorization_locally_owned_cols,
+            factorization_pivot_generation_shared_tree_sizes,
+            factorization_pivoting_buffer, factorization_jpiv,
+            factorization_pivoting_reduction_buffer,
+            factorization_pivoting_reduction_indices,
+            factorization_pivoting_reduction_indices_local, factorization_source_cols,
             factorization_panel_row_owned_swap_cols, factorization_source_swap_labels,
             factorization_col_swap_buffers, factorization_swap_flags, comm_requests,
             shared_comm_i, shared_comm_j, shared_comm_I, shared_comm_J)
@@ -260,10 +277,12 @@ function generate_pivots!(A_lu, panel)
         tile_size = A_lu.tile_size
         group_l = A_lu.group_l
         group_L = A_lu.group_L
+        pivot_generation_shared_tree_sizes = A_lu.factorization_pivot_generation_shared_tree_sizes
         pivoting_buffer = A_lu.factorization_pivoting_buffer
         jpiv = A_lu.factorization_jpiv
         pivoting_reduction_buffer = A_lu.factorization_pivoting_reduction_buffer
         pivoting_reduction_indices = A_lu.factorization_pivoting_reduction_indices
+        pivoting_reduction_indices_local = A_lu.factorization_pivoting_reduction_indices_local
         matrix_storage = A_lu.factorization_matrix_storage
         locally_owned_cols = A_lu.factorization_locally_owned_cols
         synchronize_shared = A_lu.synchronize_shared
@@ -280,102 +299,123 @@ function generate_pivots!(A_lu, panel)
         last_local_row = min(panel_group_row * tile_size, size(matrix_storage, 1))
         this_tile_size = last_local_row - first_local_row + 1
 
-        # Do 'tournament pivoting' in three stages:
-        #    All processes in each `shared_comm`.
-        # -> Root process of each shared-memory block, which is every process in
-        #    `distributed_comm`.
-        # -> Global root process, which is the root process of `distributed_comm`.
-        n_local_cols = size(matrix_storage, 2) - first_local_col + 1
-        cols_per_shared_proc = max((n_local_cols + shared_comm_size - 1) ÷ shared_comm_size,
-                                   this_tile_size)
-        this_shared_proc_cols =
-            (shared_comm_rank*cols_per_shared_proc+first_local_col:min((shared_comm_rank+1)*cols_per_shared_proc+first_local_col-1,size(matrix_storage,2)))
-
-        # We keep at least one tile per shared-mem process, so sometimes some processes may
-        # have no work to do.
-        n_active_shared_procs = (n_local_cols + cols_per_shared_proc - 1) ÷ cols_per_shared_proc
-        last_proc_n_cols = n_local_cols - (n_active_shared_procs - 1) * cols_per_shared_proc
-        last_proc_missing_cols = max(0, this_tile_size - last_proc_n_cols)
-        if shared_comm_rank < n_active_shared_procs
-            panel_buffer_offset = shared_comm_rank * cols_per_shared_proc * this_tile_size
-            panel_buffer_n_cols = length(this_shared_proc_cols)
-            panel_buffer_size = panel_buffer_n_cols * this_tile_size
-            this_lu_panel_buffer = reshape(@view(pivoting_buffer[panel_buffer_offset+1:panel_buffer_offset+panel_buffer_size]),
-                                           this_tile_size, panel_buffer_n_cols)
-            this_lu_panel_buffer .= @view matrix_storage[first_local_row:last_local_row,
-                                                         this_shared_proc_cols]
-            # LU factorize this locally-owned part of the row to get the pivots, we will
-            # then reduce the locally-found pivot columns with those found by all other
-            # processes on the shared-memory communicator.
-            # In the tournament pivoting algorithm implemented in `generate_pivots!()`
-            # [Grigori et al. (2011)], the locally-owned block may be singular here. Even if
-            # the block is singular, we can still generate pivots and construct LU factors.
-            # These pivot columns can then be used for the tournament pivoting.
-            column_pivot_lu!(this_lu_panel_buffer, jpiv)
-            shared_local_pivot_indices =
-                ipiv2perm_truncated(jpiv, panel_buffer_n_cols,
-                                    min(this_tile_size, size(this_lu_panel_buffer, 2)))
-            indices_offset = shared_comm_rank * this_tile_size
-            n_indices = min(this_tile_size,length(shared_local_pivot_indices))
-            @views @. pivoting_reduction_indices[indices_offset+1:indices_offset+n_indices] =
-                shared_local_pivot_indices[1:n_indices] + this_shared_proc_cols[1] - 1
+        # Copy data into pivoting_buffer to be LU factorized.
+        total_local_cols = size(matrix_storage, 2) - first_local_col + 1
+        local_cols_offset = first_local_col - 1
+        copy_cols_per_rank = (total_local_cols + shared_comm_size - 1) ÷ shared_comm_size
+        copy_col_range = shared_comm_rank*copy_cols_per_rank+first_local_col:min((shared_comm_rank+1)*copy_cols_per_rank,total_local_cols)+first_local_col-1
+        copy_ncol = length(copy_col_range)
+        if copy_ncol > 0
+            copy_buffer_offset = (copy_col_range[1]-1) * this_tile_size
+            copy_buffer_size = copy_ncol * this_tile_size
+            copy_pivot_buffer = reshape(@view(pivoting_buffer[copy_buffer_offset+1:copy_buffer_offset+copy_buffer_size]),
+                                        this_tile_size, copy_ncol)
+            copy_pivot_buffer .= @view matrix_storage[first_local_row:last_local_row,copy_col_range]
+        end
+        if shared_rank = 0
+            # Initial set of indices that will be permuted as pivoting progresses.
+            @views pivoting_reduction_indices[1:total_local_cols] .=
+                first_local_col:size(matrix_storage,2)
         end
         synchronize_shared()
 
-        if shared_comm_rank == 0
-            candidate_pivot_indices = @view pivoting_reduction_indices[1:n_active_shared_procs*this_tile_size-last_proc_missing_cols]
-            if n_active_shared_procs == 1
-                # Only this process did any work in the previous step, so no need to re-do LU
-                # factorization here.
-                local_panel_pivot_indices = shared_local_pivot_indices
-                local_pivot_indices =
-                    candidate_pivot_indices[1:min(this_tile_size,length(candidate_pivot_indices))]
-                global_pivot_indices = locally_owned_cols[local_pivot_indices]
-                lu_panel_buffer = this_lu_panel_buffer
-            else
-                n_buffer_cols = length(candidate_pivot_indices)
-                # Construct a reshaped view so that lu_panel_buffer is a contiguously-allocated
-                # array. Need this complication because the number of rows can be
-                # different for the last `panel`, and slicing the rows of a 2D buffer
-                # would give non-contiguous storage.
-                lu_panel_buffer = reshape(@view(pivoting_buffer[1:n_buffer_cols*this_tile_size]),
-                                          this_tile_size, n_buffer_cols)
-                lu_panel_buffer .= @view matrix_storage[first_local_row:last_local_row,candidate_pivot_indices]
+        # Do 'tournament pivoting' in two stages:
+        #    Each shared-memory block does a 'binary' tree reduction to reduce
+        #    `shared_n_cols` pivots to `this_tile_size` pivots.
+        # -> Root processes of the shared-memory blocks (the processes in
+        #    `distributed_comm`) do a 'binary' tree reduction to reduce
+        #    `distributed_comm_size * this_tile_size` pivots to `this_tile_size` pivots.
+        # When there are not enough pivots to have `2*this_tile_size` columns per process,
+        # some steps will be skipped until the number of processes participating is small
+        # enough.
+        shared_n_cols = size(matrix_storage, 2) - first_local_col + 1
+        shared_n_levels = length(pivot_generation_shared_tree_sizes)
+        shared_pivot_buffer =
+            reshape(@view(pivoting_buffer[1:this_tile_size*total_local_cols]),
+                    this_tile_size, total_local_cols)
+        function shared_memory_tree_pivot_generation!(level, n_cols)
+            # Note that all processes in shared_comm have to go through all levels of
+            # `shared_memory_tree_pivot_generation()` so that we can use
+            # `synchronize_shared()` within the recursive calls, instead of having to
+            # create separate communicators for every subset of processes that might be
+            # participating.
+            if level > n_levels
+                return nothing
+            end
+            if level < n_levels && n_cols ≤ pivot_generation_shared_tree_sizes[level+1] * 2 * this_tile_size
+                # Not enough work to do on this level, skip to the next level.
+                return shared_memory_tree_pivot_generation(level + 1, n_cols)
+            end
+            level_nproc = pivot_generation_shared_tree_sizes[level]
+            cols_per_shared_proc = max((n_cols + level_nproc - 1) ÷ level_nproc,
+                                       2 * this_tile_size)
 
+            if shared_comm_rank * cols_per_shared_proc < n_cols
+                col_offset = shared_comm_rank * cols_per_shared_proc
+                panel_buffer_offset = col_offset * this_tile_size
+                panel_buffer_n_cols = length(this_shared_proc_cols)
+                panel_buffer_size = panel_buffer_n_cols * this_tile_size
+                this_lu_panel_buffer =
+                    reshape(@view(pivoting_buffer[panel_buffer_offset+1:panel_buffer_offset+panel_buffer_size]),
+                            this_tile_size, panel_buffer_n_cols)
                 # LU factorize this locally-owned part of the row to get the pivots, we
                 # will then reduce the locally-found pivot columns with those found by all
-                # other blocks that share this row.
+                # other processes on the shared-memory communicator.
                 # In the tournament pivoting algorithm implemented in `generate_pivots!()`
-                # [Grigori et al. (2011)], the locally-owned block may be singular. Even
-                # if the local block is singular, we can still generate pivots and
+                # [Grigori et al. (2011)], the locally-owned block may be singular here.
+                # Even if the block is singular, we can still generate pivots and
                 # construct LU factors. These pivot columns can then be used for the
                 # tournament pivoting.
-                column_pivot_lu!(lu_panel_buffer, jpiv)
-                # Get the columns for just the first `this_tile_size` pivots (or all the
-                # columns, if less than `this_tile_size`), which is the number need to
-                # find in the end, after reducing over all blocks.
-                # Using the our custom ipiv2perm_truncated is slightly more efficient than
-                # constructing the full permutation vector and then selecting only the first
-                # `section_width` entries from it.
-                local_panel_pivot_indices =
-                    ipiv2perm_truncated(jpiv, n_buffer_cols,
-                                        min(this_tile_size, size(lu_panel_buffer, 2)))
-                local_pivot_indices = candidate_pivot_indices[local_panel_pivot_indices]
-                global_pivot_indices = locally_owned_cols[local_pivot_indices]
+                column_pivot_lu!(this_lu_panel_buffer, jpiv)
+                shared_local_pivot_indices =
+                    ipiv2perm_truncated(jpiv, n_cols,
+                                        min(this_tile_size, panel_buffer_n_cols))
+                for (i,local_pivot) ∈ enumerate(shared_local_pivot_indices)
+                    pivoting_reduction_indices_local[i] = pivoting_reduction_indices[local_pivot+col_offset]
+                end
             end
+            synchronize_shared()
 
+            # Update `pivoting_reduction_indices` and shared_pivot_buffer with the top
+            # `this_tile_size` pivot indices and columns.
+            if shared_comm_rank * cols_per_shared_proc < n_cols
+                local_offset = shared_comm_rank * this_tile_size
+                for i ∈ 1:length(shared_local_pivot_indices)
+                    local_pivot = pivoting_reduction_indices_local[i]
+                    pivoting_reduction_indices[local_offset+i] = local_pivot
+                    @views shared_pivot_buffer[:,i+local_offset] .=
+                        matrix_storage[first_local_row:last_local_row,local_pivot]
+                end
+            end
+            synchronize_shared()
+
+            # Continue on the next level, with fewer processes.
+            shared_memory_tree_pivot_generation(level + 1, level_nproc * this_tile_size)
+        end
+
+        shared_memory_tree_pivot_generation!(1, shared_n_cols)
+
+        if shared_comm_rank == 0
             if group_L == 1
-                # All columns are local to the block, so no need for further reduction or
-                # factorisation.
-                sub_column_pivot_indices = @view pivoting_reduction_indices[1:this_tile_size]
-                sub_column_pivot_indices .= global_pivot_indices
-
-                # For use later, need the factorized diagonal tile.
-                reduced_buffer =
-                    reshape(@view(pivoting_reduction_buffer[1:this_tile_size^2]),
-                            this_tile_size, this_tile_size)
-                @views reduced_buffer .= lu_panel_buffer[1:this_tile_size,1:this_tile_size]
+                # All columns are local to the block, so no need for further reduction,
+                # factorisation, or local->global index conversion.
             else
+                # Copy the matrix columns into a reduction buffer.
+                n_local_cols = min(this_tile_size, total_local_cols)
+                reduction_buffer =
+                    reshape(@view(pivoting_reduction_buffer[1:this_tile_size * n_local_cols]),
+                            this_tile_size, n_local_cols)
+                # Convert the 'local' pivot indices to global ones.
+                local_pivot_indices = @view pivoting_reduction_indices_local[1:n_local_cols]
+                local_pivot_indices .= @view pivoting_reduction_indices[1:n_local_cols]
+                global_pivot_indices = @view pivoting_reduction_indices[1:n_local_cols]
+                for i ∈ 1:n_local_cols
+                    local_pivot = local_pivot_indices[i]
+                    global_pivot_indices[i] = locally_owned_cols[local_pivot]
+                    @views reduction_buffer[:,i] .=
+                        matrix_storage[first_local_row:last_local_row,local_pivot]
+                end
+
                 # Collect all the local pivot columns and indices onto the `panel_l`
                 # block.
                 if group_l == panel_l
