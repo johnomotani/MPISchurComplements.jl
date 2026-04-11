@@ -88,6 +88,19 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
                                             (group_col-1)*tile_size+1:min(group_col*tile_size,local_storage_n)])
          for group_row ∈ 1:group_n_rows, group_col ∈ 1:group_n_cols]
 
+    # Generate a 'binary' tree of disributed-memory ranks that will participate in the
+    # disributed-memory part of the parallel pivot generation.
+    distributed_size_prime_factors = factor(Vector, group_L)
+    factorization_pivot_generation_distributed_tree_sizes = [group_L]
+    # `reverse()` so that we divide by the largest factors first. Should not affect
+    # overall run time as the order of the factors just shuffles around work between
+    # different levels, but this order minimises the total work done, which might
+    # marginally help power consumption?
+    for f in reverse(distributed_size_prime_factors)
+        push!(factorization_pivot_generation_distributed_tree_sizes,
+              factorization_pivot_generation_distributed_tree_sizes[end] ÷ f)
+    end
+
     # Generate a 'binary' tree of shared-memory ranks that will participate in the
     # shared-memory part of the parallel pivot generation.
     shared_size_prime_factors = factor(Vector, shared_comm_size)
@@ -130,6 +143,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
             factorization_matrix_storage, factorization_matrix_parts,
             factorization_matrix_parts_row_ranges, factorization_matrix_parts_col_ranges,
             factorization_locally_owned_cols,
+            factorization_pivot_generation_distributed_tree_sizes,
             factorization_pivot_generation_shared_tree_sizes,
             factorization_pivoting_buffer, factorization_jpiv,
             factorization_pivoting_reduction_buffer,
@@ -277,12 +291,12 @@ function generate_pivots!(A_lu, panel)
         tile_size = A_lu.tile_size
         group_l = A_lu.group_l
         group_L = A_lu.group_L
+        pivot_generation_distributed_tree_sizes = A_lu.factorization_pivot_generation_distributed_tree_sizes
         pivot_generation_shared_tree_sizes = A_lu.factorization_pivot_generation_shared_tree_sizes
         pivoting_buffer = A_lu.factorization_pivoting_buffer
         jpiv = A_lu.factorization_jpiv
         pivoting_reduction_buffer = A_lu.factorization_pivoting_reduction_buffer
         pivoting_reduction_indices = A_lu.factorization_pivoting_reduction_indices
-        pivoting_reduction_indices_local = A_lu.factorization_pivoting_reduction_indices_local
         matrix_storage = A_lu.factorization_matrix_storage
         locally_owned_cols = A_lu.factorization_locally_owned_cols
         synchronize_shared = A_lu.synchronize_shared
@@ -298,9 +312,10 @@ function generate_pivots!(A_lu, panel)
         first_local_row = (panel_group_row - 1) * tile_size + 1
         last_local_row = min(panel_group_row * tile_size, size(matrix_storage, 1))
         this_tile_size = last_local_row - first_local_row + 1
+        pivoting_reduction_indices_local = @view A_lu.factorization_pivoting_reduction_indices_local[1:this_tile_size]
 
         # Copy data into pivoting_buffer to be LU factorized.
-        total_local_cols = size(matrix_storage, 2) - first_local_col + 1
+        total_local_cols = max(size(matrix_storage, 2) - first_local_col + 1, 0)
         local_cols_offset = first_local_col - 1
         copy_cols_per_rank = (total_local_cols + shared_comm_size - 1) ÷ shared_comm_size
         copy_col_range = shared_comm_rank*copy_cols_per_rank+first_local_col:min((shared_comm_rank+1)*copy_cols_per_rank,total_local_cols)+first_local_col-1
@@ -333,16 +348,17 @@ function generate_pivots!(A_lu, panel)
         shared_pivot_buffer =
             reshape(@view(pivoting_buffer[1:this_tile_size*total_local_cols]),
                     this_tile_size, total_local_cols)
+        shared_n_levels = length(pivot_generation_shared_tree_sizes)
         function shared_memory_tree_pivot_generation!(level, n_cols)
             # Note that all processes in shared_comm have to go through all levels of
             # `shared_memory_tree_pivot_generation()` so that we can use
             # `synchronize_shared()` within the recursive calls, instead of having to
             # create separate communicators for every subset of processes that might be
             # participating.
-            if level > n_levels
+            if level > shared_n_levels
                 return nothing
             end
-            if level < n_levels && n_cols ≤ pivot_generation_shared_tree_sizes[level+1] * 2 * this_tile_size
+            if level < shared_n_levels && n_cols ≤ pivot_generation_shared_tree_sizes[level+1] * 2 * this_tile_size
                 # Not enough work to do on this level, skip to the next level.
                 return shared_memory_tree_pivot_generation(level + 1, n_cols)
             end
@@ -400,113 +416,146 @@ function generate_pivots!(A_lu, panel)
                 # All columns are local to the block, so no need for further reduction,
                 # factorisation, or local->global index conversion.
             else
-                # Copy the matrix columns into a reduction buffer.
                 n_local_cols = min(this_tile_size, total_local_cols)
+                # Define a reduction buffer. Note that we just reshape the full
+                # `pivoting_reduction_buffer`, but only use some number of columns at the
+                # beginning of the buffer - usually this buffer is 'too big'. Similarly
+                # `pivoting_reduction_indices` is 'too big'.
                 reduction_buffer =
-                    reshape(@view(pivoting_reduction_buffer[1:this_tile_size * n_local_cols]),
-                            this_tile_size, n_local_cols)
+                    reshape(pivoting_reduction_buffer, this_tile_size, group_L *
+                            tile_size)
                 # Convert the 'local' pivot indices to global ones.
                 local_pivot_indices = @view pivoting_reduction_indices_local[1:n_local_cols]
                 local_pivot_indices .= @view pivoting_reduction_indices[1:n_local_cols]
-                global_pivot_indices = @view pivoting_reduction_indices[1:n_local_cols]
+                # Copy the local matrix columns into a reduction buffer.
                 for i ∈ 1:n_local_cols
                     local_pivot = local_pivot_indices[i]
-                    global_pivot_indices[i] = locally_owned_cols[local_pivot]
+                    pivoting_reduction_indices[i] = locally_owned_cols[local_pivot]
                     @views reduction_buffer[:,i] .=
                         matrix_storage[first_local_row:last_local_row,local_pivot]
                 end
 
-                # Collect all the local pivot columns and indices onto the `panel_l`
-                # block.
-                if group_l == panel_l
-                    n_cols_from_l = [get_n_cols_from_l(l, panel_l, panel_group_col, group_L,
-                                                       length(local_panel_pivot_indices),
-                                                       n_tiles, n, tile_size)
-                                     for l ∈ 1:group_L]
-                    l_cols_end = cumsum(n_cols_from_l)
-                    n_reduced_cols = l_cols_end[end]
-                    reduced_buffer =
-                        reshape(@view(pivoting_reduction_buffer[1:this_tile_size*n_reduced_cols]),
-                                this_tile_size, n_reduced_cols)
-                    reduced_col_indices = @view pivoting_reduction_indices[1:n_reduced_cols]
-
-                    # Post receives for the columns and column indices from other blocks.
-                    req_counter = 0
-                    for l ∈ 1:group_L
-                        if l == group_l
-                            # This rank does not need to communicate with itself!
-                            continue
-                        end
-                        if n_cols_from_l[l] == 0
-                            # No cols to colect
-                            continue
-                        end
-                        # Each rank in this row is offset from the next/previous in the
-                        # distributed communicator `distributed_comm` by 1.
-                        rank_l = distributed_comm_rank + (l - group_l)
-                        if l == 1
-                            first_col = 1
-                        else
-                            first_col = l_cols_end[l-1] + 1
-                        end
-                        l_counter = 0
-                        for col ∈ first_col:l_cols_end[l]
-                            l_counter += 1
-                            reqs[req_counter+=1] =
-                                MPI.Irecv!(@view(reduced_buffer[:,col]), distributed_comm;
-                                           source=rank_l, tag=l_counter)
-                        end
-                        l_counter += 1
-                        reqs[req_counter+=1] =
-                            MPI.Irecv!(@view(reduced_col_indices[first_col:l_cols_end[l]]),
-                                       distributed_comm; source=rank_l, tag=l_counter)
-                    end
-
-                    # Copy in the local contributions
-                    l = group_l
-                    if group_l == 1
-                        first_col = 1
-                    else
-                        first_col = l_cols_end[l-1]+1
-                    end
-                    @views reduced_buffer[:,first_col:l_cols_end[l]] .=
-                        matrix_storage[first_local_row:last_local_row,local_pivot_indices]
-                    @views reduced_col_indices[first_col:l_cols_end[l]] .= global_pivot_indices
-
-                    MPI.Waitall(reqs[1:req_counter])
-
-                    # Do an LU factorization on the reduced columnss. This gives the final
-                    # pivot indices, and also the (section_width,section_width) top-left
-                    # block of the LU factors.
-                    column_pivot_lu!(reduced_buffer, jpiv)
-                    buffer_pivot_indices = ipiv2perm_truncated(jpiv, n_reduced_cols,
-                                                               this_tile_size)
-                    # Is OK to re-use the pivoting_reduction_indices buffer, as we are already
-                    # finished with `reduced_col_indices`.
-                    # The pivot indices stored in this buffer will be broadcast to all ranks in
-                    # `apply_pivots_from_sub_row!()`.
-                    sub_column_pivot_indices = @view pivoting_reduction_indices[1:this_tile_size]
-                    sub_column_pivot_indices .= reduced_col_indices[buffer_pivot_indices]
-
-                    # For use later, only need the factorized diagonal tile, which is
-                    # stored in the first tile_size*tile_size entries of reduced_buffer.
+                group_rows_in_panel = n_tiles - panel + 1
+                if group_rows_in_panel < group_L
+                    # Not all distributed ranks in the group-row own entries in the top
+                    # panel. It would be silly to send zero-size messages. This should
+                    # only happen for very small panels, so efficiency is not too
+                    # important. To avoid needing to factorize `group_rows_in_panel`, set
+                    # up a tree which just reduces to one process in a single step.
+                    tree_sizes = [group_rows_in_panel, 1]
+                    n_participating = group_rows_in_panel
+                    is_participating = n_local_cols > 0
                 else
-                    # Get the local pivot columns ready for collection.
-                    if length(local_pivot_indices) > 0
-                        collecting_rank = (panel_k - 1) * group_L + panel_l - 1
-                        req_counter = 0
-                        for col ∈ local_pivot_indices
-                            req_counter += 1
-                            reqs[req_counter] =
-                                MPI.Isend(@view(matrix_storage[first_local_row:last_local_row,col]),
-                                          distributed_comm; dest=collecting_rank, tag=req_counter)
-                        end
-                        req_counter += 1
-                        reqs[req_counter] =
-                            MPI.Isend(global_pivot_indices, distributed_comm;
-                                      dest=collecting_rank, tag=req_counter)
-                        MPI.Waitall(reqs[1:req_counter])
+                    tree_sizes = pivot_generation_distributed_tree_sizes
+                    n_participating = group_L
+                    is_participating = true
+                end
+
+                # We gather the pivot indices and columns onto the process with
+                # `group_l==panel_l`, so when calculating 'ranks' within this reduction
+                # process, we do so relative to that process.
+                distributed_n_levels = length(tree_sizes)
+                function distributed_memory_tree_pivot_generation!(level, n_participating,
+                                                                   tree_sizes)
+                    n_procs_this_level = tree_sizes[level]
+                    if n_procs_this_level == 1
+                        return nothing
                     end
+
+                    rank_step = n_participating ÷ n_procs_this_level
+
+                    # Rank within the processes that are participating at this level.
+                    level_rank = (group_l - panel_l) ÷ rank_step
+
+                    n_procs_next_level = tree_sizes[level+1]
+                    level_rank_offset = level_rank % n_procs_next_level
+                    is_gathering_proc = level_rank_offset == 0
+
+                    if is_gathering_proc
+                        # Note that the gathering process owns the diagonal tile, and we
+                        # only use this branch of the code when the diagonal tile is not
+                        # the last one, so here the diagonal tile is always full-sized.
+                        n_reduced_cols = this_tile_size
+                        for r_offset ∈ 1:rank_step-1
+                            # When not all ranks in the group row are participating, the
+                            # source rank never needs to wrap back around to start again
+                            # from 0, so the `% group_L` is not needed, but does not hurt.
+                            # When all ranks are participating there are `group_L` in
+                            # total, and the rank may need to wrap around (when panel_l >
+                            # 1).
+                            source_l = (group_l - 1 + r_offset * rank_step) % group_L + 1
+
+                            # Usually we get this_tile_size rows from each source, but
+                            # sometimes a source that owns columns at the edge of the
+                            # matrix might send fewer.
+                            if source_l < panel_l
+                                source_first_global_col = panel_group_col * group_L * tile_size + 1
+                            else
+                                source_first_global_col = (panel_group_col - 1) * group_L * tile_size + 1
+                            end
+                            n_cols_from_source = min(this_tile_size, n - source_first_global_col + 1)
+                            n_reduced_cols += n_cols_from_source
+                            source_offset = r_offset * this_tile_size
+
+                            source_r = (group_k - 1) * group_L + source_l - 1
+                            # MPI.jl doesn't like ReshapedArray type of reduction_buffer,
+                            # but we only need to communicate the underlying storage, so
+                            # communicate pivoting_reduction_buffer directly.
+                            reqs[r_offset] =
+                                MPI.Irecv!(@view(pivoting_reduction_buffer[this_tile_size*source_offset+1:this_tile_size*(source_offset+n_cols_from_source)]),
+                                           distributed_comm; source=source_r, tag=1)
+                            reqs[rank_step-1+r_offset] =
+                                MPI.Irecv!(@view(pivoting_reduction_indices[source_offset+1:source_offset+n_cols_from_source]),
+                                           distributed_comm; source=source_r, tag=2)
+                        end
+
+                        # Wait for all panel columns to arrive. Do not need indices yet,
+                        # so wait for those later.
+                        MPI.Waitall(@view(reqs[1:rank_step-1]))
+
+                        # Need to keep the unfactorized columns, so copy the data into
+                        # another buffer for factorization.
+                        factorization_buffer =
+                            reshape(@view(pivoting_buffer[1:this_tile_size*n_reduced_cols]),
+                                    this_tile_size, n_reduced_cols)
+                        factorization_buffer .= @view pivoting_reduction_buffer[:,1:n_reduced_cols]
+
+                        column_pivot_lu!(factorization_buffer, jpiv)
+                        buffer_pivot_indices = ipiv2perm_truncated(jpiv, n_reduced_cols,
+                                                                   this_tile_size)
+
+                        # Wait for all indices to arrive.
+                        MPI.Waitall(@view(reqs[rank_step:2*rank_step-2]))
+
+                        # Use `pivoting_reduction_indices_local` as an intermediate to
+                        # avoid having to implicitly allocate a buffer to copy indices.
+                        pivoting_reduction_indices_local .= @view pivoting_reduction_indices[buffer_pivot_indices]
+                        @views pivoting_reduction_indices[1:this_tile_size] .= pivoting_reduction_indices_local
+
+                        return distributed_memory_tree_pivot_generation!(level + 1,
+                                                                         n_participating,
+                                                                         tree_sizes)
+                    else
+                        # Send pivot columns and indices to the gathering
+                        # process.
+                        gathering_rank_l = (group_l - 1 - level_rank_offset * rank_step) % group_L + 1
+                        gathering_rank = (group_k - 1) * group_L + gathering_rank_l - 1
+                        # MPI.jl doesn't like ReshapedArray type of reduction_buffer, but
+                        # we only need to communicate the underlying storage, so
+                        # communicate pivoting_reduction_buffer directly.
+                        reqs[1] = MPI.Isend(@view(pivoting_reduction_buffer[1:this_tile_size*n_local_cols]),
+                                            distributed_comm; dest=gathering_rank, tag=1)
+                        reqs[2] = MPI.Isend(@view(pivoting_reduction_indices[1:n_local_cols]),
+                                            distributed_comm; dest=gathering_rank, tag=2)
+                        MPI.Waitall(@view(reqs[1:2]))
+                        return nothing
+                    end
+
+                    return nothing
+                end
+
+                if is_participating
+                    distributed_memory_tree_pivot_generation!(1, n_participating, tree_sizes)
                 end
             end
         end
