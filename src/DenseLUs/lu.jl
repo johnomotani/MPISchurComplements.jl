@@ -120,7 +120,8 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
     factorization_pivoting_reduction_buffer = allocate_shared_float(tile_size * group_L
                                                                     * tile_size)
     factorization_pivoting_reduction_indices =
-        allocate_shared_int(max(tile_size * group_L * shared_comm_size, 2 * tile_size))
+        allocate_shared_int(max(tile_size * group_L * shared_comm_size, 2 * tile_size,
+                                local_storage_m))
     factorization_pivoting_reduction_indices_local = zeros(Int64, tile_size)
     factorization_source_cols = zeros(Int64, 2 * tile_size)
     factorization_panel_row_owned_swap_cols = zeros(Int64, 2 * tile_size)
@@ -368,7 +369,8 @@ function generate_pivots!(A_lu, panel)
         if shared_comm_rank * cols_per_shared_proc < n_cols
             col_offset = shared_comm_rank * cols_per_shared_proc
             panel_buffer_offset = col_offset * this_tile_size
-            panel_buffer_n_cols = length(this_shared_proc_cols)
+            panel_buffer_n_cols = min(cols_per_shared_proc,
+                                      size(matrix_storage, 2) - (panel_buffer_offset + first_local_col - 1))
             panel_buffer_size = panel_buffer_n_cols * this_tile_size
             this_lu_panel_buffer =
                 reshape(@view(pivoting_buffer[panel_buffer_offset+1:panel_buffer_offset+panel_buffer_size]),
@@ -405,7 +407,7 @@ function generate_pivots!(A_lu, panel)
         synchronize_shared()
 
         # Continue on the next level, with fewer processes.
-        shared_memory_tree_pivot_generation(level + 1, level_nproc * this_tile_size)
+        shared_memory_tree_pivot_generation!(level + 1, level_nproc * this_tile_size)
     end
 
     shared_memory_tree_pivot_generation!(1, shared_n_cols)
@@ -981,7 +983,7 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
         n_tiles = A_lu.n_tiles
         distributed_comm_rank = A_lu.distributed_comm_rank
         shared_comm_rank = A_lu.shared_comm_rank
-        pivoting_reduction_buffer = A_lu.factorization_pivoting_reduction_buffer
+        matrix_storage = A_lu.factorization_matrix_storage
         matrix_parts = A_lu.factorization_matrix_parts
         group_K = A_lu.group_K
         group_L = A_lu.group_L
@@ -991,6 +993,25 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
         panel_group_row, panel_k = divrem(panel - 1, group_K) .+ 1
         panel_group_col, panel_l = divrem(panel - 1, group_L) .+ 1
         diagonal_distributed_rank = (panel_k - 1) * group_L + panel_l - 1
+        tile_size = A_lu.tile_size
+        first_panel_row = (panel_group_row - 1) * tile_size + 1
+        last_panel_row = min(panel_group_row * tile_size, size(matrix_storage, 1))
+        this_tile_size = last_panel_row - first_panel_row + 1
+        if group_L == 1
+            # The top tile_size*tile_size part of pivoting_buffer on the rank that owns
+            # the diagonal tile contains the factorized diagonal sub-tile that was
+            # calculated in `generate_pivots!()`.
+            diagonal_sub_tile =
+                reshape(@view(A_lu.factorization_pivoting_buffer[1:this_tile_size*this_tile_size]),
+                        this_tile_size, this_tile_size)
+        else
+            # The top tile_size*tile_size part of pivoting_reduction_buffer on the rank
+            # that owns the diagonal tile contains the factorized diagonal sub-tile that
+            # was calculated in `generate_pivots!()`.
+            diagonal_sub_tile =
+                reshape(@view(A_lu.factorization_pivoting_reduction_buffer[1:this_tile_size*this_tile_size]),
+                        this_tile_size, this_tile_size)
+        end
         if panel == n_tiles
             # No remaining matix to update, so no need for communication or off-diagonal
             # update. Only need to copy LU-factorized block into matrx_storage
@@ -998,18 +1019,13 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
                 if distributed_comm_rank == diagonal_distributed_rank
                     this_part = matrix_parts[panel_group_row,panel_group_col]
                     this_tile_size = size(this_part, 1)
-                    diagonal_sub_tile =
-                        reshape(@view(pivoting_reduction_buffer[1:this_tile_size*this_tile_size]),
-                                this_tile_size, this_tile_size)
                     # Copy diagonal_sub_tile into the matrix storage.
                     this_part .= diagonal_sub_tile
                 end
             end
             return nothing
         end
-        tile_size = A_lu.tile_size
         distributed_comm = A_lu.distributed_comm
-        matrix_storage = A_lu.factorization_matrix_storage
         reqs = A_lu.comm_requests
         group_k = A_lu.group_k
         group_l = A_lu.group_l
@@ -1017,9 +1033,6 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
         row_buffers = A_lu.factorization_pivoting_buffer
         col_buffers = A_lu.factorization_col_swap_buffers
 
-        first_panel_row = (panel_group_row - 1) * tile_size + 1
-        last_panel_row = min(panel_group_row * tile_size, size(matrix_storage, 1))
-        this_tile_size = last_panel_row - first_panel_row + 1
         # Note that the size of the diagonal tile that we communicate/process here is always
         # `(tile_size,tile_size)`. The tile can only be smaller than `tile_size` when it is
         # the last diagonal tile, but that one does not need communication/processing here. So
@@ -1038,13 +1051,6 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
         # to create them too freely.
 
         if distributed_comm_rank == diagonal_distributed_rank
-            # The top tile_size*tile_size part of pivoting_reduction_buffer on
-            # this rank contains the diagonal sub-tile that was calculated in
-            # `generate_pivots!()`.
-            diagonal_sub_tile =
-                reshape(@view(pivoting_reduction_buffer[1:tile_size*tile_size]),
-                        tile_size, tile_size)
-
             if shared_comm_rank == 0
                 # Send the diagonal sub-tile to the other ranks in this sub-column.
                 # Send to below-diagonal ranks in the group first, as these have slightly more
@@ -1070,10 +1076,6 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
                 end
             end
         elseif group_k == panel_k
-            # Receive the diagonal sub-block.
-            diagonal_sub_tile =
-                reshape(@view(pivoting_reduction_buffer[1:tile_size*tile_size]),
-                        tile_size, tile_size)
             if shared_comm_rank == 0
                 # MPI.jl doesn't like ReshapedArray type, but we only need to communicate the
                 # underlying storage, so use `parent()` to extract a SubArray which MPI.jl can
@@ -1082,9 +1084,6 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
                           source=diagonal_distributed_rank)
             end
         elseif group_l == panel_l
-            diagonal_sub_tile =
-                reshape(@view(pivoting_reduction_buffer[1:tile_size*tile_size]),
-                        tile_size, tile_size)
             if shared_comm_rank == 0
                 # MPI.jl doesn't like ReshapedArray type, but we only need to communicate the
                 # underlying storage, so use `parent()` to extract a SubArray which MPI.jl can
