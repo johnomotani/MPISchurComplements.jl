@@ -127,10 +127,12 @@ function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
         end
 
         for panel ∈ 1:n_tiles
-            generate_pivots!(A_lu, panel)
-            apply_pivots_from_sub_row!(A_lu, panel)
-            update_sub_panel_off_diagonals!(A_lu, panel)
-            update_bottom_right_block!(A_lu, panel)
+            @sc_timeit A_lu.timer "panel=$panel" begin
+                generate_pivots!(A_lu, panel)
+                apply_pivots_from_sub_row!(A_lu, panel)
+                update_sub_panel_off_diagonals!(A_lu, panel)
+                update_bottom_right_block!(A_lu, panel)
+            end
         end
 
         gather_factors!(A_lu)
@@ -1040,10 +1042,6 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
                 # sub-column, and U is the upper-triangular factor of the diagonal sub-tile.
                 trsm!('R', 'U', 'N', 'N', 1.0, diagonal_sub_tile, col_buffer)
 
-                # Copy buffer back into shared_storage and matrix storage.
-                if shared_comm_size > 1
-                    col_buffer .= col_buffer
-                end
                 local_below_diagonal_sub_column .= col_buffer
             end
         end
