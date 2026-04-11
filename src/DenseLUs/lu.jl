@@ -1217,12 +1217,8 @@ function update_bottom_right_block!(A_lu, panel)
 
         top_panel_shared_local_n_cols = length(shared_local_col_range)
         if top_panel_shared_local_n_cols > 0
-            top_panel_shared_local_buffer_size = top_panel_n_rows * top_panel_shared_local_n_cols
-            top_panel_shared_local_buffer_offset = col_offset * top_panel_n_rows
             top_panel_shared_local_buffer =
-                reshape(@view(row_buffers[top_panel_shared_local_buffer_offset+1:top_panel_shared_local_buffer_offset+top_panel_shared_local_buffer_size]),
-                        top_panel_n_rows, top_panel_shared_local_n_cols)
-
+                @view top_panel_buffer[:,col_offset+1:col_offset+top_panel_shared_local_n_cols]
 
             # Perform the update of the bottom-right block.
             remaining_block = @view matrix_storage[left_panel_first_storage_row:end,
