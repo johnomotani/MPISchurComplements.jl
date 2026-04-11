@@ -103,6 +103,15 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
     comm_requests = [MPI.REQUEST_NULL for _ ∈
                      1:max((1 + tile_size) * group_L, group_K + group_L, 2 * tile_size)]
 
+    # Indices and row/column sizes for when we want to divide the shared-memory processes
+    # into a rectangular grid. Note shared_comm_i and shared_comm_j are 0-based indices.
+    shared_comm_size_factors =
+        [prod(x) for x in collect(unique(combinations(factor(Vector, shared_comm_size))))]
+    shared_factor_ind = findlast(x -> x≤sqrt(shared_comm_size), shared_comm_size_factors)
+    shared_comm_I = shared_comm_size_factors[shared_factor_ind]
+    shared_comm_J = shared_comm_size ÷ shared_comm_I
+    shared_comm_i, shared_comm_j = divrem(shared_comm_rank, shared_comm_J)
+
     return (; factors, col_permutation, group_K, group_L, group_k, group_l,
             factorization_matrix_storage, factorization_matrix_parts,
             factorization_matrix_parts_row_ranges, factorization_matrix_parts_col_ranges,
@@ -110,7 +119,8 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm_rank::Int64,
             factorization_jpiv, factorization_pivoting_reduction_buffer,
             factorization_pivoting_reduction_indices, factorization_source_cols,
             factorization_panel_row_owned_swap_cols, factorization_source_swap_labels,
-            factorization_col_swap_buffers, factorization_swap_flags, comm_requests)
+            factorization_col_swap_buffers, factorization_swap_flags, comm_requests,
+            shared_comm_i, shared_comm_j, shared_comm_I, shared_comm_J)
 end
 
 function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
@@ -870,15 +880,11 @@ function get_shared_local_row_range(A_lu, first_local_row)
     return first_local_row+offset:min(offset+first_local_row+rows_per_rank-1,total_local_rows), offset
 end
 
-function get_shared_local_col_range(A_lu, first_local_col)
-    shared_comm_rank = A_lu.shared_comm_rank
-    shared_comm_size = A_lu.shared_comm_size
-
-    total_local_cols = size(A_lu.factorization_matrix_storage, 2)
-    n_local_cols = total_local_cols - first_local_col + 1
-    cols_per_rank = (n_local_cols + shared_comm_size - 1) ÷ shared_comm_size
-    offset = shared_comm_rank * cols_per_rank
-    return first_local_col+offset:min(offset+first_local_col+cols_per_rank-1,total_local_cols), offset
+function get_shared_local_range(n, first_index, proc, nproc)
+    n_local_entries = n - first_index + 1
+    entries_per_proc = (n_local_entries + nproc - 1) ÷ nproc
+    offset = proc * entries_per_proc
+    return first_index+offset:min(offset+first_index+entries_per_proc-1,n), offset
 end
 
 function update_sub_panel_off_diagonals!(A_lu, panel)
@@ -1062,7 +1068,9 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
                 first_storage_col = (panel_group_col - 1) * tile_size + 1
             end
 
-            shared_local_col_range, col_offset = get_shared_local_col_range(A_lu, first_storage_col)
+            shared_local_col_range, col_offset =
+                get_shared_local_range(size(matrix_storage, 2), first_storage_col,
+                                       shared_comm_rank, shared_comm_size)
 
             if length(shared_local_col_range) > 0
                 n_rows = last_storage_row - first_storage_row + 1
@@ -1111,6 +1119,11 @@ function update_bottom_right_block!(A_lu, panel)
             return nothing
         end
         shared_comm_rank = A_lu.shared_comm_rank
+        shared_comm_size = A_lu.shared_comm_size
+        shared_comm_i = A_lu.shared_comm_i
+        shared_comm_j = A_lu.shared_comm_j
+        shared_comm_I = A_lu.shared_comm_I
+        shared_comm_J = A_lu.shared_comm_J
         tile_size = A_lu.tile_size
         group_k = A_lu.group_k
         group_K = A_lu.group_K
@@ -1135,7 +1148,7 @@ function update_bottom_right_block!(A_lu, panel)
         if group_k ≤ panel_k
             left_panel_first_storage_row = panel_group_row * tile_size + 1
         else
-            left_panel_first_storage_row = (panel_group_row -1) * tile_size + 1
+            left_panel_first_storage_row = (panel_group_row - 1) * tile_size + 1
         end
         left_panel_last_storage_row = size(matrix_storage, 1)
         left_panel_first_storage_col = (panel_group_col - 1) * tile_size + 1
@@ -1213,17 +1226,27 @@ function update_bottom_right_block!(A_lu, panel)
         end
 
         shared_local_col_range, col_offset =
-            get_shared_local_col_range(A_lu, top_panel_first_storage_col)
+            get_shared_local_range(size(matrix_storage, 2), top_panel_first_storage_col,
+                                   shared_comm_j, shared_comm_J)
+
+        shared_local_row_range, row_offset =
+            get_shared_local_range(size(matrix_storage, 1), left_panel_first_storage_row,
+                                   shared_comm_i, shared_comm_I)
 
         top_panel_shared_local_n_cols = length(shared_local_col_range)
-        if top_panel_shared_local_n_cols > 0
+        left_panel_shared_local_n_rows = length(shared_local_row_range)
+        if top_panel_shared_local_n_cols > 0 && left_panel_shared_local_n_rows > 0
             top_panel_shared_local_buffer =
                 @view top_panel_buffer[:,col_offset+1:col_offset+top_panel_shared_local_n_cols]
 
+            left_panel_shared_local_buffer =
+                @view left_panel_buffer[row_offset+1:row_offset+left_panel_shared_local_n_rows,:]
+
             # Perform the update of the bottom-right block.
-            remaining_block = @view matrix_storage[left_panel_first_storage_row:end,
+            remaining_block = @view matrix_storage[shared_local_row_range,
                                                    shared_local_col_range]
-            mul!(remaining_block, left_panel_buffer, top_panel_shared_local_buffer, -1.0, 1.0)
+            mul!(remaining_block, left_panel_shared_local_buffer,
+                 top_panel_shared_local_buffer, -1.0, 1.0)
         end
 
         synchronize_shared()

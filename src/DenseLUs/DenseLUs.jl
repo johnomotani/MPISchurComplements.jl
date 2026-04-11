@@ -61,6 +61,10 @@ import LinearAlgebra: lu!, ldiv!
     shared_comm::MPI.Comm
     shared_comm_rank::Int64
     shared_comm_size::Int64
+    shared_comm_i::Int64
+    shared_comm_j::Int64
+    shared_comm_I::Int64
+    shared_comm_J::Int64
     distributed_comm::MPI.Comm
     distributed_comm_rank::Int64
     distributed_comm_size::Int64
