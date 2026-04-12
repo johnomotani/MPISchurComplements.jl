@@ -360,7 +360,7 @@ function generate_pivots!(A_lu, panel)
         end
         if level < shared_n_levels && n_cols ≤ pivot_generation_shared_tree_sizes[level+1] * 2 * this_tile_size
             # Not enough work to do on this level, skip to the next level.
-            return shared_memory_tree_pivot_generation(level + 1, n_cols)
+            return shared_memory_tree_pivot_generation!(level + 1, n_cols)
         end
         level_nproc = pivot_generation_shared_tree_sizes[level]
         cols_per_shared_proc = max((n_cols + level_nproc - 1) ÷ level_nproc,
@@ -477,21 +477,23 @@ function generate_pivots!(A_lu, panel)
 
             # Wait for all panel columns to arrive. Do not need indices yet,
             # so wait for those later.
-            MPI.Waitall(@view(reqs[1:rank_step-1]))
+            MPI.Waitall(reqs[1:rank_step-1])
 
             # Need to keep the unfactorized columns, so copy the data into
             # another buffer for factorization.
             factorization_buffer =
                 reshape(@view(pivoting_buffer[1:this_tile_size*n_reduced_cols]),
                         this_tile_size, n_reduced_cols)
-            factorization_buffer .= @view pivoting_reduction_buffer[:,1:n_reduced_cols]
+            factorization_buffer .=
+                reshape(@view(pivoting_reduction_buffer[1:this_tile_size*n_reduced_cols]),
+                              this_tile_size, n_reduced_cols)
 
             column_pivot_lu!(factorization_buffer, jpiv)
             buffer_pivot_indices = ipiv2perm_truncated(jpiv, n_reduced_cols,
                                                        this_tile_size)
 
             # Wait for all indices to arrive.
-            MPI.Waitall(@view(reqs[rank_step:2*rank_step-2]))
+            MPI.Waitall(reqs[rank_step:2*rank_step-2])
 
             # Use `pivoting_reduction_indices_local` as an intermediate to
             # avoid having to implicitly allocate a buffer to copy indices.
@@ -513,7 +515,7 @@ function generate_pivots!(A_lu, panel)
                                 distributed_comm; dest=gathering_rank, tag=1)
             reqs[2] = MPI.Isend(@view(pivoting_reduction_indices[1:n_local_cols]),
                                 distributed_comm; dest=gathering_rank, tag=2)
-            MPI.Waitall(@view(reqs[1:2]))
+            MPI.Waitall(reqs[1:2])
             return nothing
         end
 
