@@ -321,7 +321,7 @@ function generate_pivots!(A_lu, panel)
     copy_col_range = shared_comm_rank*copy_cols_per_rank+first_local_col:min((shared_comm_rank+1)*copy_cols_per_rank,total_local_cols)+first_local_col-1
     copy_ncol = length(copy_col_range)
     if copy_ncol > 0
-        copy_buffer_offset = (copy_col_range[1]-1) * this_tile_size
+        copy_buffer_offset = shared_comm_rank*copy_cols_per_rank
         copy_buffer_size = copy_ncol * this_tile_size
         copy_pivot_buffer = reshape(@view(pivoting_buffer[copy_buffer_offset+1:copy_buffer_offset+copy_buffer_size]),
                                     this_tile_size, copy_ncol)
@@ -400,8 +400,12 @@ function generate_pivots!(A_lu, panel)
             for i ∈ 1:length(shared_local_pivot_indices)
                 local_pivot = pivoting_reduction_indices_local[i]
                 pivoting_reduction_indices[local_offset+i] = local_pivot
-                @views shared_pivot_buffer[:,i+local_offset] .=
-                    matrix_storage[first_local_row:last_local_row,local_pivot]
+                # On the last level we leave the factorized diagonal tile in
+                # `shared_pivot_buffer`.
+                if level < shared_n_levels
+                    @views shared_pivot_buffer[:,i+local_offset] .=
+                        matrix_storage[first_local_row:last_local_row,local_pivot]
+                end
             end
         end
         synchronize_shared()
@@ -519,7 +523,10 @@ function generate_pivots!(A_lu, panel)
     if shared_comm_rank == 0
         if group_L == 1
             # All columns are local to the block, so no need for further reduction,
-            # factorisation, or local->global index conversion.
+            # factorisation, or local->global index conversion. Just need to copy the
+            # factorized diagonal_sub_tile into pivoting_reduction_buffer.
+            @views pivoting_reduction_buffer[1:this_tile_size^2] .=
+                pivoting_buffer[1:this_tile_size^2]
         else
             n_local_cols = min(this_tile_size, total_local_cols)
             # Define a reduction buffer. Note that we just reshape the full
@@ -997,21 +1004,12 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
         first_panel_row = (panel_group_row - 1) * tile_size + 1
         last_panel_row = min(panel_group_row * tile_size, size(matrix_storage, 1))
         this_tile_size = last_panel_row - first_panel_row + 1
-        if group_L == 1
-            # The top tile_size*tile_size part of pivoting_buffer on the rank that owns
-            # the diagonal tile contains the factorized diagonal sub-tile that was
-            # calculated in `generate_pivots!()`.
-            diagonal_sub_tile =
-                reshape(@view(A_lu.factorization_pivoting_buffer[1:this_tile_size*this_tile_size]),
-                        this_tile_size, this_tile_size)
-        else
-            # The top tile_size*tile_size part of pivoting_reduction_buffer on the rank
-            # that owns the diagonal tile contains the factorized diagonal sub-tile that
-            # was calculated in `generate_pivots!()`.
-            diagonal_sub_tile =
-                reshape(@view(A_lu.factorization_pivoting_reduction_buffer[1:this_tile_size*this_tile_size]),
-                        this_tile_size, this_tile_size)
-        end
+        # The top tile_size*tile_size part of pivoting_reduction_buffer on the rank
+        # that owns the diagonal tile contains the factorized diagonal sub-tile that
+        # was calculated in `generate_pivots!()`.
+        diagonal_sub_tile =
+            reshape(@view(A_lu.factorization_pivoting_reduction_buffer[1:this_tile_size*this_tile_size]),
+                    this_tile_size, this_tile_size)
         if panel == n_tiles
             # No remaining matix to update, so no need for communication or off-diagonal
             # update. Only need to copy LU-factorized block into matrx_storage
