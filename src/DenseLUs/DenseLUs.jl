@@ -12,7 +12,7 @@ using ..MPISchurComplements: @sc_timeit
 
 import LinearAlgebra: lu!, ldiv!
 
-@kwdef struct DenseLU{T,Tmat,Tvec,Tintvec,Tfmp,Tsync,Ttimer}
+@kwdef struct DenseLU{T,Tmat,Tvec,Tintvec,Tfmp,Tslu,Tsync,Ttimer}
     m::Int64
     n::Int64
     factors::Tmat
@@ -26,15 +26,18 @@ import LinearAlgebra: lu!, ldiv!
     factorization_matrix_parts_row_ranges::Vector{UnitRange{Int64}}
     factorization_matrix_parts_col_ranges::Vector{UnitRange{Int64}}
     factorization_locally_owned_rows::Vector{Int64}
+    factorization_pivot_generation_distributed_tree_sizes::Vector{Int64}
     factorization_pivoting_buffer::Tvec
     factorization_local_left_panel_buffer::Vector{T}
-    factorization_pivoting_reduction_buffer::Tvec
+    factorization_pivoting_reduction_buffer::Tmat
     factorization_pivoting_reduction_indices::Tintvec
+    factorization_pivoting_reduction_indices_local::Vector{Int64}
     factorization_source_rows::Vector{Int64}
     factorization_locally_owned_swap_rows::Vector{Int64}
     factorization_source_swap_labels::Vector{Int64}
     factorization_row_swap_buffers::Tmat
     factorization_swap_flags::Vector{UInt8}
+    factorization_shared_lu::Tslu
     comm_requests::Vector{MPI.Request}
     my_L_tiles::Array{T,3}
     my_L_tile_row_ranges::Vector{UnitRange{Int64}}
@@ -110,9 +113,10 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, comm::MPI.Comm,
         # NamedTuples are fields of the DenseLU struct, which we splat into the DenseLU
         # constructor to avoid having to type out long lists of variable names repeatedly.
         lu_variables =
-            setup_lu(m, n, tile_size, shared_comm_rank, shared_comm_size,
+            setup_lu(m, n, tile_size, shared_comm, shared_comm_rank, shared_comm_size,
                      distributed_comm_rank[], distributed_comm_size[], datatype,
-                     allocate_shared_float, allocate_shared_int)
+                     allocate_shared_float, allocate_shared_int, synchronize_shared,
+                     timer)
 
         ldiv_variables =
             setup_ldiv(m, datatype, tile_size, shared_comm, shared_comm_size,
