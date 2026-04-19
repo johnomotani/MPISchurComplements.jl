@@ -18,6 +18,10 @@ function dense_lu_test(n_shared)
                 # If tile_size is bigger than m, the actual value of tile_size does not
                 # matter, so skip what would (mostly?) be identical repeated tests.
                 continue
+            elseif m > 128 && tile_size < 8
+                # Very small tile_size values are slow for large matrices, so skip these
+                # combinations to speed up tests.
+                continue
             end
             if distributed_rank == 0 && shared_rank == 0
                 println("dense_lu n_shared=$n_shared, m=$m, tile_size=$tile_size")
