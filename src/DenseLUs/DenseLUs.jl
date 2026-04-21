@@ -34,9 +34,10 @@ import LinearAlgebra: lu!, ldiv!
     factorization_pivoting_reduction_indices_local::Vector{Int64}
     factorization_source_rows::Vector{Int64}
     factorization_locally_owned_swap_rows::Vector{Int64}
-    factorization_source_swap_labels::Vector{Int64}
     factorization_row_swap_buffers::Tmat
-    factorization_swap_flags::Vector{UInt8}
+    factorization_top_panel_pivots::Tintvec
+    factorization_non_local_pivots::Tintvec
+    factorization_top_panel_rows_to_send::Tintvec
     factorization_shared_lu::Tslu
     comm_requests::Vector{MPI.Request}
     my_L_tiles::Array{T,3}

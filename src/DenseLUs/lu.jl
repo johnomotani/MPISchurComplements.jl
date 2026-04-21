@@ -1,4 +1,5 @@
 using ColumnPivotLUs
+using ColumnPivotLUs: apply_row_swaps!
 using Combinatorics
 using Primes
 
@@ -21,6 +22,45 @@ function ipiv2perm_truncated(v::AbstractVector{T}, maxi::Integer,
         p[i], p[v[i]] = p[v[i]], p[i]
     end
     return p[1:truncatei]
+end
+
+# Note `pivots` is overwritten by the result `ipiv`.
+function pivot2ipiv!(pivots::AbstractVector{<:Integer}, startind::Integer)
+    n_pivots = length(pivots)
+    for i ∈ 1:n_pivots
+        pivot = pivots[i]
+        # If `i` is contained in the remaining pivots, the data originally in row `i` is
+        # now in row `pivot`, so we need to replace `i` by `pivot` in the list.
+        # Any index can be contained in `pivots` only once, so we only have to search
+        # until we find the first occurence. `i` may also not occur in `pivots`, in which
+        # case we do not need to replace anything.
+        for j ∈ i+1:n_pivots
+            if pivots[j] == i + startind - 1
+                pivots[j] = pivot
+                break
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+    type_stable_findfirst(item, collection)
+
+Find the index of `item` in `collection`. If not found, return `-1`.
+
+`findfirst()` is not type-stable. For performance-sensitive code, this version may be more
+suitable.
+"""
+function type_stable_findfirst(item, collection)
+    position = -1
+    for (i, x) ∈ enumerate(collection)
+        if x == item
+            position = i
+            break
+        end
+    end
+    return position
 end
 
 function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
@@ -121,9 +161,11 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
     factorization_pivoting_reduction_indices_local = zeros(Int64, tile_size)
     factorization_source_rows = zeros(Int64, 2 * tile_size)
     factorization_locally_owned_swap_rows = zeros(Int64, 2 * tile_size)
-    factorization_source_swap_labels = zeros(Int64, 2 * tile_size)
     factorization_row_swap_buffers = allocate_shared_float(tile_size, local_storage_n)
-    factorization_swap_flags = zeros(UInt8, 2 * tile_size)
+    factorization_top_panel_pivots = allocate_shared_int(tile_size)
+    # Extra element so the number of non-local pivots can be stored in the last element.
+    factorization_non_local_pivots = allocate_shared_int(tile_size + 1)
+    factorization_top_panel_rows_to_send = allocate_shared_int(tile_size)
 
     if tile_size ≤ ColumnPivotLUs.block_size
         # No point using RowPivotLUMPI, as it will just pass through to `LAPACK.getrf!()`
@@ -149,9 +191,9 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
             factorization_pivoting_reduction_buffer,
             factorization_pivoting_reduction_indices,
             factorization_pivoting_reduction_indices_local, factorization_source_rows,
-            factorization_locally_owned_swap_rows, factorization_source_swap_labels,
-            factorization_row_swap_buffers, factorization_swap_flags,
-            factorization_shared_lu, comm_requests)
+            factorization_locally_owned_swap_rows, factorization_top_panel_pivots,
+            factorization_non_local_pivots, factorization_top_panel_rows_to_send,
+            factorization_row_swap_buffers, factorization_shared_lu, comm_requests)
 end
 
 function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
@@ -603,392 +645,297 @@ function generate_pivots!(A_lu, panel)
     return nothing
 end
 
+# Copy rows in a similar way as LAPACK's DLASWP interchanges rows.
+function copy_to_buffer!(buffer::AbstractMatrix, input_values::AbstractMatrix,
+                         rows_to_copy, n_rows_to_copy)
+    @inbounds begin
+        n = size(buffer, 2)
+        n32 = (n ÷ 32) * 32
+        if n32 != 0
+            for j ∈ 1:32:n32
+                for i ∈ 1:n_rows_to_copy
+                    r = rows_to_copy[i]
+                    for k ∈ j:j+31
+                        buffer[i,k] = input_values[r,k]
+                    end
+                end
+            end
+        end
+        if n32 != n
+            j = n32 + 1
+            for i ∈ 1:n_rows_to_copy
+                r = rows_to_copy[i]
+                for k ∈ j:n
+                    buffer[i,k] = input_values[r,k]
+                end
+            end
+        end
+    end
+    return nothing
+end
+
 function apply_pivots_from_sub_column!(A_lu, panel)
     @sc_timeit A_lu.timer "apply_pivots_from_sub_column!" begin
         row_permutation = A_lu.row_permutation
         distributed_comm = A_lu.distributed_comm
-        distributed_comm_rank = A_lu.distributed_comm_rank
         shared_comm_rank = A_lu.shared_comm_rank
+        shared_comm_size = A_lu.shared_comm_size
         reqs = A_lu.comm_requests
         m = A_lu.m
         tile_size = A_lu.tile_size
+        group_k = A_lu.group_k
         group_K = A_lu.group_K
         group_l = A_lu.group_l
         group_L = A_lu.group_L
         matrix_storage = A_lu.factorization_matrix_storage
         row_swap_buffers = A_lu.factorization_row_swap_buffers
-        swap_flags = A_lu.factorization_swap_flags
+        top_panel_pivots = A_lu.factorization_top_panel_pivots
+        non_local_pivots = A_lu.factorization_non_local_pivots
+        top_panel_rows_to_send = A_lu.factorization_top_panel_rows_to_send
+        synchronize_shared = A_lu.synchronize_shared
 
         panel_group_row, panel_k = divrem(panel - 1, group_K) .+ 1
-        panel_group_col, panel_l = divrem(panel - 1, group_L) .+ 1
+        panel_l = (panel - 1) % group_L + 1
         first_global_col = (panel - 1) * tile_size + 1
         last_global_col = min(panel * tile_size, m)
         this_tile_size = last_global_col - first_global_col + 1
-        local_diagonal_tile_offset = (panel_group_row - 1) * tile_size
 
-        # Broadcast the pivot indices for this sub column to all ranks.
         sub_column_pivot_indices = @view A_lu.factorization_pivoting_reduction_indices[1:this_tile_size]
+
+        # When using distributed-memory MPI, the pivot rows may be either owned by the
+        # same process as the one that owns the diagonal tile, or owned by some other
+        # process.
+        # Note that as long as the correct rows end up in the 'top panel' (in the correct
+        # order), the order of the following rows does not matter (these rows will just be
+        # sorted later on by later steps of the algorithm).
+        # Rows that were originally in the 'top panel' may end up, after row swaps:
+        #  1. Still in the 'top panel'.
+        #  2. Somewhere in the later rows owned by the process that owns the top panel.
+        #  3. On some other process.
+        # To pivot all these rows:
+        #  * Copy the rows that will end up on other ranks into send buffers.
+        #  * MPI-communicate from the send buffers to other ranks, and from other ranks
+        #    into the rows owned by the 'top panel' owning process that were sent to other
+        #    ranks.
+        #  * Generate an `ipiv` vector of pivots, that when applied on the 'top panel'
+        #    owning process will swap the now-locally-owned rows into the correct order.
+        #  * Apply the swaps defined by this `ipiv`.
+        top_panel_indices = (panel-1)*tile_size+1:min(panel*tile_size, m)
+        first_top_panel = top_panel_indices[1]
+        last_top_panel = top_panel_indices[end]
         if shared_comm_rank == 0
+            # Broadcast the pivot indices for this sub column to all ranks.
             diagonal_distributed_rank = (panel_l - 1) * group_K + panel_k - 1
             MPI.Bcast!(sub_column_pivot_indices, distributed_comm;
                        root=diagonal_distributed_rank)
-        end
 
-        # As this function is just array copies and communication, we do not use any
-        # shared-memory parallelism.
-        if shared_comm_rank == 0
-            diagonal_block_indices = (panel-1)*tile_size+1:min(panel*tile_size, m)
-            first_diag = diagonal_block_indices[1]
-            last_diag = diagonal_block_indices[end]
+            n_top_panel_pivots = 0
+            n_other_local_pivots = 0
+            n_non_local_pivots = 0
 
-            # By default, just send the row from the diagonal block back to the original
-            # position of the 'pivot row' that is being moved into the diagonal block.
-            # However, if the row in the diagonal block is itself a 'pivot row', then we need
-            # to send it to the correct position within the diagonal block. Here we set up
-            # `diagonal_block_row_destination_indices` with the position where each row of the
-            # diagonal block should be sent to.
-            sorted_pivot_indices = sort(sub_column_pivot_indices)
-
-            # All pivot indices are at or below the first row of the diagonal block, so we can
-            # find the indices that are within the diagonal block from the first entries of
-            # the sorted list of pivot indices.
-            split_ind = searchsortedlast(sorted_pivot_indices, last_diag)
-            pivot_indices_inside_diagonal_block = sorted_pivot_indices[1:split_ind]
-            pivot_indices_outside_diagonal_block = sorted_pivot_indices[split_ind+1:end]
-            outside_diagonal_block_counter = 1
-
-            diagonal_block_row_destination_indices = copy(sub_column_pivot_indices)
-            for i ∈ 1:length(sub_column_pivot_indices)
-                diag_index = diagonal_block_indices[i]
-                if diag_index ∈ pivot_indices_inside_diagonal_block
-                    # Pivot destination of this row is within the diagonal block, so send it
-                    # directly.
-                    i2 = findfirst(isequal(diag_index), sub_column_pivot_indices)
-                    diagonal_block_row_destination_indices[i] = diagonal_block_indices[i2]
+            for (i, pivot) ∈ enumerate(sub_column_pivot_indices)
+                if pivot ≤ last_top_panel
+                    n_top_panel_pivots += 1
+                    top_panel_pivots[n_top_panel_pivots] = pivot
+                elseif ((pivot - 1) ÷ tile_size) % group_K + 1 == panel_k
+                    n_other_local_pivots += 1
                 else
-                    # The destination of this row must be set to something that is outside the
-                    # diagonal block.
-                    diagonal_block_row_destination_indices[i] =
-                        pivot_indices_outside_diagonal_block[outside_diagonal_block_counter]
-                    outside_diagonal_block_counter += 1
+                    n_non_local_pivots += 1
+                    non_local_pivots[n_non_local_pivots] = pivot
                 end
             end
+            # Store the number of found non-local pivots in the final entry of the
+            # `non_local_pivots` buffer, so that it is available to other processes in the
+            # shared-memory block.
+            non_local_pivots[end] = n_non_local_pivots
 
-            # Permute the global pivot vector with the current panel's pivot indices.
-            diag_tile_global_inds = (panel-1)*tile_size+1:min(panel*tile_size,m)
-            diag_tile_unpermuted_inds = row_permutation[diag_tile_global_inds]
-            pivot_rows_unpermuted_inds = row_permutation[sub_column_pivot_indices]
-            # Need to use diagonal_block_row_destination_indices to avoid errors when some of
-            # the pivot rows are within the diagonal block.
-            row_permutation[diagonal_block_row_destination_indices] .=
-                diag_tile_unpermuted_inds
-            row_permutation[diag_tile_global_inds] .= pivot_rows_unpermuted_inds
+            this_top_panel_pivots = @view top_panel_pivots[1:n_top_panel_pivots]
+            this_non_local_pivots = @view non_local_pivots[1:n_non_local_pivots]
 
-            # We aim to minimise the number of copy operations needed to complete the
-            # effect of all row swaps from this panel. As we want only one set of MPI
-            # communications, we cannot directly use `ipiv` as generated by LAPACK, as
-            # that would mean doing sequentially a set of row swaps. Instead we have
-            # generated the complete set of sources and destinations of each diagonal row.
-            # To make sure all operations are completed, we define a vector of flags for
-            # each diagonal row involved in the swaps (any off-diagonal rows owned by the
-            # diagonal-owning rank are always to be swapped to/from diagonal rows, and
-            # off-diagonal rows on other ranks the row must be both sent and received over
-            # MPI so in either case we do not need to track their states) where the flag
-            # can indicate that the buffer is not yet updated, has been emptied (into a
-            # row buffer or transferred to another row), or has been completed (final data
-            # has been transferred in, or no change is needed).
-            # We first set up the MPI communications that are needed:
-            #   * For every row sent and/or received over MPI, copy the original data into
-            #     a row buffer, then start an MPI.Isend of the data in the row buffer
-            #     and/or an MPI.Irecv into the row.
-            #   * If this diagonal row receieves over MPI, mark row as completed, as no
-            #     other data needs to be transferred into the row, we only have to wait
-            #     for all MPI transfers to complete, which we will do at the end of this
-            #     function.
-            #   * If the diagonal row sends but does not receive, mark the row as empty,
-            #     as the data has been transferred out into the row buffer, but the row is
-            #     not filled with the final data yet.
-            #   * If the row has no MPI communications, but does not need any swap, mark
-            #     as completed.
-            # In second and third passes that only involves the diagonal-owning rank, we
-            # transfer all the locally-owned data as needed. Second pass:
-            #   * Loop through the diagonal-tile rows until the first empty row is found
-            #     (restarting the loop on the following row after processing each empty
-            #     row). Note that rows outside the diagonal tile cannot be 'empty'.
-            #   * Starting from that first empty row, transfer the data from the 'source'
-            #     row into the empty row, and mark the row as 'completed'. Since the
-            #     source row is now empty, transfer data into that from its source (and
-            #     mark as completed), continuing until data was transferred from a
-            #     'complete' row (when the source row is 'complete' the data has to be
-            #     transferred from the row buffer, not from `matrix_storage`).
-            # After the second pass there are no empty rows, but it may be that there are
-            # rows that are not 'complete' because they are part of a cycle of swaps among
-            # rows owned by the diagonal-owning rank. Therefore we need a third pass:
-            #   * Loop through the diagonal rows until the first incomplete row
-            #     (restarting the loop from the row after this until there are no more
-            #     incomplete rows). Note that rows outside the diagonal tile cannot be
-            #     'incomplete'.
-            #   * Copy the incomplete row into a row buffer (and mark it as complete), and
-            #     save which row it is.  Copy the data from this rows source into the row.
-            #     Move to the now-empty source and copy its source into it (and mark it as
-            #     complete), repeating until the source is the original 'incomplete' row,
-            #     whose data is copied from the row buffer.
-            # After the third pass, all rows should be completed. Note that on each pass,
-            # we loop through the rows only once, so the number of operations increases
-            # only linearly with `tile_size` (the maximum number of rows involved in the
-            # swaps is `2*tile_size`).
-            # This method involves more loops and more checking flags than the
-            # `ipiv`-based method, but reduces the amount of data copied. It is not
-            # obvious which would be faster in serial, but the method used here is
-            # preferred because it minimises the number of MPI data transfers, and it is
-            # not clear how to mix single-transfer copies for MPI operations with
-            # sequential row-swap operations for local transfers, without some similar
-            # amount of flag-checking.
-
-            # First pass - queue up MPI communications.
-            ###########################################
-            req_counter = 0
-            # Flag 0x0 means 'complete', 0x1 means 'empty' and 0x2 means 'incomplete'.
-            swap_flags .= 0x2
-            owning_rank_k_diag = (panel - 1) % group_K
-            owning_rank_diag = (group_l - 1) * group_K + owning_rank_k_diag
-
-            source_rows = @view A_lu.factorization_source_rows[1:2*this_tile_size]
-            source_rows .= -1
-            # We also need to record which locally-owned rows are involved in the swaps.
-            locally_owned_swap_rows = A_lu.factorization_locally_owned_swap_rows
-            @views locally_owned_swap_rows[1:this_tile_size] .=
-                local_diagonal_tile_offset+1:local_diagonal_tile_offset+this_tile_size
-            @views locally_owned_swap_rows[this_tile_size+1:end] .= -1
-            n_off_diagonal_dest_rows = 0
-
-            for (iswap, (idiag, isource, idest)) ∈
-                    enumerate(zip(diagonal_block_indices, sub_column_pivot_indices,
-                                  diagonal_block_row_destination_indices))
-                if idiag == isource == idest
-                    # No swap to do.
-                    swap_flags[iswap] = 0x0
-                    continue
-                end
-
-                diag_tile_row_offset = (idiag - 1) % tile_size + 1
-
-                source_tile_row, source_tile_row_offset = divrem(isource - 1, tile_size) .+ 1
-                owning_rank_k_source = (source_tile_row - 1) % group_K
-                owning_rank_source = (group_l - 1) * group_K + owning_rank_k_source
-
-                dest_tile_row, dest_tile_row_offset = divrem(idest - 1, tile_size) .+ 1
-                owning_rank_k_dest = (dest_tile_row - 1) % group_K
-                owning_rank_dest = (group_l - 1) * group_K + owning_rank_k_dest
-
-                if distributed_comm_rank == owning_rank_diag == owning_rank_source == owning_rank_dest
-                    source_storage_row = ((source_tile_row - 1) ÷ group_K) * tile_size + source_tile_row_offset
-                    source_rows[iswap] = source_storage_row
-                    if dest_tile_row > panel_group_row
-                        # The 'destination row' is owned by the diagonal-tile-owning rank,
-                        # but is not in the diagonal tile. Therefore the 'source row' of
-                        # 'destination row' is within the diagonal tile, and we want to
-                        # record which row it is.
-                        n_off_diagonal_dest_rows += 1
-                        diag_storage_row = ((panel - 1) ÷ group_K) * tile_size + diag_tile_row_offset
-                        source_rows[this_tile_size+n_off_diagonal_dest_rows] = diag_storage_row
-                        dest_storage_row = ((dest_tile_row - 1) ÷ group_K) * tile_size + dest_tile_row_offset
-                        locally_owned_swap_rows[this_tile_size+n_off_diagonal_dest_rows] = dest_storage_row
-                    end
-                elseif distributed_comm_rank == owning_rank_diag == owning_rank_source
-                    # Copy out data from the row and start MPI.Isend()
-
-                    diag_storage_row = ((panel - 1) ÷ group_K) * tile_size + diag_tile_row_offset
-
-                    row_swap_buffer = @view row_swap_buffers[iswap,:]
-                    row_swap_buffer .= @view matrix_storage[diag_storage_row,:]
-
-                    # diag -> dest
-                    reqs[req_counter+=1] = MPI.Isend(row_swap_buffer, distributed_comm;
-                                                     dest=owning_rank_dest, tag=iswap)
-
-                    # Mark as 'empty'.
-                    swap_flags[iswap] = 0x1
-
-                    source_storage_row = ((source_tile_row - 1) ÷ group_K) * tile_size + source_tile_row_offset
-                    source_rows[iswap] = source_storage_row
-                elseif distributed_comm_rank == owning_rank_diag == owning_rank_dest
-                    # Copy out data from the row that we own, to later copy to destination
-                    # row.
-
-                    diag_storage_row = ((panel - 1) ÷ group_K) * tile_size + diag_tile_row_offset
-
-                    diag_row_data = @view matrix_storage[diag_storage_row,:]
-
-                    row_swap_buffer = @view row_swap_buffers[iswap,:]
-                    row_swap_buffer .= diag_row_data
-
-                    # source -> diag
-                    reqs[req_counter+=1] = MPI.Irecv!(diag_row_data, distributed_comm;
-                                                      source=owning_rank_source, tag=iswap)
-
-                    # Mark as 'complete' because it will be complete once MPI
-                    # communications have completed.
-                    swap_flags[iswap] = 0x0
-
-                    if dest_tile_row > panel_group_row
-                        # The 'destination row' is owned by the diagonal-tile-owning rank,
-                        # but is not in the diagonal tile. Therefore the 'source row' of
-                        # 'destination row' is within the diagonal tile, and we want to
-                        # record which row it is.
-                        n_off_diagonal_dest_rows += 1
-                        source_rows[this_tile_size+n_off_diagonal_dest_rows] = diag_storage_row
-                        dest_storage_row = ((dest_tile_row - 1) ÷ group_K) * tile_size + dest_tile_row_offset
-                        locally_owned_swap_rows[this_tile_size+n_off_diagonal_dest_rows] = dest_storage_row
-                    end
-                elseif distributed_comm_rank == owning_rank_diag
-                    diag_storage_row = ((panel - 1) ÷ group_K) * tile_size + diag_tile_row_offset
-
-                    diag_row_data = @view matrix_storage[diag_storage_row,:]
-
-                    # Copy out data from the row that we own, to later copy to destination
-                    # row.
-                    row_swap_buffer = @view row_swap_buffers[iswap,:]
-                    row_swap_buffer .= diag_row_data
-
-                    # source -> diag
-                    reqs[req_counter+=1] = MPI.Irecv!(diag_row_data, distributed_comm;
-                                                      source=owning_rank_source, tag=iswap)
-                    # diag -> dest
-                    reqs[req_counter+=1] = MPI.Isend(row_swap_buffer, distributed_comm;
-                                                     dest=owning_rank_dest, tag=iswap)
-
-                    # Mark as 'complete' because it will be complete once MPI
-                    # communications have completed.
-                    swap_flags[iswap] = 0x0
-                elseif distributed_comm_rank == owning_rank_source
-                    # Copy out data from the row that we own, to send to owning_rank_diag.
-
-                    source_storage_row = ((source_tile_row - 1) ÷ group_K) * tile_size + source_tile_row_offset
-
-                    row_swap_buffer = @view row_swap_buffers[iswap,:]
-                    row_swap_buffer .= @view matrix_storage[source_storage_row,:]
-
-                    # source -> diag
-                    reqs[req_counter+=1] = MPI.Isend(row_swap_buffer, distributed_comm;
-                                                     dest=owning_rank_diag, tag=iswap)
-                end
+            sort!(this_top_panel_pivots)
+            top_panel_pivot_counter = 1
+            if n_top_panel_pivots > 0
+                next_top_panel_pivot = this_top_panel_pivots[top_panel_pivot_counter]
+            else
+                next_top_panel_pivot = -1
             end
-            if distributed_comm_rank != owning_rank_diag
-                # Now that all rows on this rank have been copied out into buffers to
-                # send, can call MPI.IRecv!() for all of them.
-                for (iswap, (idiag, isource, idest)) ∈
-                        enumerate(zip(diagonal_block_indices, sub_column_pivot_indices,
-                                      diagonal_block_row_destination_indices))
-                    if idiag == isource == idest
-                        # No swap to do.
-                        continue
-                    end
-
-                    panel = (idiag - 1) ÷ tile_size + 1
-                    owning_rank_k_diag = (panel - 1) % group_K
-
-                    dest_tile_row, dest_tile_row_offset = divrem(idest - 1, tile_size) .+ 1
-                    owning_rank_k_dest = (dest_tile_row - 1) % group_K
-                    owning_rank_dest = (group_l - 1) * group_K + owning_rank_k_dest
-
-                    if distributed_comm_rank == owning_rank_dest
-                        dest_storage_row = ((dest_tile_row - 1) ÷ group_K) * tile_size + dest_tile_row_offset
-
-                        # source -> diag
-                        reqs[req_counter+=1] =
-                            MPI.Irecv!(@view(matrix_storage[dest_storage_row,:]),
-                                       distributed_comm; source=owning_rank_diag, tag=iswap)
-                    end
-                end
-            end
-
-            if distributed_comm_rank == owning_rank_diag
-                source_rows = @view source_rows[1:this_tile_size+n_off_diagonal_dest_rows]
-                locally_owned_swap_rows = @view locally_owned_swap_rows[1:this_tile_size+n_off_diagonal_dest_rows]
-                swap_flags = @view swap_flags[1:this_tile_size+n_off_diagonal_dest_rows]
-                source_swap_labels = @view A_lu.factorization_source_swap_labels[1:this_tile_size+n_off_diagonal_dest_rows]
-
-                # Figure out the index within locally_owned_swap_rows of each source row, and
-                # store in source_swap_labels.
-                for (i, source_row) ∈ enumerate(source_rows)
-                    # Operation like `findfirst()`, but some entries will not be found.
-                    # `findfirst()` returns `nothing` when the entry is not found, but
-                    # that would introduce type instability, so search with a loop
-                    # instead.
-                    source_label = -1
-                    for i ∈ 1:length(locally_owned_swap_rows)
-                        if locally_owned_swap_rows[i] == source_row
-                            source_label = i
-                            break
+            send_local_counter = 0
+            send_non_local_counter = 0
+            # While deciding which rows should be sent with MPI communications, arrange the
+            # non_local_pivots so that any that go into a row in the top panel that is being
+            # sent (which is therefore open to receive data) are sent directly to that row, so
+            # that they (probably?) do not need to be swapped once they are received. This
+            # should reduce the number of row swaps that need to be done.
+            for (top_panel_row, pivot_row) ∈ zip(top_panel_indices, sub_column_pivot_indices)
+                if top_panel_row != next_top_panel_pivot
+                    non_local_pivot_position = type_stable_findfirst(pivot_row,
+                                                                     this_non_local_pivots)
+                    if non_local_pivot_position != -1
+                        # This row can receive a non-local row directly into its final
+                        # position.
+                        send_non_local_counter += 1
+                        top_panel_rows_to_send[send_non_local_counter] = top_panel_row
+                        if non_local_pivot_position != send_non_local_counter
+                            # If `non_local_pivot_position == send_non_local_counter` then the
+                            # non-local pivot index is already in the correct position in the
+                            # list to be sent to this row. Otherwise, swap the non-local pivot
+                            # index into this position.
+                            non_local_pivots[non_local_pivot_position], non_local_pivots[send_non_local_counter] =
+                                non_local_pivots[send_non_local_counter], non_local_pivots[non_local_pivot_position]
                         end
+                    elseif send_local_counter < n_other_local_pivots
+                        send_local_counter += 1
+                    else
+                        send_non_local_counter += 1
+                        top_panel_rows_to_send[send_non_local_counter] = top_panel_row
                     end
-                    source_swap_labels[i] = source_label
-                end
-
-                # Second pass - fill all chains that start with an empty row.
-                #############################################################
-                for next_potential_empty_row ∈ 1:this_tile_size
-                    if swap_flags[next_potential_empty_row] == 0x1
-                        label = next_potential_empty_row
-                        source_label = source_swap_labels[label]
-                        while true
-                            if swap_flags[source_label] == 0x0
-                                # 'Completed' row, which must be within the diagonal tile.
-                                # Copy data from the row swap buffers.
-                                irow = locally_owned_swap_rows[label]
-                                @views matrix_storage[irow,:] .=
-                                    row_swap_buffers[source_label,:]
-                                swap_flags[label] = 0x0
-                                break
-                            elseif swap_flags[source_label] == 0x2
-                                # 'Not-completed' row, copy data matrix storage.
-                                irow = locally_owned_swap_rows[label]
-                                isource = locally_owned_swap_rows[source_label]
-                                @views matrix_storage[irow,:] .=
-                                    matrix_storage[isource,:]
-                                swap_flags[label] = 0x0
-                                label = source_label
-                                source_label = source_swap_labels[label]
-                            else
-                                error("Chain did not terminate in a completed row. This "
-                                      * "should never happen.")
-                            end
-                        end
-                    end
-                end
-
-                # Third pass - move data around chains that are cycles of incomplete rows.
-                ##########################################################################
-                for next_potential_incomplete_label ∈ 1:this_tile_size
-                    if swap_flags[next_potential_incomplete_label] == 0x2
-                        row_buffer = @view row_swap_buffers[next_potential_incomplete_label,:]
-                        # Copy out data from this row so that we can put it back into the last
-                        # row in the cycle.
-                        irow = locally_owned_swap_rows[next_potential_incomplete_label]
-                        row_buffer .= @view matrix_storage[irow,:]
-
-                        label = next_potential_incomplete_label
-                        next_label = source_swap_labels[label]
-                        swap_flags[next_potential_incomplete_label] = 0x0
-                        while next_label != next_potential_incomplete_label
-                            this_row = locally_owned_swap_rows[label]
-                            next_row = locally_owned_swap_rows[next_label]
-                            @views matrix_storage[this_row,:] .= matrix_storage[next_row,:]
-                            swap_flags[next_label] = 0x0
-                            label = next_label
-                            next_label = source_swap_labels[label]
-                        end
-
-                        # Copy in the data from start_row to this final row to complete the
-                        # cycle.
-                        this_row = locally_owned_swap_rows[label]
-                        @views matrix_storage[this_row,:] .= row_buffer
-                    end
+                elseif top_panel_pivot_counter < n_top_panel_pivots
+                    top_panel_pivot_counter += 1
+                    next_top_panel_pivot = this_top_panel_pivots[top_panel_pivot_counter]
+                else
+                    next_top_panel_pivot = -1
                 end
             end
-            MPI.Waitall(reqs[1:req_counter])
+
+            this_top_panel_rows_to_send = @view(top_panel_rows_to_send[1:send_non_local_counter])
+
+            # Replace the indices of 'non-local' rows with the indices of the rows where their
+            # data will be located after communications complete.
+            for i ∈ 1:this_tile_size
+                pivot = sub_column_pivot_indices[i]
+                pivot_position = type_stable_findfirst(pivot, this_non_local_pivots)
+                if pivot_position != -1
+                    sub_column_pivot_indices[i] = top_panel_rows_to_send[pivot_position]
+                end
+            end
+
+            # Convert `sub_column_pivot_indices` into an `ipiv` vector that can be used for
+            # row swaps.
+            pivot2ipiv!(sub_column_pivot_indices, first_top_panel)
+
+            # Update row_permutations with the destination positions of the MPI-communicated
+            # rows.
+            for (i1, i2) ∈ zip(this_non_local_pivots, this_top_panel_rows_to_send)
+                row_permutation[i1], row_permutation[i2] = row_permutation[i2], row_permutation[i1]
+            end
+
+            # Apply `sub_column_pivot_indices` as an 'ipiv' to `row_permutation` to update
+            # the positions of the locally-owned rows according to the local row-swaps.
+            # `apply_row_swaps!()` treats `row_permutation` as a Matrix even though it is
+            # a Vector, but will always use `1` as the second index, which is OK in Julia.
+            panel_offset = (panel - 1) * tile_size
+            sub_column_pivot_indices .-= panel_offset
+            apply_row_swaps!(@view(row_permutation[(panel-1)*tile_size+1:end]),
+                             sub_column_pivot_indices, 1, this_tile_size)
         end
+
+        local_storage_m = size(matrix_storage, 2)
+        cols_per_proc = (local_storage_m + shared_comm_size - 1) ÷ shared_comm_size
+        col_range = shared_comm_rank*cols_per_proc+1:min((shared_comm_rank+1)*cols_per_proc,local_storage_m)
+
+        if group_k == panel_k
+            # Convert the 'ipiv' entries from global row indices to to local row indices
+            # (in `matrix_storage`), offset to start from the start with the top panel.
+            top_panel_first_storage_row = (panel_group_row - 1) * tile_size + 1
+            if shared_comm_rank == 0
+                for i ∈ 1:this_tile_size
+                    # Remove offset that was subtracted in order to pivot row_permutation.
+                    p = sub_column_pivot_indices[i] + panel_offset
+                    # Convert global to local index.
+                    p_tile_row = (p - 1) ÷ tile_size + 1
+                    p_group_row, p_k = divrem(p_tile_row - 1, group_K) .+ 1
+                    p -= ((p_group_row - 1) * (group_K - 1) + p_k - 1) * tile_size
+                    # Offset to start from start of top panel.
+                    p -= top_panel_first_storage_row - 1
+                    sub_column_pivot_indices[i] = p
+                end
+
+                # Convert `top_panel_rows_to_send` to local indices.
+                top_panel_local_storage_offset = ((panel_group_row - 1) * (group_K - 1) + panel_k - 1) * tile_size
+                for i ∈ 1:n_non_local_pivots
+                    top_panel_rows_to_send[i] -= top_panel_local_storage_offset
+                end
+            end
+
+            synchronize_shared()
+
+            # Copy rows that are going to be sent into row_buffers.
+            @views copy_to_buffer!(row_swap_buffers[:,col_range],
+                                   matrix_storage[:,col_range], top_panel_rows_to_send,
+                                   non_local_pivots[end])
+
+            synchronize_shared()
+
+            if shared_comm_rank == 0
+                # Receive and send the non-local pivots.
+                req_counter = 0
+                for (i, (send_row, source_row)) ∈ enumerate(zip(@view(top_panel_rows_to_send[1:n_non_local_pivots]),
+                                                                @view(non_local_pivots[1:n_non_local_pivots])))
+                    source_tile_row = (source_row - 1) ÷ tile_size + 1
+                    source_row_k = (source_tile_row - 1) % group_K
+                    source_r = (group_l - 1) * group_K + source_row_k
+                    reqs[req_counter+=1] = MPI.Irecv!(@view(matrix_storage[send_row,:]),
+                                                      distributed_comm; source=source_r)
+                    reqs[req_counter+=1] = MPI.Isend(@view(row_swap_buffers[i,:]),
+                                                     distributed_comm; dest=source_r)
+                end
+                MPI.Waitall(reqs[1:req_counter])
+            end
+
+            synchronize_shared()
+
+            apply_row_swaps!(@view(matrix_storage[top_panel_first_storage_row:end,col_range]),
+                             sub_column_pivot_indices, length(col_range), this_tile_size)
+        else
+            # Here we absuse `non_local_pivots` and reduce it to just the rows owned by
+            # this process.
+            if shared_comm_rank == 0
+                n_rows_owned_here = 0
+                for i ∈ 1:n_non_local_pivots
+                    pivot = non_local_pivots[i]
+                    if ((pivot - 1) ÷ tile_size) % group_K + 1 == group_k
+                        n_rows_owned_here += 1
+                        # Convert global to local index.
+                        pivot_tile_row = (pivot - 1) ÷ tile_size + 1
+                        pivot_group_row, pivot_k = divrem(pivot_tile_row - 1, group_K) .+ 1
+                        local_pivot = pivot - ((pivot_group_row - 1) * (group_K - 1) + pivot_k - 1) * tile_size
+                        non_local_pivots[n_rows_owned_here] = local_pivot
+                    end
+                end
+                # Save the number of 'non local rows' owned by this process in the extra,
+                # last element of `non_local_pivots`, so that other processes in the
+                # shared-memory block can access it.
+                non_local_pivots[end] = n_rows_owned_here
+            end
+
+            synchronize_shared()
+
+            @views copy_to_buffer!(row_swap_buffers[:,col_range], matrix_storage[:,col_range],
+                                   non_local_pivots, non_local_pivots[end])
+
+            synchronize_shared()
+
+            if shared_comm_rank == 0
+                # Send and receive the pivot rows from/to this process.
+
+                top_panel_k = (panel - 1) % group_K
+                top_panel_r = (group_l - 1) * group_K + top_panel_k
+
+                req_counter = 0
+                for (i, row) ∈ enumerate(@view non_local_pivots[1:n_rows_owned_here])
+                    reqs[req_counter+=1] = MPI.Irecv!(@view(matrix_storage[row,:]),
+                                                      distributed_comm;
+                                                      source=top_panel_r)
+                    reqs[req_counter+=1] = MPI.Isend(@view(row_swap_buffers[i,:]),
+                                                     distributed_comm; dest=top_panel_r)
+                end
+
+                MPI.Waitall(reqs[1:req_counter])
+            end
+        end
+
+        synchronize_shared()
+
     end
 
     return nothing
