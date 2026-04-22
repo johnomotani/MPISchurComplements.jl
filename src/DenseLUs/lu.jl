@@ -67,7 +67,8 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
                   shared_comm_rank::Int64, shared_comm_size::Int64,
                   distributed_comm_rank::Int64, distributed_comm_size::Int64,
                   datatype::Type, allocate_shared_float::Ff, allocate_shared_int::Fi,
-                  synchronize_shared, timer) where {Ff,Fi}
+                  synchronize_shared, distributed_block_rows::Union{Nothing,Int64},
+                  timer) where {Ff,Fi}
 
     row_permutation = allocate_shared_int(m)
 
@@ -83,18 +84,27 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
                                                    timer=timer)
     end
 
-    # Each block owns a set of (tile_size,tile_size) tiles in the full matrix - the last
-    # row and column of tiles may be shorter/narrower. The tiles are distributed in a
-    # block-cyclic pattern. Each block owns sub-tiles in the k'th row in each group of K
-    # columns, and in the l'th column of each group of L columns. We choose (abritrarily)
-    # to make L≤K.
-    distributed_comm_size_factors =
-        [prod(x) for x in
-         collect(unique(combinations(factor(Vector, distributed_comm_size))))]
-    # Find the last factor ≤ sqrt(distributed_comm_size)
-    factor_ind = findlast(x -> x≤sqrt(distributed_comm_size), distributed_comm_size_factors)
-    group_L = distributed_comm_size_factors[factor_ind]
-    group_K = distributed_comm_size ÷ group_L
+    if distributed_block_rows === nothing
+        # Each block owns a set of (tile_size,tile_size) tiles in the full matrix - the
+        # last row and column of tiles may be shorter/narrower. The tiles are distributed
+        # in a block-cyclic pattern. Each block owns sub-tiles in the k'th row in each
+        # group of K columns, and in the l'th column of each group of L columns. We choose
+        # (abritrarily) to make L≤K.
+        distributed_comm_size_factors =
+            [prod(x) for x in
+             collect(unique(combinations(factor(Vector, distributed_comm_size))))]
+        # Find the last factor ≤ sqrt(distributed_comm_size)
+        factor_ind = findlast(x -> x≤sqrt(distributed_comm_size), distributed_comm_size_factors)
+        group_L = distributed_comm_size_factors[factor_ind]
+        group_K = distributed_comm_size ÷ group_L
+    else
+        if distributed_comm_size % distributed_block_rows != 0
+            error("distributed_block_rows=$distributed_block_rows argument does not "
+                  * "divide distributed_comm_size=$distributed_comm_size.")
+        end
+        group_K = distributed_block_rows
+        group_L = distributed_comm_size ÷ group_K
+    end
 
     group_l, group_k = divrem(distributed_comm_rank, group_K) .+ 1
 

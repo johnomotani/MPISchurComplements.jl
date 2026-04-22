@@ -3,7 +3,7 @@ using Combinatorics
 using LinearAlgebra
 using Primes
 
-function dense_lu_test(n_shared)
+function dense_lu_test(n_shared, distributed_block_rows)
     # Only testing shared-memory parallelism for the DenseLU solver.
     comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
         shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
@@ -11,7 +11,7 @@ function dense_lu_test(n_shared)
 
     rng = StableRNG(3002)
 
-    @testset "dense_lu n_shared=$n_shared" begin
+    @testset "dense_lu n_shared=$n_shared, distributed_block_rows=$distributed_block_rows" begin
         @testset "m=$m, tile_size=$tile_size" for m ∈ (32, 33, 100, 128, 295, 317, 460, 532, 604, 739, 827, 964, 1009, 1024),
                                                   tile_size ∈ (1, 2, 3, 25, 32, 90, 128)
             if tile_size > m + 5
@@ -24,7 +24,7 @@ function dense_lu_test(n_shared)
                 continue
             end
             if distributed_rank == 0 && shared_rank == 0
-                println("dense_lu n_shared=$n_shared, m=$m, tile_size=$tile_size")
+                println("dense_lu n_shared=$n_shared, distributed_block_rows=$distributed_block_rows, m=$m, tile_size=$tile_size")
             end
 
             A = allocate_array_float(m, m)
@@ -48,7 +48,8 @@ function dense_lu_test(n_shared)
             MPI.Barrier(shared_comm)
 
             Alu = dense_lu(Afactors, tile_size, comm, shared_comm, distributed_comm,
-                           allocate_array_float, allocate_array_int)
+                           allocate_array_float, allocate_array_int;
+                           distributed_block_rows=distributed_block_rows)
 
             function test_once()
                 ldiv!(x, Alu, b)
@@ -142,7 +143,7 @@ end
 
 function dense_lu_tests()
     nproc = MPI.Comm_size(MPI.COMM_WORLD)
-    for n_shared ∈ [prod(x) for x ∈ unique(combinations(factor(Vector, nproc)))]
-        dense_lu_test(n_shared)
+    for n_shared ∈ [prod(x) for x ∈ unique(combinations(factor(Vector, nproc)))], distributed_block_rows ∈ (nothing, 1)
+        dense_lu_test(n_shared, distributed_block_rows)
     end
 end

@@ -77,7 +77,8 @@ end
 function dense_lu(A::AbstractMatrix, tile_size::Int64, comm::MPI.Comm,
                   shared_comm::MPI.Comm, distributed_comm::MPI.Comm,
                   allocate_shared_float::Function, allocate_shared_int::Function;
-                  synchronize_shared=nothing, skip_factorization=false, check_lu=true,
+                  synchronize_shared=nothing, distributed_block_rows=nothing,
+                  skip_factorization=false, check_lu=true,
                   timer::Union{TimerOutput,Nothing}=nothing)
     @sc_timeit timer "setup" begin
         datatype = eltype(A)
@@ -117,7 +118,7 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, comm::MPI.Comm,
             setup_lu(m, n, tile_size, shared_comm, shared_comm_rank, shared_comm_size,
                      distributed_comm_rank[], distributed_comm_size[], datatype,
                      allocate_shared_float, allocate_shared_int, synchronize_shared,
-                     timer)
+                     distributed_block_rows, timer)
 
         ldiv_variables =
             setup_ldiv(m, datatype, tile_size, shared_comm, shared_comm_size,
