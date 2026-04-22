@@ -1155,6 +1155,10 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
                 n_cols = last_storage_col - first_storage_col + 1
                 buffer_size = n_local_rows * n_cols
 
+                local_below_diagonal_sub_column =
+                    @view matrix_storage[shared_local_row_range,
+                                         first_storage_col:last_storage_col]
+
                 # Copy matrix entries into contiguous buffer to improve efficiency.
                 col_buffer =
                     @view(reshape(@view(col_buffers[1:n_rows*n_cols]),
@@ -1170,21 +1174,43 @@ function update_sub_panel_off_diagonals!(A_lu, panel)
                     local_col_buffer = col_buffer
                 end
 
-                local_below_diagonal_sub_column =
-                    @view matrix_storage[shared_local_row_range,
-                                         first_storage_col:last_storage_col]
+                if group_K == 1
+                    # The left panel is all owned by this shared-memory block, so
+                    # factorization was performed in a single step, and
+                    # `factorization_buffer` contains the result already. No need to call
+                    # `trsm!()`, can just copy into the left panel.
+                    left_panel_first_row = (panel - 1) * tile_size + 1
+                    n_factorization_buffer_rows = size(matrix_storage, 1) - left_panel_first_row + 1
+                    factorization_buffer =
+                        reshape(@view(A_lu.factorization_pivoting_buffer[1:n_factorization_buffer_rows*this_tile_size]),
+                                n_factorization_buffer_rows, this_tile_size)
+                    local_factorization_buffer = @view factorization_buffer[this_tile_size+1+row_offset:this_tile_size+length(shared_local_row_range)+row_offset,:]
+                    # Note need to copy these entries both into `matrix_storage` and into
+                    # `col_buffer`, as `col_buffer` will be used in
+                    # `update_bottom_right_block!()`.
+                    local_below_diagonal_sub_column .= local_factorization_buffer
+                else
+                    local_col_buffer .= local_below_diagonal_sub_column
 
-                local_col_buffer .= local_below_diagonal_sub_column
+                    # Need to solve M*U=A for M, where A are the original matrix elements of the
+                    # sub-column, and U is the upper-triangular factor of the diagonal sub-tile.
+                    trsm!('R', 'U', 'N', 'N', 1.0, diagonal_sub_tile, local_col_buffer)
 
-                # Need to solve M*U=A for M, where A are the original matrix elements of the
-                # sub-column, and U is the upper-triangular factor of the diagonal sub-tile.
-                trsm!('R', 'U', 'N', 'N', 1.0, diagonal_sub_tile, local_col_buffer)
-
-                # Copy buffer back into shared_storage and matrix storage.
-                if shared_comm_size > 1
-                    col_buffer .= local_col_buffer
+                    # Copy buffer back into shared_storage and matrix storage.
+                    if shared_comm_size > 1
+                        col_buffer .= local_col_buffer
+                    end
+                    local_below_diagonal_sub_column .= local_col_buffer
                 end
-                local_below_diagonal_sub_column .= local_col_buffer
+            end
+            if group_K == 1
+                # `col_buffer` points to the same memory as `factorization_buffer`, but
+                # with a different layout, so we have to synchronize before copying the
+                # data back into col_buffer.
+                synchronize_shared()
+                if length(shared_local_row_range) > 0
+                    col_buffer .= local_below_diagonal_sub_column
+                end
             end
         end
 
