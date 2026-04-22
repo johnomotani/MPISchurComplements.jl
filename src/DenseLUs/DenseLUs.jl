@@ -16,7 +16,7 @@ import LinearAlgebra: lu!, ldiv!
     m::Int64
     n::Int64
     factors::Tmat
-    row_permutation::Vector{Int64}
+    row_permutation::Tintvec
     group_K::Int64
     group_L::Int64
     group_k::Int64

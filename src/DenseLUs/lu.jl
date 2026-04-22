@@ -69,12 +69,18 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
                   datatype::Type, allocate_shared_float::Ff, allocate_shared_int::Fi,
                   synchronize_shared, timer) where {Ff,Fi}
 
-    factors = allocate_shared_float(m, n)
+    row_permutation = allocate_shared_int(m)
 
-    if shared_comm_rank == 0
-        row_permutation = zeros(Int64, m)
+    if tile_size ≤ ColumnPivotLUs.block_size && distributed_comm_size > 1
+        # No point using RowPivotLUMPI, as it will just pass through to `LAPACK.getrf!()`
+        # for this `tile_size`. Instead, store an `ipiv` vector to use when calling
+        # `LAPACK.getrf!()` directly.
+        factorization_shared_lu = allocate_shared_int(m)
     else
-        row_permutation = zeros(Int64, 0)
+        ipiv = allocate_shared_int(m)
+        factorization_shared_lu = get_row_pivot_lu(ipiv, shared_comm;
+                                                   synchronize=synchronize_shared,
+                                                   timer=timer)
     end
 
     # Each block owns a set of (tile_size,tile_size) tiles in the full matrix - the last
@@ -110,77 +116,89 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
         return tile_col_start:tile_col_end
     end
 
-    factorization_matrix_parts_row_ranges = [get_row_range(group_row)
-                                             for group_row ∈ 1:group_n_rows]
-    factorization_matrix_parts_col_ranges = [get_col_range(group_col)
-                                             for group_col ∈ 1:group_n_cols]
-    factorization_locally_owned_rows = vcat((collect(r) for r ∈
-                                             factorization_matrix_parts_row_ranges)...)
+    if distributed_comm_size > 1
+        factors = allocate_shared_float(m, n)
 
-    # Store the locally-owned parts of the array in a joined-together 2D array
-    # `factorization_matrix_storage`. This will be useful for some operations.
-    # `factorization_matrix_parts` contains views into `factorization_matrix_storage`
-    # corresponding to the locally-owned section of each tile.
-    local_storage_m = sum(length(r) for r ∈ factorization_matrix_parts_row_ranges)
-    local_storage_n = sum(length(c) for c ∈ factorization_matrix_parts_col_ranges)
-    factorization_matrix_storage = allocate_shared_float(local_storage_m, local_storage_n)
-    factorization_matrix_parts =
-        [@view(factorization_matrix_storage[(group_row-1)*tile_size+1:min(group_row*tile_size,local_storage_m),
-                                            (group_col-1)*tile_size+1:min(group_col*tile_size,local_storage_n)])
-         for group_row ∈ 1:group_n_rows, group_col ∈ 1:group_n_cols]
+        factorization_matrix_parts_row_ranges = [get_row_range(group_row)
+                                                 for group_row ∈ 1:group_n_rows]
+        factorization_matrix_parts_col_ranges = [get_col_range(group_col)
+                                                 for group_col ∈ 1:group_n_cols]
+        factorization_locally_owned_rows = vcat((collect(r) for r ∈
+                                                 factorization_matrix_parts_row_ranges)...)
 
-    factorization_pivoting_buffer =
-        allocate_shared_float(max(group_n_rows * tile_size * tile_size,
-                                  group_K * tile_size * tile_size))
-    if shared_comm_size > 1
-        factorization_local_left_panel_buffer =
-            Vector{datatype}(undef, (group_n_rows * tile_size + shared_comm_size - 1) ÷ shared_comm_size * tile_size)
+        # Store the locally-owned parts of the array in a joined-together 2D array
+        # `factorization_matrix_storage`. This will be useful for some operations.
+        # `factorization_matrix_parts` contains views into `factorization_matrix_storage`
+        # corresponding to the locally-owned section of each tile.
+        local_storage_m = sum(length(r) for r ∈ factorization_matrix_parts_row_ranges)
+        local_storage_n = sum(length(c) for c ∈ factorization_matrix_parts_col_ranges)
+        factorization_matrix_storage = allocate_shared_float(local_storage_m, local_storage_n)
+        factorization_matrix_parts =
+            [@view(factorization_matrix_storage[(group_row-1)*tile_size+1:min(group_row*tile_size,local_storage_m),
+                                                (group_col-1)*tile_size+1:min(group_col*tile_size,local_storage_n)])
+             for group_row ∈ 1:group_n_rows, group_col ∈ 1:group_n_cols]
+
+        factorization_pivoting_buffer =
+            allocate_shared_float(max(group_n_rows * tile_size * tile_size,
+                                      group_K * tile_size * tile_size))
+        if shared_comm_size > 1
+            factorization_local_left_panel_buffer =
+                Vector{datatype}(undef, (group_n_rows * tile_size + shared_comm_size - 1) ÷ shared_comm_size * tile_size)
+        else
+            # Do not need this buffer
+            factorization_local_left_panel_buffer = zeros(datatype, 0)
+        end
+
+        # Generate a 'binary' tree of disributed-memory ranks that will participate in the
+        # disributed-memory part of the parallel pivot generation.
+        distributed_size_prime_factors = factor(Vector, group_K)
+        factorization_pivot_generation_distributed_tree_sizes = [group_K]
+        # `reverse()` so that we divide by the largest factors first. Should not affect
+        # overall run time as the order of the factors just shuffles around work between
+        # different levels, but this order minimises the total work done, which might
+        # marginally help power consumption?
+        for f in reverse(distributed_size_prime_factors)
+            push!(factorization_pivot_generation_distributed_tree_sizes,
+                  factorization_pivot_generation_distributed_tree_sizes[end] ÷ f)
+        end
+
+        factorization_pivoting_reduction_buffer = allocate_shared_float(tile_size * group_K,
+                                                                        tile_size)
+        factorization_pivoting_reduction_indices =
+            allocate_shared_int(max(tile_size * group_K * shared_comm_size, 2 * tile_size,
+                                    local_storage_m))
+        factorization_pivoting_reduction_indices_local = zeros(Int64, tile_size)
+        factorization_source_rows = zeros(Int64, 2 * tile_size)
+        factorization_locally_owned_swap_rows = zeros(Int64, 2 * tile_size)
+            factorization_row_swap_buffers = allocate_shared_float(tile_size, local_storage_n)
+        factorization_top_panel_pivots = allocate_shared_int(tile_size)
+        # Extra element so the number of non-local pivots can be stored in the last element.
+        factorization_non_local_pivots = allocate_shared_int(tile_size + 1)
+        factorization_top_panel_rows_to_send = allocate_shared_int(tile_size)
+
+        comm_requests = [MPI.REQUEST_NULL for _ ∈
+                         1:max((1 + tile_size) * group_K, group_K + group_L, 2 * tile_size)]
     else
-        # Do not need this buffer
-        factorization_local_left_panel_buffer = zeros(datatype, 0)
+        factors = allocate_shared_float(0, 0)
+        factorization_matrix_storage = allocate_shared_float(0, 0)
+        factorization_matrix_parts = nothing
+        factorization_matrix_parts_row_ranges = UnitRange{Int64}[]
+        factorization_matrix_parts_col_ranges = UnitRange{Int64}[]
+        factorization_locally_owned_rows = Int64[]
+        factorization_pivot_generation_distributed_tree_sizes = Int64[]
+        factorization_pivoting_buffer = allocate_shared_float(0)
+        factorization_local_left_panel_buffer = eltype(factors)[]
+        factorization_pivoting_reduction_buffer = allocate_shared_float(0, 0)
+        factorization_pivoting_reduction_indices = allocate_shared_int(0)
+        factorization_pivoting_reduction_indices_local = Int64[]
+        factorization_source_rows = Int64[]
+        factorization_locally_owned_swap_rows = Int64[]
+        factorization_top_panel_pivots = allocate_shared_int(0)
+        factorization_non_local_pivots = allocate_shared_int(0)
+        factorization_top_panel_rows_to_send = allocate_shared_int(0)
+        factorization_row_swap_buffers = allocate_shared_float(0, 0)
+        comm_requests = MPI.Request[]
     end
-
-    # Generate a 'binary' tree of disributed-memory ranks that will participate in the
-    # disributed-memory part of the parallel pivot generation.
-    distributed_size_prime_factors = factor(Vector, group_K)
-    factorization_pivot_generation_distributed_tree_sizes = [group_K]
-    # `reverse()` so that we divide by the largest factors first. Should not affect
-    # overall run time as the order of the factors just shuffles around work between
-    # different levels, but this order minimises the total work done, which might
-    # marginally help power consumption?
-    for f in reverse(distributed_size_prime_factors)
-        push!(factorization_pivot_generation_distributed_tree_sizes,
-              factorization_pivot_generation_distributed_tree_sizes[end] ÷ f)
-    end
-
-    factorization_pivoting_reduction_buffer = allocate_shared_float(tile_size * group_K,
-                                                                    tile_size)
-    factorization_pivoting_reduction_indices =
-        allocate_shared_int(max(tile_size * group_K * shared_comm_size, 2 * tile_size,
-                                local_storage_m))
-    factorization_pivoting_reduction_indices_local = zeros(Int64, tile_size)
-    factorization_source_rows = zeros(Int64, 2 * tile_size)
-    factorization_locally_owned_swap_rows = zeros(Int64, 2 * tile_size)
-    factorization_row_swap_buffers = allocate_shared_float(tile_size, local_storage_n)
-    factorization_top_panel_pivots = allocate_shared_int(tile_size)
-    # Extra element so the number of non-local pivots can be stored in the last element.
-    factorization_non_local_pivots = allocate_shared_int(tile_size + 1)
-    factorization_top_panel_rows_to_send = allocate_shared_int(tile_size)
-
-    if tile_size ≤ ColumnPivotLUs.block_size
-        # No point using RowPivotLUMPI, as it will just pass through to `LAPACK.getrf!()`
-        # for this `tile_size`. Instead, store an `ipiv` vector to use when calling
-        # `LAPACK.getrf!()` directly.
-        factorization_shared_lu = allocate_shared_int(m)
-    else
-        ipiv = allocate_shared_int(m)
-        factorization_shared_lu = get_row_pivot_lu(ipiv, shared_comm;
-                                                   synchronize=synchronize_shared,
-                                                   timer=timer)
-    end
-
-    comm_requests = [MPI.REQUEST_NULL for _ ∈
-                     1:max((1 + tile_size) * group_K, group_K + group_L, 2 * tile_size)]
 
     return (; factors, row_permutation, group_K, group_L, group_k, group_l,
             factorization_matrix_storage, factorization_matrix_parts,
@@ -198,8 +216,24 @@ end
 
 function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
     @sc_timeit A_lu.timer "lu!" begin
-        n_tiles = A_lu.n_tiles
         shared_comm_rank = A_lu.shared_comm_rank
+
+        if A_lu.distributed_comm_size == 1
+            # No distributed-memory MPI, more efficient to use RowPivotLUMPI directly,
+            # which uses only shared-memory MPI parallelism.
+            shared_lu = A_lu.factorization_shared_lu
+            row_permutation = A_lu.row_permutation
+            lu!(shared_lu, A)
+            if shared_comm_rank == 0
+                row_permutation .= 1:A_lu.m
+                apply_row_swaps!(row_permutation, shared_lu.ipiv, 1, A_lu.n)
+            end
+            fill_ldiv_tiles!(A_lu, A)
+
+            return A_lu
+        end
+
+        n_tiles = A_lu.n_tiles
         synchronize_shared = A_lu.synchronize_shared
 
         redistribute_matrix!(A_lu, A)
@@ -217,7 +251,7 @@ function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
         end
 
         gather_factors!(A_lu)
-        fill_ldiv_tiles!(A_lu)
+        fill_ldiv_tiles!(A_lu, A_lu.factors)
     end
 
     return A_lu
@@ -1334,9 +1368,8 @@ function update_bottom_right_block!(A_lu, panel)
     return nothing
 end
 
-function fill_ldiv_tiles!(A_lu)
+function fill_ldiv_tiles!(A_lu, factors)
     @sc_timeit A_lu.timer "fill_ldiv_tiles!" begin
-        factors = A_lu.factors
         my_L_tiles = A_lu.my_L_tiles
         my_L_tile_row_ranges = A_lu.my_L_tile_row_ranges
         my_L_tile_col_ranges = A_lu.my_L_tile_col_ranges

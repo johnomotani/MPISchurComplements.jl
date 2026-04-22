@@ -28,6 +28,7 @@ function dense_lu_test(n_shared)
             end
 
             A = allocate_array_float(m, m)
+            Afactors = allocate_array_float(m, m)
             b = allocate_array_float(m)
             x = allocate_array_float(m)
 
@@ -37,6 +38,7 @@ function dense_lu_test(n_shared)
                 while abs(det(A)) < 1.0e-4
                     A .= rand(rng, m, m)
                 end
+                Afactors .= A
                 b .= rand(rng, m)
             end
             if shared_rank == 0
@@ -45,7 +47,7 @@ function dense_lu_test(n_shared)
             end
             MPI.Barrier(shared_comm)
 
-            Alu = dense_lu(copy(A), tile_size, comm, shared_comm, distributed_comm,
+            Alu = dense_lu(Afactors, tile_size, comm, shared_comm, distributed_comm,
                            allocate_array_float, allocate_array_int)
 
             function test_once()
@@ -57,7 +59,11 @@ function dense_lu_test(n_shared)
                     tol = 2.0e-10
                     @test isapprox(A * x, b; norm=(x)->NaN, rtol=tol, atol=tol)
                     @test isapprox(x, A \ b; norm=(x)->NaN, rtol=tol, atol=tol)
-                    @test isapprox(Alu.factors, check_factors_lu.factors; norm=(x)->NaN, rtol=tol, atol=tol)
+                    if distributed_nproc == 1
+                        @test isapprox(Afactors, check_factors_lu.factors; norm=(x)->NaN, rtol=tol, atol=tol)
+                    else
+                        @test isapprox(Alu.factors, check_factors_lu.factors; norm=(x)->NaN, rtol=tol, atol=tol)
+                    end
                 end
             end
 
@@ -84,6 +90,7 @@ function dense_lu_test(n_shared)
                     while abs(det(A)) < 1.0e-4
                         A .= rand(rng, m, m)
                     end
+                    Afactors .= A
                     b .= rand(rng, m)
                 end
                 if shared_rank == 0
@@ -92,7 +99,7 @@ function dense_lu_test(n_shared)
                 end
                 MPI.Barrier(shared_comm)
 
-                lu!(Alu, copy(A))
+                lu!(Alu, Afactors)
 
                 test_once()
             end
