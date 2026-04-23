@@ -20,7 +20,7 @@ Time the LU factorization and solve for a matrix of size `n` and label `imat` lo
 the HDF5 file called `filename`, running with shared-memory blocks of size `n_shared`
 processes.
 """
-function time_lu(filename, n_shared, n, imat)
+function time_lu(filename, n_shared, distributed_block_rows, n, imat)
     comm_world = MPI.COMM_WORLD
     comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
         shared_nproc, shared_rank, allocate_shared_float, allocate_shared_int,
@@ -46,7 +46,9 @@ function time_lu(filename, n_shared, n, imat)
             MPI.Barrier(comm_world)
             t0 = time_ns()
             A_lu = dense_lu(A, nb, comm, shared_comm, distributed_comm, allocate_shared_float,
-                            allocate_shared_int; skip_factorization=true, check_lu=false)
+                            allocate_shared_int;
+                            distributed_block_rows=distributed_block_rows,
+                            skip_factorization=true, check_lu=false)
             MPI.Barrier(comm_world)
             t1 = time_ns()
             t_setup = (t1 - t0) / 1e9
@@ -54,7 +56,7 @@ function time_lu(filename, n_shared, n, imat)
             if distributed_rank == 0 && shared_rank == 0
                 println(now())
                 println("benchmark: matrix=$mat_name  rhs=$vec_name  file='$filename'")
-                println("  nproc = $(distributed_nproc * shared_nproc)  n_shared=$n_shared  n = $n  nb = $nb  nrhs = $nrhs")
+                println("  nproc = $(distributed_nproc * shared_nproc)  n_shared=$n_shared  distributed_block_rows = $distributed_block_rows  n = $n  nb = $nb  nrhs = $nrhs")
             end
 
             t_trisolve_array = fill(Float64(Inf), nrhs)
@@ -95,7 +97,8 @@ function time_lu(filename, n_shared, n, imat)
                 println()
 
                 open(logfile, "a") do io
-                    println(io, "$n $nb $imat $distributed_nproc $shared_nproc $t_factorisation $t_trisolve_min $t_trisolve_mean $t_trisolve_max $(t_factorisation + t_trisolve_mean)")
+                    dbr = distributed_block_rows === nothing ? 0 : distributed_block_rows
+                    println(io, "$n $nb $imat $distributed_nproc $shared_nproc $dbr $t_factorisation $t_trisolve_min $t_trisolve_mean $t_trisolve_max $(t_factorisation + t_trisolve_mean)")
                 end
             end
 

@@ -13,7 +13,7 @@ const nrhs_repeats = 10
 
 include("../test/utils.jl")
 
-function time_lu(input_file, mat_size, n_shared, tile_size, logoutput=false)
+function time_lu(input_file, mat_size, n_shared, distributed_block_rows, tile_size, logoutput=false)
     comm_world = MPI.COMM_WORLD
     comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
         shared_nproc, shared_rank, allocate_shared_float, allocate_shared_int,
@@ -43,13 +43,14 @@ function time_lu(input_file, mat_size, n_shared, tile_size, logoutput=false)
     if distributed_rank == 0 && shared_rank == 0
         println(outstream, now())
         println(outstream, "benchmark: matrix=$mat_name  rhs=$vec_name  file='$input_file'")
-        println(outstream, "  nproc = $(distributed_nproc * shared_nproc)  n_shared=$n_shared  mat_size = $mat_size  tile_size = $tile_size  nrhs = $nrhs")
+        println(outstream, "  nproc = $(distributed_nproc * shared_nproc)  n_shared=$n_shared  distributed_block_rows = $distributed_block_rows  mat_size = $mat_size  tile_size = $tile_size  nrhs = $nrhs")
     end
 
     MPI.Barrier(comm_world)
     t0 = time_ns()
     A_lu = dense_lu(A, tile_size, comm, shared_comm, distributed_comm, allocate_shared_float,
-                    allocate_shared_int; skip_factorization=true, check_lu=false, timer=timer)
+                    allocate_shared_int; distributed_block_rows=distributed_block_rows,
+                    skip_factorization=true, check_lu=false, timer=timer)
     MPI.Barrier(comm_world)
     t1 = time_ns()
     t_setup = (t1 - t0) / 1e9
@@ -129,13 +130,17 @@ function main()
     input_file = ARGS[1]
     mat_size = parse(Int64, ARGS[2])
     n_shared = parse(Int64, ARGS[3])
-    tile_size = parse(Int64, ARGS[4])
+    distributed_block_rows = parse(Int64, ARGS[4])
+    tile_size = parse(Int64, ARGS[5])
     if n_shared > nproc
         error("n_shared ($n_shared) > nproc ($nproc)")
     end
-    time_lu(input_file, mat_size, n_shared, tile_size)
+    if distributed_block_rows == 0
+        distributed_block_rows = nothing
+    end
+    time_lu(input_file, mat_size, n_shared, distributed_block_rows, tile_size)
     println("repeat to remove compile timings")
-    time_lu(input_file, mat_size, n_shared, tile_size, true)
+    time_lu(input_file, mat_size, n_shared, distributed_block_rows, tile_size, true)
 
     MPI.Finalize()
     return nothing

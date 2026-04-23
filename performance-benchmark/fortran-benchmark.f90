@@ -507,8 +507,8 @@ contains
           !   t_trisolve_min  t_trisolve_mean  t_trisolve_max  t_total_mean !
           open(newunit=log_unit, file=LOG_FILE, &
               status='unknown', position='append', action='write')
-          write(log_unit, '(I0,1X,I0,1X,I0,1X,I0,1X,I0,5(1X,ES24.16))') &
-              n, nb, imat, nprocs, blas_threads, &
+          write(log_unit, '(I0,5(1X,I0),5(1X,ES24.16))') &
+              n, nb, imat, nprocs, blas_threads, 0, &
               t_factorisation, &
               t_trisolve_min, t_trisolve_mean, t_trisolve_max, &
               t_factorisation + t_trisolve_mean

@@ -70,7 +70,7 @@ function time_lu(filename, n_threads, n, imat)
         println()
 
         open(logfile, "a") do io
-            println(io, "$n $nb $imat $nproc $n_threads $t_factorisation $t_trisolve_min $t_trisolve_mean $t_trisolve_max $(t_factorisation + t_trisolve_mean)")
+            println(io, "$n $nb $imat $nproc $n_threads 0 $t_factorisation $t_trisolve_min $t_trisolve_mean $t_trisolve_max $(t_factorisation + t_trisolve_mean)")
         end
     end
 
