@@ -7,7 +7,7 @@ using MPISchurComplements.DenseLUs
 
 const logfile = "timings-julia.log"
 const nrhs = 10
-const nmat_repeats = 10
+const nmat_repeats_max = 10
 const nrhs_repeats = 10
 const tile_sizes = [32, 64, 128, 256, 512, 1024, 2048]
 
@@ -36,6 +36,14 @@ function time_lu(filename, n_shared, distributed_block_rows, n, imat)
         vec_name = "rhs-$n"
         rhs_array .= read(file[vec_name])
         close(file)
+    end
+
+    if n > 4196
+        nmat_repeats = min(3, nmat_repeats_max)
+    elseif n > 1024
+        nmat_repeats = min(5, nmat_repeats_max)
+    else
+        nmat_repeats = nmat_repeats_max
     end
 
     for nb ∈ tile_sizes

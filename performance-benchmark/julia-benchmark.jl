@@ -23,7 +23,14 @@ function main()
             elseif nproc ≤ 8 && n > 8192
                 continue
             end
-            for imat ∈ 1:10
+            if n > 8192
+                imat_max = 3
+            elseif n > 1024
+                imat_max = 5
+            else
+                imat_max = 10
+            end
+            for imat ∈ 1:imat_max
                 time_lu(ARGS[1], n_shared, distributed_block_rows, n, imat)
             end
         end
