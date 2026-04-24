@@ -186,8 +186,10 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
         factorization_non_local_pivots = allocate_shared_int(tile_size + 1)
         factorization_top_panel_rows_to_send = allocate_shared_int(tile_size)
 
+        n_tiles = (m + tile_size - 1) ÷ tile_size
         comm_requests = [MPI.REQUEST_NULL for _ ∈
-                         1:max((1 + tile_size) * group_K, group_K + group_L, 2 * tile_size)]
+                         1:max((1 + tile_size) * group_K, group_K + group_L,
+                               2 * tile_size, n_tiles^2)]
     else
         factors = allocate_shared_float(0, 0)
         factorization_matrix_storage = allocate_shared_float(0, 0)
@@ -271,26 +273,200 @@ end
 # tiles of the matrix, in the 'local buffers'.
 function redistribute_matrix!(A_lu, A)
     @sc_timeit A_lu.timer "redistribute_matrix!" begin
+        m = A_lu.m
+        n = A_lu.n
         distributed_comm = A_lu.distributed_comm
+        distributed_comm_rank = A_lu.distributed_comm_rank
         shared_comm_rank = A_lu.shared_comm_rank
+        shared_comm_size = A_lu.shared_comm_size
+        tile_size = A_lu.tile_size
+        group_k = A_lu.group_k
+        group_l = A_lu.group_l
+        group_K = A_lu.group_K
+        group_L = A_lu.group_L
+        matrix_storage = A_lu.factorization_matrix_storage
         matrix_parts = A_lu.factorization_matrix_parts
         row_ranges = A_lu.factorization_matrix_parts_row_ranges
         col_ranges = A_lu.factorization_matrix_parts_col_ranges
         synchronize_shared = A_lu.synchronize_shared
 
-        if size(A) != (A_lu.m, A_lu.n)
-            error("Expected `A` to be a $((A_lu.m,A_lu.n)) matrix buffer on every rank")
-        end
+        if group_K == 1 && group_L == 1
+            # Only one shared-memory block, so no need for distributed communication.
+            shared_comm_size = A_lu.shared_comm_size
 
-        if shared_comm_rank == 0
-            # As this block is just copying a one matrix into another, it must be memory
-            # bandwidth limited, so not sure that trying to use shared-memory processes would
-            # speed it up. Anyway, it is unlikely to be the main bottleneck, so not worth
-            # performance testing (unless it turns out to be a limiting factor).
-            MPI.Bcast!(A, distributed_comm; root=0)
+            cols_per_proc = (n + shared_comm_size - 1) ÷ shared_comm_size
+            col_range = shared_comm_rank*cols_per_proc+1:min((shared_comm_rank+1)*cols_per_proc,n)
 
-            for (tile_j,cr) ∈ enumerate(col_ranges), (tile_i, rr) ∈ enumerate(row_ranges)
-                @views matrix_parts[tile_i,tile_j] .= A[rr,cr]
+            matrix_storage[:,col_range] .= A[:,col_range]
+        elseif group_K == 1
+            # Single shared-memory block owns each tile-column, so can communicate whole
+            # tile-columns.
+            if distributed_comm_rank == 0
+                if shared_comm_rank == 0
+                    reqs = A_lu.comm_requests
+                    req_counter = 0
+                    # First send columns to other processes, then copy columns owned by
+                    # this process.
+                    for tile_j ∈ 1:size(matrix_parts,2)
+                        for dest_l ∈ 2:group_L
+                            A_col_range = ((tile_j-1)*group_L+dest_l-1)*tile_size+1:min(((tile_j-1)*group_L+dest_l)*tile_size,n)
+                            if !isempty(A_col_range)
+                                reqs[req_counter+=1] =
+                                    MPI.Isend(@view(A[:,A_col_range]), distributed_comm;
+                                              dest=dest_l-1, tag=tile_j)
+                            end
+                        end
+                    end
+                end
+                if shared_comm_size == 1
+                    for tile_j ∈ 1:size(matrix_parts,2)
+                        A_col_range = ((tile_j-1)*group_L)*tile_size+1:min(((tile_j-1)*group_L+1)*tile_size,n)
+                        col_range = (tile_j-1)*tile_size+1:min(tile_j*tile_size,size(matrix_storage,2))
+                        @views matrix_storage[:,col_range] .= A[:,A_col_range]
+                    end
+                elseif shared_comm_rank > 0
+                    # When we are using shared-memory parallelism, use the non-root ranks
+                    # in the shared memory block to copy the locally-owned parts of the
+                    # matrix, while the root rank is MPI-sending the non-locally-owned
+                    # parts.
+                    n_tile_cols = size(matrix_parts,2)
+                    tile_cols_per_proc = (n_tile_cols + shared_comm_size) ÷ (shared_comm_size - 1)
+                    tile_col_range = (shared_comm_rank-1)*tile_cols_per_proc+1:min(shared_comm_rank*tile_cols_per_proc,n_tile_cols)
+                    for tile_j ∈ tile_col_range
+                        A_col_range = ((tile_j-1)*group_L)*tile_size+1:min(((tile_j-1)*group_L+1)*tile_size,n)
+                        col_range = (tile_j-1)*tile_size+1:min(tile_j*tile_size,size(matrix_storage,2))
+                        @views matrix_storage[:,col_range] .= A[:,A_col_range]
+                    end
+                end
+            elseif shared_comm_rank == 0
+                reqs = A_lu.comm_requests
+                req_counter = 0
+                for tile_j ∈ 1:size(matrix_parts, 2)
+                    col_range = (tile_j-1)*tile_size+1:min(tile_j*tile_size,size(matrix_storage,2))
+                    if !isempty(col_range)
+                        reqs[req_counter+=1] =
+                            MPI.Irecv!(@view(matrix_storage[:,col_range]),
+                                       distributed_comm; source=0, tag=tile_j)
+                    end
+                end
+            end
+            if shared_comm_rank == 0
+                MPI.Waitall(reqs[1:req_counter])
+            end
+        elseif group_L == 1
+            # Single shared-memory block owns each tile-row, so can communicate whole
+            # tile-rows.
+            if distributed_comm_rank == 0
+                if shared_comm_rank == 0
+                    reqs = A_lu.comm_requests
+                    req_counter = 0
+                    # First send rows to other processes, then copy rows owned by this
+                    # process.
+                    for tile_i ∈ 1:size(matrix_parts,1)
+                        for dest_k ∈ 2:group_K
+                            A_row_range = ((tile_i-1)*group_K+dest_k-1)*tile_size+1:min(((tile_i-1)*group_K+dest_k)*tile_size,m)
+                            if !isempty(A_row_range)
+                                reqs[req_counter+=1] =
+                                    MPI.Isend(@view(A[A_row_range,:]), distributed_comm;
+                                              dest=dest_k-1, tag=tile_i)
+                            end
+                        end
+                    end
+                end
+                if shared_comm_size == 1
+                    for tile_i ∈ 1:size(matrix_parts,1)
+                        A_row_range = ((tile_i-1)*group_K)*tile_size+1:min(((tile_i-1)*group_K+1)*tile_size,m)
+                        row_range = (tile_i-1)*tile_size+1:min(tile_i*tile_size,size(matrix_storage,1))
+                        @views matrix_storage[row_range,:] .= A[A_row_range,:]
+                    end
+                elseif shared_comm_rank > 0
+                    # When we are using shared-memory parallelism, use the non-root ranks
+                    # in the shared memory block to copy the locally-owned parts of the
+                    # matrix, while the root rank is MPI-sending the non-locally-owned
+                    # parts.
+                    n_tile_rows = size(matrix_parts, 1)
+                    tile_rows_per_proc = (n_tile_rows + shared_comm_size) ÷ (shared_comm_size - 1)
+                    tile_row_range = (shared_comm_rank-1)*tile_rows_per_proc+1:min(shared_comm_rank*tile_rows_per_proc,n_tile_rows)
+                    for tile_i ∈ tile_row_range
+                        A_row_range = ((tile_i-1)*group_K)*tile_size+1:min(((tile_i-1)*group_K+1)*tile_size,m)
+                        row_range = (tile_i-1)*tile_size+1:min(tile_i*tile_size,size(matrix_storage,1))
+                        @views matrix_storage[row_range,:] .= A[A_row_range,:]
+                    end
+                end
+            elseif shared_comm_rank == 0
+                reqs = A_lu.comm_requests
+                req_counter = 0
+                for tile_i ∈ 1:size(matrix_parts,1)
+                    row_range = (tile_i-1)*tile_size+1:min(tile_i*tile_size,size(matrix_storage,1))
+                    if !isempty(row_range)
+                        reqs[req_counter+=1] =
+                            MPI.Irecv!(@view(matrix_storage[row_range,:]),
+                                       distributed_comm; source=0, tag=tile_i)
+                    end
+                end
+            end
+            if shared_comm_rank == 0
+                MPI.Waitall(reqs[1:req_counter])
+            end
+        else
+            # Both rows and columns are divided up, so communicate individual tiles.
+            if distributed_comm_rank == 0
+                if shared_comm_rank == 0
+                    reqs = A_lu.comm_requests
+                    req_counter = 0
+                    # First send columns to other processes, then copy columns owned by
+                    # this process.
+                    n_tile_rows = size(matrix_parts,1)
+                    for tile_j ∈ 1:size(matrix_parts,2), tile_i ∈ 1:n_tile_rows
+                        for dest_l ∈ 1:group_L, dest_k ∈ (dest_l == 1 ? 2 : 1):group_K
+                            A_col_range = ((tile_j-1)*group_L+dest_l-1)*tile_size+1:min(((tile_j-1)*group_L+dest_l)*tile_size,n)
+                            A_row_range = ((tile_i-1)*group_K+dest_k-1)*tile_size+1:min(((tile_i-1)*group_K+dest_k)*tile_size,m)
+                            if !isempty(A_col_range) && !isempty(A_row_range)
+                                dest_r = (dest_l - 1) * group_K + dest_k - 1
+                                tag = tile_j * n_tile_rows + tile_i
+                                reqs[req_counter+=1] =
+                                    MPI.Isend(@view(A[A_row_range,A_col_range]), distributed_comm;
+                                              dest=dest_r, tag=tag)
+                            end
+                        end
+                    end
+                end
+                if shared_comm_size == 1
+                    for tile_j ∈ 1:size(matrix_parts,2), tile_i ∈ 1:size(matrix_parts,1)
+                        A_col_range = ((tile_j-1)*group_L)*tile_size+1:min(((tile_j-1)*group_L+1)*tile_size,n)
+                        A_row_range = ((tile_i-1)*group_K)*tile_size+1:min(((tile_i-1)*group_K+1)*tile_size,m)
+                        matrix_parts[tile_i,tile_j] .= @view(A[A_row_range,A_col_range])
+                    end
+                elseif shared_comm_rank > 0
+                    # When we are using shared-memory parallelism, use the non-root ranks
+                    # in the shared memory block to copy the locally-owned parts of the
+                    # matrix, while the root rank is MPI-sending the non-locally-owned
+                    # parts.
+                    n_tile_cols = size(matrix_parts,2)
+                    tile_cols_per_proc = (n_tile_cols + shared_comm_size) ÷ (shared_comm_size - 1)
+                    tile_col_range = (shared_comm_rank-1)*tile_cols_per_proc+1:min(shared_comm_rank*tile_cols_per_proc,n_tile_cols)
+                    for tile_j ∈ tile_col_range, tile_i ∈ 1:size(matrix_parts,1)
+                        A_col_range = ((tile_j-1)*group_L)*tile_size+1:min(((tile_j-1)*group_L+1)*tile_size,n)
+                        A_row_range = ((tile_i-1)*group_K)*tile_size+1:min(((tile_i-1)*group_K+1)*tile_size,m)
+                        matrix_parts[tile_i,tile_j] .= @view(A[A_row_range,A_col_range])
+                    end
+                end
+            elseif shared_comm_rank == 0
+                reqs = A_lu.comm_requests
+                req_counter = 0
+                n_tile_rows = size(matrix_parts,1)
+                for tile_j ∈ 1:size(matrix_parts,2), tile_i ∈ 1:n_tile_rows
+                    tile_storage = matrix_parts[tile_i,tile_j]
+                    if length(tile_storage) > 0
+                        tag = tile_j * n_tile_rows + tile_i
+                        reqs[req_counter+=1] =
+                            MPI.Irecv!(tile_storage, distributed_comm;
+                                       source=0, tag=tag)
+                    end
+                end
+            end
+            if shared_comm_rank == 0
+                MPI.Waitall(reqs[1:req_counter])
             end
         end
 
