@@ -1,4 +1,5 @@
 using MPISchurComplements.DenseLUs
+using MPISchurComplements.DenseLUs: gather_factors!
 using Combinatorics
 using LinearAlgebra
 using Primes
@@ -56,6 +57,9 @@ function dense_lu_test(n_shared, distributed_block_rows)
                 # LU factorise using the row permutation calculated for Alu, to compare
                 # the factors.
                 check_factors_lu = lu(A[Alu.row_permutation,:], NoPivot())
+                if distributed_nproc > 1
+                    factors = gather_factors!(Alu)
+                end
                 if shared_rank == 0
                     tol = 2.0e-10
                     @test isapprox(A * x, b; norm=(x)->NaN, rtol=tol, atol=tol)
@@ -63,7 +67,7 @@ function dense_lu_test(n_shared, distributed_block_rows)
                     if distributed_nproc == 1
                         @test isapprox(Afactors, check_factors_lu.factors; norm=(x)->NaN, rtol=tol, atol=tol)
                     else
-                        @test isapprox(Alu.factors, check_factors_lu.factors; norm=(x)->NaN, rtol=tol, atol=tol)
+                        @test isapprox(factors, check_factors_lu.factors; norm=(x)->NaN, rtol=tol, atol=tol)
                     end
                 end
             end

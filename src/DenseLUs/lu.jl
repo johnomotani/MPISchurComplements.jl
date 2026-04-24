@@ -1,7 +1,5 @@
 using ColumnPivotLUs
 using ColumnPivotLUs: apply_row_swaps!
-using Combinatorics
-using Primes
 
 # Implement efficient parallel LU factorization, based on ideas in:
 # L. Grigori, J. Demmel, and H. Xiang, "CALU: a communication optimal LU factorization algorithm", SIAM Journal on Matrix Analysis and Applications, 32 (2011), pp. 1317-1350.
@@ -67,8 +65,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
                   shared_comm_rank::Int64, shared_comm_size::Int64,
                   distributed_comm_rank::Int64, distributed_comm_size::Int64,
                   datatype::Type, allocate_shared_float::Ff, allocate_shared_int::Fi,
-                  synchronize_shared, distributed_block_rows::Union{Nothing,Int64},
-                  timer) where {Ff,Fi}
+                  synchronize_shared, group_K::Int64, group_L::Int64, timer) where {Ff,Fi}
 
     row_permutation = allocate_shared_int(m)
 
@@ -82,28 +79,6 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
         factorization_shared_lu = get_row_pivot_lu(ipiv, shared_comm;
                                                    synchronize=synchronize_shared,
                                                    timer=timer)
-    end
-
-    if distributed_block_rows === nothing
-        # Each block owns a set of (tile_size,tile_size) tiles in the full matrix - the
-        # last row and column of tiles may be shorter/narrower. The tiles are distributed
-        # in a block-cyclic pattern. Each block owns sub-tiles in the k'th row in each
-        # group of K columns, and in the l'th column of each group of L columns. We choose
-        # (abritrarily) to make L≤K.
-        distributed_comm_size_factors =
-            [prod(x) for x in
-             collect(unique(combinations(factor(Vector, distributed_comm_size))))]
-        # Find the last factor ≤ sqrt(distributed_comm_size)
-        factor_ind = findlast(x -> x≤sqrt(distributed_comm_size), distributed_comm_size_factors)
-        group_L = distributed_comm_size_factors[factor_ind]
-        group_K = distributed_comm_size ÷ group_L
-    else
-        if distributed_comm_size % distributed_block_rows != 0
-            error("distributed_block_rows=$distributed_block_rows argument does not "
-                  * "divide distributed_comm_size=$distributed_comm_size.")
-        end
-        group_K = distributed_block_rows
-        group_L = distributed_comm_size ÷ group_K
     end
 
     group_l, group_k = divrem(distributed_comm_rank, group_K) .+ 1
@@ -127,8 +102,6 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
     end
 
     if distributed_comm_size > 1
-        factors = allocate_shared_float(m, n)
-
         factorization_matrix_parts_row_ranges = [get_row_range(group_row)
                                                  for group_row ∈ 1:group_n_rows]
         factorization_matrix_parts_col_ranges = [get_col_range(group_col)
@@ -189,9 +162,8 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
         n_tiles = (m + tile_size - 1) ÷ tile_size
         comm_requests = [MPI.REQUEST_NULL for _ ∈
                          1:max((1 + tile_size) * group_K, group_K + group_L,
-                               2 * tile_size, n_tiles^2)]
+                               2 * tile_size, 2 * n_tiles^2)]
     else
-        factors = allocate_shared_float(0, 0)
         factorization_matrix_storage = allocate_shared_float(0, 0)
         factorization_matrix_parts = nothing
         factorization_matrix_parts_row_ranges = UnitRange{Int64}[]
@@ -199,7 +171,7 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
         factorization_locally_owned_rows = Int64[]
         factorization_pivot_generation_distributed_tree_sizes = Int64[]
         factorization_pivoting_buffer = allocate_shared_float(0)
-        factorization_local_left_panel_buffer = eltype(factors)[]
+        factorization_local_left_panel_buffer = eltype(factorization_matrix_storage)[]
         factorization_pivoting_reduction_buffer = allocate_shared_float(0, 0)
         factorization_pivoting_reduction_indices = allocate_shared_int(0)
         factorization_pivoting_reduction_indices_local = Int64[]
@@ -212,10 +184,9 @@ function setup_lu(m::Int64, n::Int64, tile_size::Int64, shared_comm::MPI.Comm,
         comm_requests = MPI.Request[]
     end
 
-    return (; factors, row_permutation, group_K, group_L, group_k, group_l,
-            factorization_matrix_storage, factorization_matrix_parts,
-            factorization_matrix_parts_row_ranges, factorization_matrix_parts_col_ranges,
-            factorization_locally_owned_rows,
+    return (; row_permutation, group_k, group_l, factorization_matrix_storage,
+            factorization_matrix_parts, factorization_matrix_parts_row_ranges,
+            factorization_matrix_parts_col_ranges, factorization_locally_owned_rows,
             factorization_pivot_generation_distributed_tree_sizes,
             factorization_pivoting_buffer, factorization_local_left_panel_buffer,
             factorization_pivoting_reduction_buffer,
@@ -262,8 +233,9 @@ function lu!(A_lu::DenseLU{T}, A::AbstractMatrix{T}) where T
             update_bottom_right_block!(A_lu, panel)
         end
 
-        gather_factors!(A_lu)
-        fill_ldiv_tiles!(A_lu, A_lu.factors)
+        synchronize_shared()
+
+        fill_ldiv_tiles!(A_lu)
     end
 
     return A_lu
@@ -476,36 +448,38 @@ function redistribute_matrix!(A_lu, A)
     return nothing
 end
 
-# Gather factorized matrix from `matrix_parts` into `factors`. Could probably do this
-# without the `MPI.Allreduce!()` by passing individual tiles in `fill_ldiv_tiles!()` (i.e.
-# `fill_ldiv_tiles!()` would use data from the distributed `matrix_parts` directly, and we
-# would never store `factors`).
+# `gather_factors!()` is only used for testing. Otherwise, we do not need to gather the
+# factorized matrix into a single array.
 function gather_factors!(A_lu)
     @sc_timeit A_lu.timer "gather_factors!" begin
         shared_comm_rank = A_lu.shared_comm_rank
         distributed_comm = A_lu.distributed_comm
-        factors = A_lu.factors
         matrix_parts = A_lu.factorization_matrix_parts
         row_ranges = A_lu.factorization_matrix_parts_row_ranges
         col_ranges = A_lu.factorization_matrix_parts_col_ranges
+        m = A_lu.m
+        n = A_lu.n
         synchronize_shared = A_lu.synchronize_shared
 
         if shared_comm_rank == 0
+            factors = zeros(eltype(matrix_parts[1,1]), m, n)
+
             # As this block is just copying a value or another matrix into a matrix, it must
             # be memory bandwidth limited, so not sure that trying to use shared-memory
             # processes would speed it up. Anyway, it is unlikely to be the main bottleneck,
             # so not worth performance testing (unless it turns out to be a limiting factor).
-            factors .= 0.0
             for (tile_j,cr) ∈ enumerate(col_ranges), (tile_i, rr) ∈ enumerate(row_ranges)
                 @views factors[rr,cr] .= matrix_parts[tile_i,tile_j]
             end
             MPI.Allreduce!(factors, +, distributed_comm)
+        else
+            factors = nothing
         end
 
         synchronize_shared()
     end
 
-    return nothing
+    return factors
 end
 
 function get_n_rows_from_k(k, panel_k, panel_group_row, group_K, n_local_pivots, n_tiles, m, tile_size)
@@ -1580,6 +1554,73 @@ function update_bottom_right_block!(A_lu, panel)
     return nothing
 end
 
+function fill_ldiv_tiles!(A_lu)
+    @sc_timeit A_lu.timer "fill_ldiv_tiles!" begin
+        matrix_parts = A_lu.factorization_matrix_parts
+        my_L_tiles = A_lu.my_L_tiles
+        my_L_tile_row_ranges = A_lu.my_L_tile_row_ranges
+        my_L_tile_col_ranges = A_lu.my_L_tile_col_ranges
+        my_U_tiles = A_lu.my_U_tiles
+        my_U_tile_row_ranges = A_lu.my_U_tile_row_ranges
+        my_U_tile_col_ranges = A_lu.my_U_tile_col_ranges
+        my_nonlocal_L_tile_list = A_lu.my_nonlocal_L_tile_list
+        my_nonlocal_U_tile_list = A_lu.my_nonlocal_U_tile_list
+        my_ldiv_tile_send_list = A_lu.my_ldiv_tile_send_list
+        my_local_L_tile_list = A_lu.my_local_L_tile_list
+        my_local_U_tile_list = A_lu.my_local_U_tile_list
+        my_diagonal_tile_list = A_lu.my_diagonal_tile_list
+        reqs = A_lu.comm_requests
+        comm = A_lu.comm
+
+        req_counter = 0
+
+        for (step, tile_ind, source) ∈ eachcol(my_nonlocal_L_tile_list)
+            row_range = my_L_tile_row_ranges[step]
+            col_range = my_L_tile_col_ranges[step]
+            reqs[req_counter+=1] =
+                MPI.Irecv!(@view(my_L_tiles[1:length(row_range),1:length(col_range),step]),
+                           comm; source=source, tag=tile_ind)
+        end
+
+        for (step, tile_ind, source) ∈ eachcol(my_nonlocal_U_tile_list)
+            row_range = my_U_tile_row_ranges[step]
+            col_range = my_U_tile_col_ranges[step]
+            reqs[req_counter+=1] =
+                MPI.Irecv!(@view(my_U_tiles[1:length(row_range),1:length(col_range),step]),
+                           comm; source=source, tag=tile_ind)
+        end
+
+        for (tile_ind, dest) ∈ eachcol(my_ldiv_tile_send_list)
+            reqs[req_counter+=1] = MPI.Isend(matrix_parts[tile_ind], comm; dest=dest,
+                                             tag=tile_ind)
+        end
+
+        # While MPI comms complete, copy the locally-owned tiles.
+        for (step, tile_ind) ∈ eachcol(my_local_L_tile_list)
+            row_range = my_L_tile_row_ranges[step]
+            col_range = my_L_tile_col_ranges[step]
+            @view(my_L_tiles[1:length(row_range),1:length(col_range),step]) .=
+                matrix_parts[tile_ind]
+        end
+        for (step, tile_ind) ∈ eachcol(my_local_U_tile_list)
+            row_range = my_U_tile_row_ranges[step]
+            col_range = my_U_tile_col_ranges[step]
+            @view(my_U_tiles[1:length(row_range),1:length(col_range),step]) .=
+                matrix_parts[tile_ind]
+        end
+
+        MPI.Waitall(reqs[1:req_counter])
+
+        # Copy any diagonal tiles from my_L_tiles to my_U_tiles.
+        for (L_diag, U_diag) ∈ eachcol(my_diagonal_tile_list)
+            @views my_U_tiles[:,:,U_diag] .= my_L_tiles[:,:,L_diag]
+        end
+    end
+    return nothing
+end
+
+# Version used when not using distributed-memory MPI, in which case the input matrix is
+# factorized in-place.
 function fill_ldiv_tiles!(A_lu, factors)
     @sc_timeit A_lu.timer "fill_ldiv_tiles!" begin
         my_L_tiles = A_lu.my_L_tiles

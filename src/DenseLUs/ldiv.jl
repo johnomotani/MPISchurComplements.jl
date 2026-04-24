@@ -1,8 +1,9 @@
-function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI.Comm,
-                    shared_comm_size::Int64, shared_comm_rank::Int64,
-                    distributed_comm::MPI.Comm, distributed_comm_size::Int64,
-                    distributed_comm_rank::Int64, is_root::Bool,
-                    allocate_shared_float::Ff, allocate_shared_int::Fi) where {Ff,Fi}
+function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, comm::MPI.Comm,
+                    shared_comm::MPI.Comm, shared_comm_size::Int64,
+                    shared_comm_rank::Int64, distributed_comm::MPI.Comm,
+                    distributed_comm_size::Int64, distributed_comm_rank::Int64,
+                    is_root::Bool, allocate_shared_float::Ff, allocate_shared_int::Fi,
+                    group_K::Int64, group_L::Int64) where {Ff,Fi}
     vec_buffer1 = allocate_shared_float(m)
     vec_buffer2 = allocate_shared_float(m)
     L_rhs_update_buffer = allocate_shared_float(m)
@@ -25,10 +26,11 @@ function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI
     if is_root
         diagonal_indices = fill(0, n_steps_max)
         first_unhandled_column_in_row = ones(Int64, n_tiles)
+        nproc = shared_comm_size * distributed_comm_size
         # The pairs of entries in `tiles_for_rank` are the (row,column) of a tile. We
         # build up a list of these Tuples for each rank, indicating the tile that that
         # rank should work on on each step.
-        tiles_for_rank = fill(-1, 2, n_steps_max, shared_comm_size * distributed_comm_size)
+        tiles_for_rank = fill(-1, 2, n_steps_max, nproc)
         next_diagonal_tile = 1
         step = 1
         rows_with_tasks = zeros(Int64, shared_comm_size, distributed_comm_size)
@@ -331,11 +333,99 @@ function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI
         # Convert because Int64 is more convenient to communicate over MPI than Bool.
         step_needs_synchronize = Int64.(step_needs_synchronize)
 
+        # Work out communication pattern for `fill_ldiv_tiles!()`.
+        nonlocal_L_tile_list = fill(-1, 3, (n_tiles * (n_tiles + 1)) ÷ 2, nproc)
+        nonlocal_L_tile_list_count = zeros(Int64, nproc)
+        nonlocal_U_tile_list = fill(-1, 3, (n_tiles * (n_tiles + 1)) ÷ 2, nproc)
+        nonlocal_U_tile_list_count = zeros(Int64, nproc)
+        ldiv_tile_send_list = fill(-1, 2, n_tiles^2, nproc)
+        ldiv_tile_send_list_count = zeros(Int64, nproc)
+        local_L_tile_list = fill(-1, 2, (n_tiles * (n_tiles + 1)) ÷ 2, nproc)
+        local_L_tile_list_count = zeros(Int64, nproc)
+        local_U_tile_list = fill(-1, 2, (n_tiles * (n_tiles + 1)) ÷ 2, nproc)
+        local_U_tile_list_count = zeros(Int64, nproc)
+        diagonal_tile_list = fill(-1, 2, n_tiles, nproc)
+        diagonal_tile_list_count = zeros(Int64, nproc)
+        tile_rows_per_block = (n_tiles + group_K - 1) ÷ group_K
+        tile_cols_per_block = (n_tiles + group_L - 1) ÷ group_L
+        tiles_per_proc = (tile_rows_per_block * tile_cols_per_block + shared_comm_size - 1) ÷ shared_comm_size
+        function get_source(tile_i, tile_j)
+            local_tile_i, source_k = divrem(tile_i - 1, group_K) .+ 1
+            local_tile_j, source_l = divrem(tile_j - 1, group_L) .+ 1
+            source_block = (source_l - 1) * group_K + source_k - 1
+            tile_ind = (local_tile_j - 1) * tile_rows_per_block + local_tile_i
+            tile_proc = (tile_ind - 1) ÷ tiles_per_proc
+            source = source_block * shared_comm_size + tile_proc
+            return source_block, source, tile_ind
+        end
+        for rank ∈ 0:nproc-1
+            block = rank ÷ shared_comm_size
+            for step ∈ 1:n_steps[]
+                tile_i, tile_j = @view tiles_for_rank[:,step,rank+1]
+                if tile_i != -1
+                    # There is a tile on this process at this step.
+                    L_source_block, L_source, L_tile_ind = get_source(tile_i, tile_j)
+                    if block == L_source_block
+                        # Locally owned.
+                        local_L_tile_list_count[rank+1] += 1
+                        local_L_tile_list[:,local_L_tile_list_count[rank+1],rank+1] .= (step, L_tile_ind)
+                    else
+                        # Non-local.
+                        nonlocal_L_tile_list_count[rank+1] += 1
+                        nonlocal_L_tile_list[:,nonlocal_L_tile_list_count[rank+1],rank+1] .= (step, L_tile_ind, L_source)
+                        ldiv_tile_send_list_count[L_source+1] += 1
+                        ldiv_tile_send_list[:,ldiv_tile_send_list_count[L_source+1],L_source+1] .= (L_tile_ind, rank)
+                    end
+
+                    U_tile_i = n_tiles - tile_i + 1
+                    U_tile_j = n_tiles - tile_j + 1
+                    U_source_block, U_source, U_tile_ind = get_source(U_tile_i, U_tile_j)
+                    if block == U_source_block
+                        # Locally owned.
+                        local_U_tile_list_count[rank+1] += 1
+                        local_U_tile_list[:,local_U_tile_list_count[rank+1],rank+1] .= (step, U_tile_ind)
+                    else
+                        # Non-local.
+                        nonlocal_U_tile_list_count[rank+1] += 1
+                        nonlocal_U_tile_list[:,nonlocal_U_tile_list_count[rank+1],rank+1] .= (step, U_tile_ind, U_source)
+                        ldiv_tile_send_list_count[U_source+1] += 1
+                        ldiv_tile_send_list[:,ldiv_tile_send_list_count[U_source+1],U_source+1] .= (U_tile_ind, rank)
+                    end
+
+                    if tile_i == tile_j
+                        # Diagonal tile.
+                        diagonal_tile_list_count[rank+1] += 1
+                        diagonal_tile_list[1,diagonal_tile_list_count[rank+1],rank+1] = step
+                    end
+                end
+            end
+            # U-solve has diagonal tiles on the same steps as the L-solve, but moves through
+            # the diagonal tiles in the opposite order.
+            @views diagonal_tile_list[2,1:diagonal_tile_list_count[rank+1],rank+1] .=
+                reverse(diagonal_tile_list[1,1:diagonal_tile_list_count[rank+1],rank+1])
+        end
+
         diagonal_indices = diagonal_indices[1:n_steps[]]
 
         MPI.Bcast!(n_steps, distributed_comm; root=0)
         MPI.Bcast!(n_steps, shared_comm; root=0)
         MPI.Bcast!(diagonal_indices, distributed_comm; root=0)
+        small_reqs = MPI.Request[]
+        for rank ∈ 1:nproc-1
+            push!(small_reqs, MPI.Isend(@view(nonlocal_L_tile_list_count[rank+1:rank+1]),
+                                        comm; dest=rank, tag=1))
+            push!(small_reqs, MPI.Isend(@view(nonlocal_U_tile_list_count[rank+1:rank+1]),
+                                        comm; dest=rank, tag=2))
+            push!(small_reqs, MPI.Isend(@view(ldiv_tile_send_list_count[rank+1:rank+1]),
+                                        comm; dest=rank, tag=3))
+            push!(small_reqs, MPI.Isend(@view(local_L_tile_list_count[rank+1:rank+1]),
+                                        comm; dest=rank, tag=4))
+            push!(small_reqs, MPI.Isend(@view(local_U_tile_list_count[rank+1:rank+1]),
+                                        comm; dest=rank, tag=5))
+            push!(small_reqs, MPI.Isend(@view(diagonal_tile_list_count[rank+1:rank+1]),
+                                        comm; dest=rank, tag=6))
+        end
+        MPI.Waitall(small_reqs)
 
         step_needs_synchronize_this_block = allocate_shared_int(n_steps[])
 
@@ -358,14 +448,64 @@ function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI
             push!(reqs, MPI.Isend(@view(step_needs_synchronize[:,block+1]),
                                   distributed_comm; dest=block, tag=shared_comm_size))
         end
+        for rank ∈ 1:nproc-1
+            if nonlocal_L_tile_list_count[rank+1] > 0
+                push!(reqs,
+                      MPI.Isend(@view(nonlocal_L_tile_list[:,1:nonlocal_L_tile_list_count[rank+1],rank+1]),
+                                comm; dest=rank, tag=shared_comm_size+1))
+            end
+            if nonlocal_U_tile_list_count[rank+1] > 0
+                push!(reqs,
+                      MPI.Isend(@view(nonlocal_U_tile_list[:,1:nonlocal_U_tile_list_count[rank+1],rank+1]),
+                                comm; dest=rank, tag=shared_comm_size+2))
+            end
+            if ldiv_tile_send_list_count[rank+1] > 0
+                push!(reqs,
+                      MPI.Isend(@view(ldiv_tile_send_list[:,1:ldiv_tile_send_list_count[rank+1],rank+1]),
+                                comm; dest=rank, tag=shared_comm_size+3))
+            end
+            if local_L_tile_list_count[rank+1] > 0
+                push!(reqs,
+                      MPI.Isend(@view(local_L_tile_list[:,1:local_L_tile_list_count[rank+1],rank+1]),
+                                comm; dest=rank, tag=shared_comm_size+4))
+            end
+            if local_U_tile_list_count[rank+1] > 0
+                push!(reqs,
+                      MPI.Isend(@view(local_U_tile_list[:,1:local_U_tile_list_count[rank+1],rank+1]),
+                                comm; dest=rank, tag=shared_comm_size+5))
+            end
+            if diagonal_tile_list_count[rank+1] > 0
+                push!(reqs,
+                      MPI.Isend(@view(diagonal_tile_list[:,1:diagonal_tile_list_count[rank+1],rank+1]),
+                                comm; dest=rank, tag=shared_comm_size+6))
+            end
+        end
         MPI.Waitall(reqs)
         my_tiles_for_rank = tiles_for_rank[:,:,1]
+        my_nonlocal_L_tile_list = nonlocal_L_tile_list[:,1:nonlocal_L_tile_list_count[1],1]
+        my_nonlocal_U_tile_list = nonlocal_U_tile_list[:,1:nonlocal_U_tile_list_count[1],1]
+        my_ldiv_tile_send_list = ldiv_tile_send_list[:,1:ldiv_tile_send_list_count[1],1]
+        my_local_L_tile_list = local_L_tile_list[:,1:local_L_tile_list_count[1],1]
+        my_local_U_tile_list = local_U_tile_list[:,1:local_U_tile_list_count[1],1]
+        my_diagonal_tile_list = diagonal_tile_list[:,1:diagonal_tile_list_count[1],1]
     elseif shared_comm_rank == 0
         n_steps = Ref(-1)
         MPI.Bcast!(n_steps, distributed_comm; root=0)
         MPI.Bcast!(n_steps, shared_comm; root=0)
         diagonal_indices = fill(0, n_steps[])
         MPI.Bcast!(diagonal_indices, distributed_comm; root=0)
+        my_nonlocal_L_tile_list_count = Ref(0)
+        MPI.Recv!(my_nonlocal_L_tile_list_count, comm; source=0, tag=1)
+        my_nonlocal_U_tile_list_count = Ref(0)
+        MPI.Recv!(my_nonlocal_U_tile_list_count, comm; source=0, tag=2)
+        my_ldiv_tile_send_list_count = Ref(0)
+        MPI.Recv!(my_ldiv_tile_send_list_count, comm; source=0, tag=3)
+        my_local_L_tile_list_count = Ref(0)
+        MPI.Recv!(my_local_L_tile_list_count, comm; source=0, tag=4)
+        my_local_U_tile_list_count = Ref(0)
+        MPI.Recv!(my_local_U_tile_list_count, comm; source=0, tag=5)
+        my_diagonal_tile_list_count = Ref(0)
+        MPI.Recv!(my_diagonal_tile_list_count, comm; source=0, tag=6)
         step_needs_synchronize_this_block = allocate_shared_int(n_steps[])
         # Receive tiles_for_rank for each process in this block, and then pass them on.
         # Use my_tiles_for_rank as a buffer to pass on these arrays.
@@ -398,13 +538,73 @@ function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI
                 first_step_for_column[column] = step
             end
         end
+        my_nonlocal_L_tile_list = fill(-1, 3, my_nonlocal_L_tile_list_count[])
+        if my_nonlocal_L_tile_list_count[] > 0
+            MPI.Recv!(my_nonlocal_L_tile_list, comm; source=0, tag=shared_comm_size+1)
+        end
+        my_nonlocal_U_tile_list = fill(-1, 3, my_nonlocal_U_tile_list_count[])
+        if my_nonlocal_U_tile_list_count[] > 0
+            MPI.Recv!(my_nonlocal_U_tile_list, comm; source=0, tag=shared_comm_size+2)
+        end
+        my_ldiv_tile_send_list = fill(-1, 2, my_ldiv_tile_send_list_count[])
+        if my_ldiv_tile_send_list_count[] > 0
+            MPI.Recv!(my_ldiv_tile_send_list, comm; source=0, tag=shared_comm_size+3)
+        end
+        my_local_L_tile_list = fill(-1, 2, my_local_L_tile_list_count[])
+        if my_local_L_tile_list_count[] > 0
+            MPI.Recv!(my_local_L_tile_list, comm; source=0, tag=shared_comm_size+4)
+        end
+        my_local_U_tile_list = fill(-1, 2, my_local_U_tile_list_count[])
+        if my_local_U_tile_list_count[] > 0
+            MPI.Recv!(my_local_U_tile_list, comm; source=0, tag=shared_comm_size+5)
+        end
+        my_diagonal_tile_list = fill(-1, 2, my_diagonal_tile_list_count[])
+        if my_diagonal_tile_list_count[] > 0
+            MPI.Recv!(my_diagonal_tile_list, comm; source=0, tag=shared_comm_size+6)
+        end
     else
         n_steps = Ref(-1)
         diagonal_indices = Int64[]
         MPI.Bcast!(n_steps, shared_comm; root=0)
+        my_nonlocal_L_tile_list_count = Ref(0)
+        MPI.Irecv!(my_nonlocal_L_tile_list_count, comm; source=0, tag=1)
+        my_nonlocal_U_tile_list_count = Ref(0)
+        MPI.Irecv!(my_nonlocal_U_tile_list_count, comm; source=0, tag=2)
+        my_ldiv_tile_send_list_count = Ref(0)
+        MPI.Irecv!(my_ldiv_tile_send_list_count, comm; source=0, tag=3)
+        my_local_L_tile_list_count = Ref(0)
+        MPI.Irecv!(my_local_L_tile_list_count, comm; source=0, tag=4)
+        my_local_U_tile_list_count = Ref(0)
+        MPI.Irecv!(my_local_U_tile_list_count, comm; source=0, tag=5)
+        my_diagonal_tile_list_count = Ref(0)
+        MPI.Irecv!(my_diagonal_tile_list_count, comm; source=0, tag=6)
         step_needs_synchronize_this_block = allocate_shared_int(n_steps[])
         my_tiles_for_rank = zeros(Int64, 2, n_steps[])
         MPI.Recv!(my_tiles_for_rank, shared_comm; source=0)
+        my_nonlocal_L_tile_list = fill(-1, 3, my_nonlocal_L_tile_list_count[])
+        if my_nonlocal_L_tile_list_count[] > 0
+            MPI.Recv!(my_nonlocal_L_tile_list, comm; source=0, tag=shared_comm_size+1)
+        end
+        my_nonlocal_U_tile_list = fill(-1, 3, my_nonlocal_U_tile_list_count[])
+        if my_nonlocal_U_tile_list_count[] > 0
+            MPI.Recv!(my_nonlocal_U_tile_list, comm; source=0, tag=shared_comm_size+2)
+        end
+        my_ldiv_tile_send_list = fill(-1, 2, my_ldiv_tile_send_list_count[])
+        if my_ldiv_tile_send_list_count[] > 0
+            MPI.Recv!(my_ldiv_tile_send_list, comm; source=0, tag=shared_comm_size+3)
+        end
+        my_local_L_tile_list = fill(-1, 2, my_local_L_tile_list_count[])
+        if my_local_L_tile_list_count[] > 0
+            MPI.Recv!(my_local_L_tile_list, comm; source=0, tag=shared_comm_size+4)
+        end
+        my_local_U_tile_list = fill(-1, 2, my_local_U_tile_list_count[])
+        if my_local_U_tile_list_count[] > 0
+            MPI.Recv!(my_local_U_tile_list, comm; source=0, tag=shared_comm_size+5)
+        end
+        my_diagonal_tile_list = fill(-1, 2, my_diagonal_tile_list_count[])
+        if my_diagonal_tile_list_count[] > 0
+            MPI.Recv!(my_diagonal_tile_list, comm; source=0, tag=shared_comm_size+6)
+        end
     end
 
     # Need to find the steps where the following step is the first one that uses the
@@ -488,6 +688,8 @@ function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI
 
     return (; my_L_tiles, my_L_tile_row_ranges, my_L_tile_col_ranges, L_receive_requests,
             L_send_requests, my_U_tiles, my_U_tile_row_ranges, my_U_tile_col_ranges,
+            my_nonlocal_L_tile_list, my_nonlocal_U_tile_list, my_ldiv_tile_send_list,
+            my_local_L_tile_list, my_local_U_tile_list, my_diagonal_tile_list,
             U_receive_requests, U_send_requests, diagonal_indices, new_column_triggers,
             step_needs_synchronize_this_block, vec_buffer1, vec_buffer2,
             L_rhs_update_buffer, U_rhs_update_buffer, n_tiles)

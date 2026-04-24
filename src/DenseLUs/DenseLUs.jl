@@ -2,9 +2,11 @@ module DenseLUs
 
 export DenseLU, dense_lu
 
+using Combinatorics
 using LinearAlgebra
 using LinearAlgebra.BLAS: trsv!, trsm!, gemm!
 using MPI
+using Primes
 using StatsBase: countmap
 using TimerOutputs
 
@@ -15,7 +17,6 @@ import LinearAlgebra: lu!, ldiv!
 @kwdef struct DenseLU{T,Tmat,Tvec,Tintvec,Tfmp,Tslu,Tsync,Ttimer}
     m::Int64
     n::Int64
-    factors::Tmat
     row_permutation::Tintvec
     group_K::Int64
     group_L::Int64
@@ -48,6 +49,12 @@ import LinearAlgebra: lu!, ldiv!
     my_U_tiles::Array{T,3}
     my_U_tile_row_ranges::Vector{UnitRange{Int64}}
     my_U_tile_col_ranges::Vector{UnitRange{Int64}}
+    my_nonlocal_L_tile_list::Matrix{Int64}
+    my_nonlocal_U_tile_list::Matrix{Int64}
+    my_ldiv_tile_send_list::Matrix{Int64}
+    my_local_L_tile_list::Matrix{Int64}
+    my_local_U_tile_list::Matrix{Int64}
+    my_diagonal_tile_list::Matrix{Int64}
     U_receive_requests::Vector{MPI.Request}
     U_send_requests::Vector{MPI.Request}
     diagonal_indices::Vector{Int64}
@@ -111,6 +118,28 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, comm::MPI.Comm,
         MPI.Bcast!(distributed_comm_size, shared_comm; root=0)
         is_root = (shared_comm_rank == 0 && distributed_comm_rank[] == 0)
 
+        if distributed_block_rows === nothing
+            # Each block owns a set of (tile_size,tile_size) tiles in the full matrix - the
+            # last row and column of tiles may be shorter/narrower. The tiles are distributed
+            # in a block-cyclic pattern. Each block owns sub-tiles in the k'th row in each
+            # group of K columns, and in the l'th column of each group of L columns. We choose
+            # (abritrarily) to make L≤K.
+            distributed_comm_size_factors =
+                [prod(x) for x in
+                 collect(unique(combinations(factor(Vector, distributed_comm_size[]))))]
+            # Find the last factor ≤ sqrt(distributed_comm_size)
+            factor_ind = findlast(x -> x≤sqrt(distributed_comm_size[]), distributed_comm_size_factors)
+            group_L = distributed_comm_size_factors[factor_ind]
+            group_K = distributed_comm_size[] ÷ group_L
+        else
+            if distributed_comm_size[] % distributed_block_rows != 0
+                error("distributed_block_rows=$distributed_block_rows argument does not "
+                      * "divide distributed_comm_size[]=$(distributed_comm_size[]).")
+            end
+            group_K = distributed_block_rows
+            group_L = distributed_comm_size[] ÷ group_K
+        end
+
         # setup_lu and setup_ldiv both return NamedTuples. All the entries in both those
         # NamedTuples are fields of the DenseLU struct, which we splat into the DenseLU
         # constructor to avoid having to type out long lists of variable names repeatedly.
@@ -118,20 +147,20 @@ function dense_lu(A::AbstractMatrix, tile_size::Int64, comm::MPI.Comm,
             setup_lu(m, n, tile_size, shared_comm, shared_comm_rank, shared_comm_size,
                      distributed_comm_rank[], distributed_comm_size[], datatype,
                      allocate_shared_float, allocate_shared_int, synchronize_shared,
-                     distributed_block_rows, timer)
+                     group_K, group_L, timer)
 
         ldiv_variables =
-            setup_ldiv(m, datatype, tile_size, shared_comm, shared_comm_size,
+            setup_ldiv(m, datatype, tile_size, comm, shared_comm, shared_comm_size,
                        shared_comm_rank, distributed_comm, distributed_comm_size[],
                        distributed_comm_rank[], is_root, allocate_shared_float,
-                       allocate_shared_int)
+                       allocate_shared_int, group_K, group_L)
 
         A_lu =  DenseLU(; m, n, tile_size, comm, comm_rank, comm_size, shared_comm,
                         shared_comm_rank, shared_comm_size, distributed_comm,
                         distributed_comm_rank=distributed_comm_rank[],
                         distributed_comm_size=distributed_comm_size[], is_root,
-                        synchronize_shared, check_lu, lu_variables..., ldiv_variables...,
-                        timer)
+                        synchronize_shared, check_lu, group_K, group_L, lu_variables...,
+                        ldiv_variables..., timer)
     end
 
     if !skip_factorization
