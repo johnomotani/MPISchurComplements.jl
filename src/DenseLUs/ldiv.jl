@@ -466,7 +466,8 @@ function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI
         if itile == -1
             return 1:0
         else
-            return max(m-itile*tile_size+1,1):m-(itile-1)*tile_size
+            itile_rev = n_tiles - itile + 1
+            return (itile_rev-1)*tile_size+1:min(itile_rev*tile_size,m)
         end
     end
     my_U_tiles = fill(datatype(NaN), tile_size, tile_size, n_steps[])
@@ -700,15 +701,16 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                         # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm),
                         # so we cannot start this operation earlier.
                         t = diagonal_tile+1
+                        itile_rev = n_tiles - t + 1
                         U_receive_requests[t] =
-                            temp_Ireduce!(@view(y[max(m-t*tile_size+1,1):m-(t-1)*tile_size]),
+                            temp_Ireduce!(@view(y[(itile_rev-1)*tile_size+1:min(itile_rev*tile_size,m)]),
                                           +, distributed_comm; root=0)
                     end
                 else
                     # Need the [1:length(row_range)] selection, even though for most tiles
                     # this is just the full range, because the last row may have a different
                     # size
-                    @views gemm!('N', 'N', -one(T), my_U_tiles[1:length(row_range),:,step],
+                    @views gemm!('N', 'N', -one(T), my_U_tiles[:,1:length(col_range),step],
                                  x[col_range], one(T), U_rhs_update_buffer[row_range])
                 end
                 if step_needs_synchronize_this_block[step] == 1
@@ -724,7 +726,7 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                     # Need the [1:length(row_range)] selection, even though for most tiles
                     # this is just the full range, because the last row may have a different
                     # size
-                    @views gemm!('N', 'N', -one(T), my_U_tiles[1:length(row_range),:,step],
+                    @views gemm!('N', 'N', -one(T), my_U_tiles[:,1:length(col_range),step],
                                  x[col_range], one(T), U_rhs_update_buffer[row_range])
                 end
                 # Get data required for the next tiles processed on the block.
@@ -741,8 +743,9 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                         # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm), so we
                         # have to match the order that these operations are started on the root
                         # process.
+                        itile_rev = n_tiles - maybe_diagonal_tile + 1
                         U_receive_requests[maybe_diagonal_tile] =
-                            temp_Ibcast!(@view(x[max(m-maybe_diagonal_tile*tile_size+1,1):m-(maybe_diagonal_tile-1)*tile_size]),
+                            temp_Ibcast!(@view(x[(itile_rev-1)*tile_size+1:min(itile_rev*tile_size,m)]),
                                          distributed_comm; root=0)
                         if maybe_diagonal_tile < n_tiles
                             # We have sorted the tiles so that the shared_comm_rank=0 process
@@ -750,8 +753,9 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                             # `t` was handled on this step on this block, it was definitely
                             # handled on this rank, so we do not need to synchronize.
                             t = maybe_diagonal_tile + 1
+                            itile_rev = n_tiles - t + 1
                             U_send_requests[t] =
-                                temp_Ireduce!(@view(U_rhs_update_buffer[max(m-t*tile_size+1,1):m-(t-1)*tile_size]),
+                                temp_Ireduce!(@view(U_rhs_update_buffer[(itile_rev-1)*tile_size+1:min(itile_rev*tile_size,m)]),
                                               +, distributed_comm; root=0)
                         end
                     end
