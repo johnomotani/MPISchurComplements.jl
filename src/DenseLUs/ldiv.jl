@@ -787,7 +787,9 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
                     # Need the [1:length(row_range)] selection, even though for most tiles
                     # this is just the full range, because the last row may have a different
                     # size
-                    @views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                    #@views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                    #             y[col_range], one(T), L_rhs_update_buffer[row_range])
+                    @views gemv!('N', -one(T), my_L_tiles[1:length(row_range),:,step],
                                  y[col_range], one(T), L_rhs_update_buffer[row_range])
                 end
                 if step_needs_synchronize_this_block[step] == 1
@@ -803,7 +805,9 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
                     # Need the [1:length(row_range)] selection, even though for most tiles
                     # this is just the full range, because the last row may have a different
                     # size
-                    @views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                    #@views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                    #             y[col_range], one(T), L_rhs_update_buffer[row_range])
+                    @views gemv!('N', -one(T), my_L_tiles[1:length(row_range),:,step],
                                  y[col_range], one(T), L_rhs_update_buffer[row_range])
                 end
                 if shared_comm_rank == 0
@@ -912,7 +916,9 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                     # Need the [1:length(row_range)] selection, even though for most tiles
                     # this is just the full range, because the last row may have a different
                     # size
-                    @views gemm!('N', 'N', -one(T), my_U_tiles[:,1:length(col_range),step],
+                    #@views gemm!('N', 'N', -one(T), my_U_tiles[:,1:length(col_range),step],
+                    #             x[col_range], one(T), U_rhs_update_buffer[row_range])
+                    @views gemv!('N', -one(T), my_U_tiles[:,1:length(col_range),step],
                                  x[col_range], one(T), U_rhs_update_buffer[row_range])
                 end
                 if step_needs_synchronize_this_block[step] == 1
@@ -928,7 +934,9 @@ function U_solve!(x, A_lu::DenseLU{T}, y) where T
                     # Need the [1:length(row_range)] selection, even though for most tiles
                     # this is just the full range, because the last row may have a different
                     # size
-                    @views gemm!('N', 'N', -one(T), my_U_tiles[:,1:length(col_range),step],
+                    #@views gemm!('N', 'N', -one(T), my_U_tiles[:,1:length(col_range),step],
+                    #             x[col_range], one(T), U_rhs_update_buffer[row_range])
+                    @views gemv!('N', -one(T), my_U_tiles[:,1:length(col_range),step],
                                  x[col_range], one(T), U_rhs_update_buffer[row_range])
                 end
                 # Get data required for the next tiles processed on the block.

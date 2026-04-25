@@ -4,7 +4,7 @@ export DenseLU, dense_lu
 
 using Combinatorics
 using LinearAlgebra
-using LinearAlgebra.BLAS: trsv!, trsm!, gemm!
+using LinearAlgebra.BLAS: trsv!, trsm!, gemv!, gemm!
 using MPI
 using Primes
 using StatsBase: countmap
