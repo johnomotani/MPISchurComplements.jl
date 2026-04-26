@@ -129,7 +129,8 @@ function plot_for_matrix_size(timings2, dbr_values, nproc_array, tile_sizes, mat
     end
 
     fig = Figure()
-    ax = Axis(fig[1,1]; xlabel="nproc", ylabel="$operation_label time", title="$solver_label $mat_size", yscale=log10)
+    #ax = Axis(fig[1,1]; xlabel="nproc", ylabel="$operation_label time", title="$solver_label $mat_size", yscale=log10)
+    ax = Axis(fig[1,1]; xlabel="nproc", ylabel="$operation_label time", title="$solver_label $mat_size")
 
     marker_styles = (:circle, :cross, :xcross, :utriangle, :dtriangle, :ltriangle, :rtriangle)
     linestyle_pairs = ((:solid, :dash),
