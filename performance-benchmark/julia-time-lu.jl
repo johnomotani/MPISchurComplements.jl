@@ -5,12 +5,6 @@ using MPI
 using MPISchurComplements
 using MPISchurComplements.DenseLUs
 
-const logfile = "timings-julia.log"
-const nrhs = 10
-const nmat_repeats_max = 10
-const nrhs_repeats = 10
-const tile_sizes = [32, 64, 128, 256, 512, 1024, 2048]
-
 include("../test/utils.jl")
 
 """
@@ -20,7 +14,8 @@ Time the LU factorization and solve for a matrix of size `n` and label `imat` lo
 the HDF5 file called `filename`, running with shared-memory blocks of size `n_shared`
 processes.
 """
-function time_lu(filename, n_shared, distributed_block_rows, n, imat)
+function time_lu(filename, n_shared, distributed_block_rows, n, imat, nrhs, nmat_repeats,
+                 nrhs_repeats, tile_sizes, logfile)
     comm_world = MPI.COMM_WORLD
     comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
         shared_nproc, shared_rank, allocate_shared_float, allocate_shared_int,
@@ -36,14 +31,6 @@ function time_lu(filename, n_shared, distributed_block_rows, n, imat)
         vec_name = "rhs-$n"
         rhs_array .= read(file[vec_name])
         close(file)
-    end
-
-    if n > 4196
-        nmat_repeats = min(3, nmat_repeats_max)
-    elseif n > 1024
-        nmat_repeats = min(5, nmat_repeats_max)
-    else
-        nmat_repeats = nmat_repeats_max
     end
 
     for nb ∈ tile_sizes

@@ -123,7 +123,9 @@ function plot_for_matrix_size(timings2, dbr_values, nproc_array, tile_sizes, mat
     println(tee, "Best parameters for each nproc")
     println(tee, "nproc\tshared\tdbr\ttile_size")
     for nproc ∈ 1:max_nproc
-        println(tee, nproc, "\t", optimal_n_shared[nproc], "\t", optimal_dbr[nproc], "\t", optimal_tile_size[nproc])
+        if isfinite(optimal_times[nproc])
+            println(tee, nproc, "\t", optimal_n_shared[nproc], "\t", optimal_dbr[nproc], "\t", optimal_tile_size[nproc])
+        end
     end
 
     fig = Figure()
@@ -136,6 +138,7 @@ function plot_for_matrix_size(timings2, dbr_values, nproc_array, tile_sizes, mat
                        ((:dot, :loose), (:dashdot, :loose)),
                       )
 
+    nvals = 1:max_nproc
     for (i, (dbr, ms, ls)) ∈ enumerate(zip(dbr_values, marker_styles, linestyle_pairs))
         if dbr == 0
             dbr_label = ""
@@ -147,8 +150,12 @@ function plot_for_matrix_size(timings2, dbr_values, nproc_array, tile_sizes, mat
                 scatter!(ax, t; marker=ms, color=j, colormap=:tab10, colorrange=(1,10), label="$(dbr_label)tile_size=$tile_size")
                 #scatter!(ax, t; marker=ms, color=j, colorrange=(1,10), label="dbr=$dbr, tile_size=$tile_size")
             end
-            lines!(ax, [timings_array[n,n,i,j] for n ∈ 1:max_nproc]; linestyle=ls[1], color=j, colormap=:tab10, colorrange=(1,10), label="$(dbr_label)tile_size=$tile_size, n_shared=nproc")
-            lines!(ax, timings_array[:,1,i,j]; linestyle=ls[2], color=j, colormap=:tab10, colorrange=(1,10), label="$(dbr_label)tile_size=$tile_size, n_shared=1")
+            all_shared_times = [timings_array[n,n,i,j] for n ∈ nvals]
+            valid_ninds_all_shared = @. isfinite(all_shared_times)
+            no_shared_times = timings_array[:,1,i,j]
+            valid_ninds_no_shared = @. isfinite(no_shared_times)
+            lines!(ax, nvals[valid_ninds_all_shared], all_shared_times[valid_ninds_all_shared]; linestyle=ls[1], color=j, colormap=:tab10, colorrange=(1,10), label="$(dbr_label)tile_size=$tile_size, n_shared=nproc")
+            lines!(ax, nvals[valid_ninds_no_shared], no_shared_times[valid_ninds_no_shared]; linestyle=ls[2], color=j, colormap=:tab10, colorrange=(1,10), label="$(dbr_label)tile_size=$tile_size, n_shared=1")
         end
     end
 
@@ -191,8 +198,10 @@ function plot_optimal_times(optimal_times, operation_label)
 
     for (i, (this_optimal_times, solver_label)) ∈ enumerate(optimal_times)
         for (j, (times, label)) ∈ enumerate(this_optimal_times)
-            lines!(ax, times; label=label, linestyle=linestyles[i], color=j,
-                   colormap=:tab20, colorrange=(1,20))
+            nvals = 1:length(times)
+            valid_ninds = @. isfinite(times)
+            lines!(ax, nvals[valid_ninds], times[valid_ninds]; label=label,
+                   linestyle=linestyles[i], color=j, colormap=:tab20, colorrange=(1,20))
         end
     end
 
@@ -209,16 +218,15 @@ function plot_optimal_times(optimal_times, operation_label)
     return nothing
 end
 
-function plot_benchmarks()
-    julia_file = "timings-julia.log"
+function plot_benchmarks(suffix="")
     optimal_factorisation_times = Tuple{Vector{Tuple{Vector{Float64},String}},String}[]
     optimal_solve_times = Tuple{Vector{Tuple{Vector{Float64},String}},String}[]
     mkpath(results_dir)
-    io = open(joinpath(results_dir, "optimal_parameters.log"), "w")
+    io = open(joinpath(results_dir, "optimal_parameters$suffix.log"), "w")
     tee = TeeStream(stdout, io)
-    for (filename, label) ∈ (("timings-julia.log", "DenseLUs"),
+    for (filename, label) ∈ (("timings-julia$suffix.log", "DenseLUs"),
                              ("timings-fortran.log", "ScaLAPACK"),
-                             ("timings-linearalgebra.log", "LinearAlgebra"),
+                             ("timings-linearalgebra$suffix.log", "LinearAlgebra"),
                             )
         if isfile(filename)
             println(tee, label)
@@ -242,4 +250,8 @@ function plot_benchmarks()
     return nothing
 end
 
-plot_benchmarks()
+if length(ARGS) > 0
+    plot_benchmarks(ARGS[1])
+else
+    plot_benchmarks()
+end

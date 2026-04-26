@@ -93,7 +93,7 @@ contains
     integer :: nrhs_total    ! number of RHS vectors (columns of B)
     integer :: nrhs_repeats
     parameter (nrhs_repeats = 10) ! Repeat each rhs to get better statistics
-    integer :: tile_sizes(7)
+    integer :: tile_sizes(5)
     integer :: nb ! block size
     integer :: nmat_repeats
     parameter (nmat_repeats = 10) ! Repeat each matrix to get better statistics
@@ -159,7 +159,7 @@ contains
     integer :: i, irhs, itile, irepeatmat, irepeatrhs
     integer, external :: numroc
 
-    tile_sizes = [32, 64, 128, 256, 512, 1024, 2048]
+    tile_sizes = [128, 256, 512, 1024, 2048]
 
     ! ================================================================= !
     ! Step 1 – query MPI environment (MPI already initialised by caller)
