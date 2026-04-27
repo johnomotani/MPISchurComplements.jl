@@ -42,14 +42,14 @@ function pivot2ipiv!(pivots::AbstractVector{<:Integer}, startind::Integer)
     return nothing
 end
 
-"""
-    type_stable_findfirst(item, collection)
-
-Find the index of `item` in `collection`. If not found, return `-1`.
-
-`findfirst()` is not type-stable. For performance-sensitive code, this version may be more
-suitable.
-"""
+#"""
+#    type_stable_findfirst(item, collection)
+#
+#Find the index of `item` in `collection`. If not found, return `-1`.
+#
+#`findfirst()` is not type-stable. For performance-sensitive code, this version may be more
+#suitable.
+#"""
 function type_stable_findfirst(item, collection)
     position = -1
     for (i, x) ∈ enumerate(collection)
