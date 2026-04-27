@@ -1149,6 +1149,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             # distributed MPI, but we expect this step not to be a bottleneck, so it is done in
             # serial (at least for now).
             if isa(sc.schur_complement_factorization, DenseLU)
+                synchronize_shared()
                 lu!(sc.schur_complement_factorization, schur_complement)
             elseif shared_rank == 0 && distributed_rank == 0
                 new_lu = lu!(schur_complement; check=check_lu)
