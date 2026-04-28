@@ -12,7 +12,6 @@ using MPISchurComplements
 using MPISchurComplements.FakeMPILUs
 
 include("utils.jl")
-include("dense_lu.jl")
 include("simple_matrix.jl")
 include("finite_element.jl")
 
@@ -21,7 +20,6 @@ function runtests()
         MPI.Init()
     end
     @testset "MPISchurComplements" begin
-        dense_lu_tests()
         simple_matrix_tests()
         finite_element_tests()
     end

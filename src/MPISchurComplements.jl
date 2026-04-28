@@ -25,6 +25,7 @@ export MPISchurComplement, mpi_schur_complement, update_schur_complement!, ldiv!
 using LinearAlgebra
 import LinearAlgebra: ldiv!
 using MPI
+using MPIDenseLUs
 using SparseArrays
 using TimerOutputs
 
@@ -40,8 +41,6 @@ macro sc_timeit(timer, name, expr)
     end
 end
 
-include("DenseLUs/DenseLUs.jl")
-using .DenseLUs
 
 struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,Tbv,Tgy,
                           TBob,Trangeno,Tsync,Ttimer}
@@ -346,7 +345,7 @@ together the matrices passed on each distributed-MPI rank gives the full, global
 overlap can be passed on any distributed rank, as long as the contributions from each
 distributed rank add up to the full value).
 
-`comm` is the MPI communicator containing all processes to be used by DenseLU.
+`comm` is the MPI communicator containing all processes to be used by MPIDenseLU.
 
 `shared_comm` is the MPI communicator to use for shared-memory communications.
 
@@ -377,15 +376,16 @@ done (requires `use_sparse=true`). There is no saving in setup time because `Ain
 still has to be calculated, to be multiplied by `C` when calculating `schur_complement`.
 There is also no memory saving as a dense B-sized buffer array is needed.
 
-By default, when `shared_comm` is passed the DenseLUs module provided as part of
-MPISchurComplements.jl is used to factorize/solve the Schur complement matrix (which is
-dense) using a shared-memory parallel implementation (at present only the solve
-(`ldiv!()`) phase is parallelised, not the factorization (`lu!`)) and when `shared_comm`
-is not passed the serial implementation from LinearAlgebra (which uses LAPACK/BLAS) is
-used.  `parallel_schur` can be passed to force use of the serial (`false`) or parallel
-DenseLUs (`true`) implementations. When using DenseLUs, `schur_tile_size` can be used to
-set the `tile_size` argument to `dense_lu()`; the default is to use the smaller of 256 and
-the largest 2^n smaller than half of the size of the global 'bottom vector'.
+By default, when `distributed_comm` and/or`shared_comm` are passed the MPIDenseLUs package
+is used to factorize/solve the Schur complement matrix (which is dense) using a hybrid
+distributed+shared-memory MPI parallel implementation (both factorization `lu!()` and
+solve `ldiv!()` phases are parallelised) and when neither communicator is is passed the
+serial implementation from LinearAlgebra (which uses LAPACK/BLAS) is used.
+`parallel_schur` can be passed to force use of the serial (`false`) or parallel
+MPIDenseLUs (`true`) implementations. When using MPIDenseLUs, `schur_tile_size` can be
+used to set the `tile_size` argument to `mpi_dense_lu()`; the default is to use the
+smaller of 128 and the largest 2^n smaller than half of the size of the global 'bottom
+vector'.
 
 `skip_factorization=true` can be passed to create an MPISchurComplement instance without
 calculating the factorization corresponding to the input matrices. `ldiv!()` called with
@@ -413,7 +413,7 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                               allocate_shared_int::Union{Function,Nothing}=nothing,
                               synchronize_shared::Union{Function,Nothing}=nothing,
                               use_sparse=true, separate_Ainv_B=false,
-                              parallel_schur=shared_comm!==nothing,
+                              parallel_schur=(distributed_comm!==nothing || shared_comm!==nothing),
                               schur_tile_size=nothing, skip_factorization=false,
                               check_lu::Bool=true,
                               timer::Union{TimerOutput,Nothing}=nothing)
@@ -855,13 +855,13 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     if parallel_schur
         if schur_tile_size === nothing
             power_of_2 = floor(Int64, log2(bottom_vec_global_size / 2))
-            schur_tile_size = min(256, 2^power_of_2)
+            schur_tile_size = min(128, 2^power_of_2)
         end
         schur_complement_factorization =
-            dense_lu(schur_complement, schur_tile_size, comm, shared_comm,
-                     distributed_comm, allocate_shared_float, allocate_shared_int;
-                     synchronize_shared=synchronize_shared, skip_factorization=true,
-                     check_lu=check_lu, timer=timer)
+            mpi_dense_lu(schur_complement, schur_tile_size, comm, shared_comm,
+                         distributed_comm, allocate_shared_float, allocate_shared_int;
+                         synchronize_shared=synchronize_shared, skip_factorization=true,
+                         check_lu=check_lu, timer=timer)
     else
         if shared_rank == 0 && distributed_rank == 0
             schur_complement_factorization =
@@ -1148,7 +1148,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             # `sc.schur_complement_factorization`) could be parallelised with shared memory and/or
             # distributed MPI, but we expect this step not to be a bottleneck, so it is done in
             # serial (at least for now).
-            if isa(sc.schur_complement_factorization, DenseLU)
+            if isa(sc.schur_complement_factorization, MPIDenseLU)
                 synchronize_shared()
                 lu!(sc.schur_complement_factorization, schur_complement)
             elseif shared_rank == 0 && distributed_rank == 0
