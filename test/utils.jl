@@ -1,30 +1,23 @@
 function get_comms(shared_nproc, with_comm=false)
-    if shared_nproc == 1 && !with_comm
-        distributed_comm = MPI.COMM_WORLD
-        distributed_nproc = MPI.Comm_size(distributed_comm)
-        distributed_rank = MPI.Comm_rank(distributed_comm)
-        shared_comm = nothing
-        shared_rank = 0
-    else
-        nproc = MPI.Comm_size(MPI.COMM_WORLD)
-        rank = MPI.Comm_rank(MPI.COMM_WORLD)
-        distributed_nproc, rem = divrem(nproc, shared_nproc)
-        if rem != 0
-            error("shared_nproc=$shared_nproc does not divide nproc=$nproc")
-        end
-        distributed_rank, shared_rank = divrem(rank, shared_nproc)
-        shared_comm = MPI.Comm_split(MPI.COMM_WORLD, distributed_rank, shared_rank)
-        if shared_rank == 0
-            distributed_color = 0
-        else
-            distributed_color = nothing
-        end
-        distributed_comm = MPI.Comm_split(MPI.COMM_WORLD, distributed_color,
-                                          distributed_rank)
+    comm = MPI.COMM_WORLD
+    nproc = MPI.Comm_size(comm)
+    rank = MPI.Comm_rank(comm)
+    distributed_nproc, rem = divrem(nproc, shared_nproc)
+    if rem != 0
+        error("shared_nproc=$shared_nproc does not divide nproc=$nproc")
     end
+    distributed_rank, shared_rank = divrem(rank, shared_nproc)
+    shared_comm = MPI.Comm_split(MPI.COMM_WORLD, distributed_rank, shared_rank)
+    if shared_rank == 0
+        distributed_color = 0
+    else
+        distributed_color = nothing
+    end
+    distributed_comm = MPI.Comm_split(MPI.COMM_WORLD, distributed_color,
+                                      distributed_rank)
 
     local_win_store_float = nothing
-    if shared_comm === nothing && !with_comm
+    if shared_comm == MPI.COMM_SELF && !with_comm
         allocate_array_float = (args...)->zeros(Float64, args...)
     else
         local_win_store_float = MPI.Win[]
@@ -47,7 +40,7 @@ function get_comms(shared_nproc, with_comm=false)
     end
 
     local_win_store_int = nothing
-    if shared_comm === nothing && !with_comm
+    if shared_comm == MPI.COMM_SELF && !with_comm
         allocate_array_int = (args...)->zeros(Float64, args...)
     else
         local_win_store_int = MPI.Win[]
@@ -69,7 +62,7 @@ function get_comms(shared_nproc, with_comm=false)
         end
     end
 
-    return distributed_comm, distributed_nproc, distributed_rank, shared_comm,
+    return comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
            shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
            local_win_store_float, local_win_store_int
 end

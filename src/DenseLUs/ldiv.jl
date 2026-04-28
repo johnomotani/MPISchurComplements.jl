@@ -1,8 +1,9 @@
-function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI.Comm,
-                    shared_comm_size::Int64, shared_comm_rank::Int64,
-                    distributed_comm::MPI.Comm, distributed_comm_size::Int64,
-                    distributed_comm_rank::Int64, is_root::Bool,
-                    allocate_shared_float::Ff, allocate_shared_int::Fi) where {Ff,Fi}
+function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, comm::MPI.Comm,
+                    shared_comm::MPI.Comm, shared_comm_size::Int64,
+                    shared_comm_rank::Int64, distributed_comm::MPI.Comm,
+                    distributed_comm_size::Int64, distributed_comm_rank::Int64,
+                    is_root::Bool, allocate_shared_float::Ff, allocate_shared_int::Fi,
+                    group_K::Int64, group_L::Int64) where {Ff,Fi}
     vec_buffer1 = allocate_shared_float(m)
     vec_buffer2 = allocate_shared_float(m)
     L_rhs_update_buffer = allocate_shared_float(m)
@@ -25,10 +26,11 @@ function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI
     if is_root
         diagonal_indices = fill(0, n_steps_max)
         first_unhandled_column_in_row = ones(Int64, n_tiles)
+        nproc = shared_comm_size * distributed_comm_size
         # The pairs of entries in `tiles_for_rank` are the (row,column) of a tile. We
         # build up a list of these Tuples for each rank, indicating the tile that that
         # rank should work on on each step.
-        tiles_for_rank = fill(-1, 2, n_steps_max, shared_comm_size * distributed_comm_size)
+        tiles_for_rank = fill(-1, 2, n_steps_max, nproc)
         next_diagonal_tile = 1
         step = 1
         rows_with_tasks = zeros(Int64, shared_comm_size, distributed_comm_size)
@@ -331,11 +333,99 @@ function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI
         # Convert because Int64 is more convenient to communicate over MPI than Bool.
         step_needs_synchronize = Int64.(step_needs_synchronize)
 
+        # Work out communication pattern for `fill_ldiv_tiles!()`.
+        nonlocal_L_tile_list = fill(-1, 3, (n_tiles * (n_tiles + 1)) ÷ 2, nproc)
+        nonlocal_L_tile_list_count = zeros(Int64, nproc)
+        nonlocal_U_tile_list = fill(-1, 3, (n_tiles * (n_tiles + 1)) ÷ 2, nproc)
+        nonlocal_U_tile_list_count = zeros(Int64, nproc)
+        ldiv_tile_send_list = fill(-1, 2, n_tiles^2, nproc)
+        ldiv_tile_send_list_count = zeros(Int64, nproc)
+        local_L_tile_list = fill(-1, 2, (n_tiles * (n_tiles + 1)) ÷ 2, nproc)
+        local_L_tile_list_count = zeros(Int64, nproc)
+        local_U_tile_list = fill(-1, 2, (n_tiles * (n_tiles + 1)) ÷ 2, nproc)
+        local_U_tile_list_count = zeros(Int64, nproc)
+        diagonal_tile_list = fill(-1, 2, n_tiles, nproc)
+        diagonal_tile_list_count = zeros(Int64, nproc)
+        tile_rows_per_block = (n_tiles + group_K - 1) ÷ group_K
+        tile_cols_per_block = (n_tiles + group_L - 1) ÷ group_L
+        tiles_per_proc = (tile_rows_per_block * tile_cols_per_block + shared_comm_size - 1) ÷ shared_comm_size
+        function get_source(tile_i, tile_j)
+            local_tile_i, source_k = divrem(tile_i - 1, group_K) .+ 1
+            local_tile_j, source_l = divrem(tile_j - 1, group_L) .+ 1
+            source_block = (source_l - 1) * group_K + source_k - 1
+            tile_ind = (local_tile_j - 1) * tile_rows_per_block + local_tile_i
+            tile_proc = (tile_ind - 1) ÷ tiles_per_proc
+            source = source_block * shared_comm_size + tile_proc
+            return source_block, source, tile_ind
+        end
+        for rank ∈ 0:nproc-1
+            block = rank ÷ shared_comm_size
+            for step ∈ 1:n_steps[]
+                tile_i, tile_j = @view tiles_for_rank[:,step,rank+1]
+                if tile_i != -1
+                    # There is a tile on this process at this step.
+                    L_source_block, L_source, L_tile_ind = get_source(tile_i, tile_j)
+                    if block == L_source_block
+                        # Locally owned.
+                        local_L_tile_list_count[rank+1] += 1
+                        local_L_tile_list[:,local_L_tile_list_count[rank+1],rank+1] .= (step, L_tile_ind)
+                    else
+                        # Non-local.
+                        nonlocal_L_tile_list_count[rank+1] += 1
+                        nonlocal_L_tile_list[:,nonlocal_L_tile_list_count[rank+1],rank+1] .= (step, L_tile_ind, L_source)
+                        ldiv_tile_send_list_count[L_source+1] += 1
+                        ldiv_tile_send_list[:,ldiv_tile_send_list_count[L_source+1],L_source+1] .= (L_tile_ind, rank)
+                    end
+
+                    U_tile_i = n_tiles - tile_i + 1
+                    U_tile_j = n_tiles - tile_j + 1
+                    U_source_block, U_source, U_tile_ind = get_source(U_tile_i, U_tile_j)
+                    if block == U_source_block
+                        # Locally owned.
+                        local_U_tile_list_count[rank+1] += 1
+                        local_U_tile_list[:,local_U_tile_list_count[rank+1],rank+1] .= (step, U_tile_ind)
+                    else
+                        # Non-local.
+                        nonlocal_U_tile_list_count[rank+1] += 1
+                        nonlocal_U_tile_list[:,nonlocal_U_tile_list_count[rank+1],rank+1] .= (step, U_tile_ind, U_source)
+                        ldiv_tile_send_list_count[U_source+1] += 1
+                        ldiv_tile_send_list[:,ldiv_tile_send_list_count[U_source+1],U_source+1] .= (U_tile_ind, rank)
+                    end
+
+                    if tile_i == tile_j
+                        # Diagonal tile.
+                        diagonal_tile_list_count[rank+1] += 1
+                        diagonal_tile_list[1,diagonal_tile_list_count[rank+1],rank+1] = step
+                    end
+                end
+            end
+            # U-solve has diagonal tiles on the same steps as the L-solve, but moves through
+            # the diagonal tiles in the opposite order.
+            @views diagonal_tile_list[2,1:diagonal_tile_list_count[rank+1],rank+1] .=
+                reverse(diagonal_tile_list[1,1:diagonal_tile_list_count[rank+1],rank+1])
+        end
+
         diagonal_indices = diagonal_indices[1:n_steps[]]
 
         MPI.Bcast!(n_steps, distributed_comm; root=0)
         MPI.Bcast!(n_steps, shared_comm; root=0)
         MPI.Bcast!(diagonal_indices, distributed_comm; root=0)
+        small_reqs = MPI.Request[]
+        for rank ∈ 1:nproc-1
+            push!(small_reqs, MPI.Isend(@view(nonlocal_L_tile_list_count[rank+1:rank+1]),
+                                        comm; dest=rank, tag=1))
+            push!(small_reqs, MPI.Isend(@view(nonlocal_U_tile_list_count[rank+1:rank+1]),
+                                        comm; dest=rank, tag=2))
+            push!(small_reqs, MPI.Isend(@view(ldiv_tile_send_list_count[rank+1:rank+1]),
+                                        comm; dest=rank, tag=3))
+            push!(small_reqs, MPI.Isend(@view(local_L_tile_list_count[rank+1:rank+1]),
+                                        comm; dest=rank, tag=4))
+            push!(small_reqs, MPI.Isend(@view(local_U_tile_list_count[rank+1:rank+1]),
+                                        comm; dest=rank, tag=5))
+            push!(small_reqs, MPI.Isend(@view(diagonal_tile_list_count[rank+1:rank+1]),
+                                        comm; dest=rank, tag=6))
+        end
+        MPI.Waitall(small_reqs)
 
         step_needs_synchronize_this_block = allocate_shared_int(n_steps[])
 
@@ -358,14 +448,64 @@ function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI
             push!(reqs, MPI.Isend(@view(step_needs_synchronize[:,block+1]),
                                   distributed_comm; dest=block, tag=shared_comm_size))
         end
+        for rank ∈ 1:nproc-1
+            if nonlocal_L_tile_list_count[rank+1] > 0
+                push!(reqs,
+                      MPI.Isend(@view(nonlocal_L_tile_list[:,1:nonlocal_L_tile_list_count[rank+1],rank+1]),
+                                comm; dest=rank, tag=shared_comm_size+1))
+            end
+            if nonlocal_U_tile_list_count[rank+1] > 0
+                push!(reqs,
+                      MPI.Isend(@view(nonlocal_U_tile_list[:,1:nonlocal_U_tile_list_count[rank+1],rank+1]),
+                                comm; dest=rank, tag=shared_comm_size+2))
+            end
+            if ldiv_tile_send_list_count[rank+1] > 0
+                push!(reqs,
+                      MPI.Isend(@view(ldiv_tile_send_list[:,1:ldiv_tile_send_list_count[rank+1],rank+1]),
+                                comm; dest=rank, tag=shared_comm_size+3))
+            end
+            if local_L_tile_list_count[rank+1] > 0
+                push!(reqs,
+                      MPI.Isend(@view(local_L_tile_list[:,1:local_L_tile_list_count[rank+1],rank+1]),
+                                comm; dest=rank, tag=shared_comm_size+4))
+            end
+            if local_U_tile_list_count[rank+1] > 0
+                push!(reqs,
+                      MPI.Isend(@view(local_U_tile_list[:,1:local_U_tile_list_count[rank+1],rank+1]),
+                                comm; dest=rank, tag=shared_comm_size+5))
+            end
+            if diagonal_tile_list_count[rank+1] > 0
+                push!(reqs,
+                      MPI.Isend(@view(diagonal_tile_list[:,1:diagonal_tile_list_count[rank+1],rank+1]),
+                                comm; dest=rank, tag=shared_comm_size+6))
+            end
+        end
         MPI.Waitall(reqs)
         my_tiles_for_rank = tiles_for_rank[:,:,1]
+        my_nonlocal_L_tile_list = nonlocal_L_tile_list[:,1:nonlocal_L_tile_list_count[1],1]
+        my_nonlocal_U_tile_list = nonlocal_U_tile_list[:,1:nonlocal_U_tile_list_count[1],1]
+        my_ldiv_tile_send_list = ldiv_tile_send_list[:,1:ldiv_tile_send_list_count[1],1]
+        my_local_L_tile_list = local_L_tile_list[:,1:local_L_tile_list_count[1],1]
+        my_local_U_tile_list = local_U_tile_list[:,1:local_U_tile_list_count[1],1]
+        my_diagonal_tile_list = diagonal_tile_list[:,1:diagonal_tile_list_count[1],1]
     elseif shared_comm_rank == 0
         n_steps = Ref(-1)
         MPI.Bcast!(n_steps, distributed_comm; root=0)
         MPI.Bcast!(n_steps, shared_comm; root=0)
         diagonal_indices = fill(0, n_steps[])
         MPI.Bcast!(diagonal_indices, distributed_comm; root=0)
+        my_nonlocal_L_tile_list_count = Ref(0)
+        MPI.Recv!(my_nonlocal_L_tile_list_count, comm; source=0, tag=1)
+        my_nonlocal_U_tile_list_count = Ref(0)
+        MPI.Recv!(my_nonlocal_U_tile_list_count, comm; source=0, tag=2)
+        my_ldiv_tile_send_list_count = Ref(0)
+        MPI.Recv!(my_ldiv_tile_send_list_count, comm; source=0, tag=3)
+        my_local_L_tile_list_count = Ref(0)
+        MPI.Recv!(my_local_L_tile_list_count, comm; source=0, tag=4)
+        my_local_U_tile_list_count = Ref(0)
+        MPI.Recv!(my_local_U_tile_list_count, comm; source=0, tag=5)
+        my_diagonal_tile_list_count = Ref(0)
+        MPI.Recv!(my_diagonal_tile_list_count, comm; source=0, tag=6)
         step_needs_synchronize_this_block = allocate_shared_int(n_steps[])
         # Receive tiles_for_rank for each process in this block, and then pass them on.
         # Use my_tiles_for_rank as a buffer to pass on these arrays.
@@ -398,13 +538,73 @@ function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI
                 first_step_for_column[column] = step
             end
         end
+        my_nonlocal_L_tile_list = fill(-1, 3, my_nonlocal_L_tile_list_count[])
+        if my_nonlocal_L_tile_list_count[] > 0
+            MPI.Recv!(my_nonlocal_L_tile_list, comm; source=0, tag=shared_comm_size+1)
+        end
+        my_nonlocal_U_tile_list = fill(-1, 3, my_nonlocal_U_tile_list_count[])
+        if my_nonlocal_U_tile_list_count[] > 0
+            MPI.Recv!(my_nonlocal_U_tile_list, comm; source=0, tag=shared_comm_size+2)
+        end
+        my_ldiv_tile_send_list = fill(-1, 2, my_ldiv_tile_send_list_count[])
+        if my_ldiv_tile_send_list_count[] > 0
+            MPI.Recv!(my_ldiv_tile_send_list, comm; source=0, tag=shared_comm_size+3)
+        end
+        my_local_L_tile_list = fill(-1, 2, my_local_L_tile_list_count[])
+        if my_local_L_tile_list_count[] > 0
+            MPI.Recv!(my_local_L_tile_list, comm; source=0, tag=shared_comm_size+4)
+        end
+        my_local_U_tile_list = fill(-1, 2, my_local_U_tile_list_count[])
+        if my_local_U_tile_list_count[] > 0
+            MPI.Recv!(my_local_U_tile_list, comm; source=0, tag=shared_comm_size+5)
+        end
+        my_diagonal_tile_list = fill(-1, 2, my_diagonal_tile_list_count[])
+        if my_diagonal_tile_list_count[] > 0
+            MPI.Recv!(my_diagonal_tile_list, comm; source=0, tag=shared_comm_size+6)
+        end
     else
         n_steps = Ref(-1)
         diagonal_indices = Int64[]
         MPI.Bcast!(n_steps, shared_comm; root=0)
+        my_nonlocal_L_tile_list_count = Ref(0)
+        MPI.Irecv!(my_nonlocal_L_tile_list_count, comm; source=0, tag=1)
+        my_nonlocal_U_tile_list_count = Ref(0)
+        MPI.Irecv!(my_nonlocal_U_tile_list_count, comm; source=0, tag=2)
+        my_ldiv_tile_send_list_count = Ref(0)
+        MPI.Irecv!(my_ldiv_tile_send_list_count, comm; source=0, tag=3)
+        my_local_L_tile_list_count = Ref(0)
+        MPI.Irecv!(my_local_L_tile_list_count, comm; source=0, tag=4)
+        my_local_U_tile_list_count = Ref(0)
+        MPI.Irecv!(my_local_U_tile_list_count, comm; source=0, tag=5)
+        my_diagonal_tile_list_count = Ref(0)
+        MPI.Irecv!(my_diagonal_tile_list_count, comm; source=0, tag=6)
         step_needs_synchronize_this_block = allocate_shared_int(n_steps[])
         my_tiles_for_rank = zeros(Int64, 2, n_steps[])
         MPI.Recv!(my_tiles_for_rank, shared_comm; source=0)
+        my_nonlocal_L_tile_list = fill(-1, 3, my_nonlocal_L_tile_list_count[])
+        if my_nonlocal_L_tile_list_count[] > 0
+            MPI.Recv!(my_nonlocal_L_tile_list, comm; source=0, tag=shared_comm_size+1)
+        end
+        my_nonlocal_U_tile_list = fill(-1, 3, my_nonlocal_U_tile_list_count[])
+        if my_nonlocal_U_tile_list_count[] > 0
+            MPI.Recv!(my_nonlocal_U_tile_list, comm; source=0, tag=shared_comm_size+2)
+        end
+        my_ldiv_tile_send_list = fill(-1, 2, my_ldiv_tile_send_list_count[])
+        if my_ldiv_tile_send_list_count[] > 0
+            MPI.Recv!(my_ldiv_tile_send_list, comm; source=0, tag=shared_comm_size+3)
+        end
+        my_local_L_tile_list = fill(-1, 2, my_local_L_tile_list_count[])
+        if my_local_L_tile_list_count[] > 0
+            MPI.Recv!(my_local_L_tile_list, comm; source=0, tag=shared_comm_size+4)
+        end
+        my_local_U_tile_list = fill(-1, 2, my_local_U_tile_list_count[])
+        if my_local_U_tile_list_count[] > 0
+            MPI.Recv!(my_local_U_tile_list, comm; source=0, tag=shared_comm_size+5)
+        end
+        my_diagonal_tile_list = fill(-1, 2, my_diagonal_tile_list_count[])
+        if my_diagonal_tile_list_count[] > 0
+            MPI.Recv!(my_diagonal_tile_list, comm; source=0, tag=shared_comm_size+6)
+        end
     end
 
     # Need to find the steps where the following step is the first one that uses the
@@ -466,7 +666,8 @@ function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI
         if itile == -1
             return 1:0
         else
-            return max(m-itile*tile_size+1,1):m-(itile-1)*tile_size
+            itile_rev = n_tiles - itile + 1
+            return (itile_rev-1)*tile_size+1:min(itile_rev*tile_size,m)
         end
     end
     my_U_tiles = fill(datatype(NaN), tile_size, tile_size, n_steps[])
@@ -487,6 +688,8 @@ function setup_ldiv(m::Int64, datatype::Type, tile_size::Int64, shared_comm::MPI
 
     return (; my_L_tiles, my_L_tile_row_ranges, my_L_tile_col_ranges, L_receive_requests,
             L_send_requests, my_U_tiles, my_U_tile_row_ranges, my_U_tile_col_ranges,
+            my_nonlocal_L_tile_list, my_nonlocal_U_tile_list, my_ldiv_tile_send_list,
+            my_local_L_tile_list, my_local_U_tile_list, my_diagonal_tile_list,
             U_receive_requests, U_send_requests, diagonal_indices, new_column_triggers,
             step_needs_synchronize_this_block, vec_buffer1, vec_buffer2,
             L_rhs_update_buffer, U_rhs_update_buffer, n_tiles)
@@ -497,29 +700,26 @@ function ldiv!(A_lu::DenseLU{T}, b::AbstractVector{T}) where T
 end
 
 function ldiv!(x::AbstractVector{T}, A_lu::DenseLU{T}, b::AbstractVector{T}) where T
-    is_root = A_lu.is_root
-    row_permutation = A_lu.row_permutation
-    b_permuted = A_lu.vec_buffer1
-    y = A_lu.vec_buffer2
-    shared_comm_rank = A_lu.shared_comm_rank
-    synchronize_shared = A_lu.synchronize_shared
+    @sc_timeit A_lu.timer "ldiv!" begin
+        is_root = A_lu.is_root
+        row_permutation = A_lu.row_permutation
+        b_permuted = A_lu.vec_buffer1
+        y = A_lu.vec_buffer2
+        shared_comm_rank = A_lu.shared_comm_rank
+        synchronize_shared = A_lu.synchronize_shared
 
-    # Permute the RHS, storing in buffer2. This accounts for 'row permutations' that were
-    # generated/used for 'pivoting' when the L and U factors were computed.
-    if is_root
-        # Could parallelise this?
-        @views b_permuted .= b[row_permutation]
-    end
+        # Permute the RHS, storing in buffer2. This accounts for 'row permutations' that were
+        # generated/used for 'pivoting' when the L and U factors were computed.
+        if is_root
+            # Could parallelise this?
+            @views b_permuted .= b[row_permutation]
+        end
 
-    L_solve!(y, A_lu, b_permuted)
-    U_solve!(x, A_lu, y)
+        L_solve!(y, A_lu, b_permuted)
+        U_solve!(x, A_lu, y)
 
-    # Clean up MPI requests. These should all have been completed already, so this should
-    # not take any time.
-    if is_root
-        MPI.Waitall(A_lu.L_receive_requests)
-        MPI.Waitall(A_lu.U_receive_requests)
-    elseif shared_comm_rank == 0
+        # Clean up MPI requests. These should all have been completed already, so this should
+        # not take any time.
         MPI.Waitall(A_lu.L_send_requests)
         MPI.Waitall(A_lu.U_send_requests)
         MPI.Waitall(A_lu.L_receive_requests)
@@ -530,120 +730,126 @@ function ldiv!(x::AbstractVector{T}, A_lu::DenseLU{T}, b::AbstractVector{T}) whe
 end
 
 function L_solve!(y, A_lu::DenseLU{T}, b) where T
-    m = A_lu.m
-    n_tiles = A_lu.n_tiles
-    tile_size = A_lu.tile_size
-    my_L_tiles = A_lu.my_L_tiles
-    my_L_tile_row_ranges = A_lu.my_L_tile_row_ranges
-    my_L_tile_col_ranges = A_lu.my_L_tile_col_ranges
-    diagonal_indices = A_lu.diagonal_indices
-    synchronize_shared = A_lu.synchronize_shared
-    L_receive_requests = A_lu.L_receive_requests
-    L_send_requests = A_lu.L_send_requests
-    new_column_triggers = A_lu.new_column_triggers
-    step_needs_synchronize_this_block = A_lu.step_needs_synchronize_this_block
-    L_rhs_update_buffer = A_lu.L_rhs_update_buffer
-    shared_comm_rank = A_lu.shared_comm_rank
-    distributed_comm = A_lu.distributed_comm
+    @sc_timeit A_lu.timer "L_solve!" begin
+        m = A_lu.m
+        n_tiles = A_lu.n_tiles
+        tile_size = A_lu.tile_size
+        my_L_tiles = A_lu.my_L_tiles
+        my_L_tile_row_ranges = A_lu.my_L_tile_row_ranges
+        my_L_tile_col_ranges = A_lu.my_L_tile_col_ranges
+        diagonal_indices = A_lu.diagonal_indices
+        synchronize_shared = A_lu.synchronize_shared
+        L_receive_requests = A_lu.L_receive_requests
+        L_send_requests = A_lu.L_send_requests
+        new_column_triggers = A_lu.new_column_triggers
+        step_needs_synchronize_this_block = A_lu.step_needs_synchronize_this_block
+        L_rhs_update_buffer = A_lu.L_rhs_update_buffer
+        shared_comm_rank = A_lu.shared_comm_rank
+        distributed_comm = A_lu.distributed_comm
 
-    if shared_comm_rank == 0
-        L_rhs_update_buffer .= 0.0
-    end
-
-    if A_lu.is_root
-        for step ∈ 1:length(my_L_tile_row_ranges)
-            diagonal_tile = diagonal_indices[step]
-            row_range = my_L_tile_row_ranges[step]
-            col_range = my_L_tile_col_ranges[step]
-            if diagonal_tile > 0
-                # Wait to ensure that contributions from all other blocks have been added
-                # to `b`.
-                MPI.Wait(L_receive_requests[diagonal_tile])
-                # Root process always wrote to b[tile_range] on the previous step, so no
-                # need to synchronize before this calculation.
-                # Still need to add this block's contributions to `b`.
-                @views @. y[col_range] = b[col_range] + L_rhs_update_buffer[col_range]
-                # Need the [1:length(row_range),1:length(col_range)] selection, even
-                # though for most tiles this is just the full range, because the last row
-                # and column may have a different size
-                @views trsv!('L', 'N', 'U',
-                             my_L_tiles[1:length(row_range),1:length(col_range),step],
-                             y[col_range])
-                if diagonal_tile < n_tiles
-                    L_send_requests[diagonal_tile] = temp_Ibcast!(@view(y[col_range]),
-                                                                  distributed_comm; root=0)
-                    # Start MPI.Ireduce!() ready for the next diagonal tile. MPI
-                    # non-blocking collective operations have to be called in the same
-                    # order on all ranks
-                    # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm),
-                    # so we cannot start this operation earlier.
-                    t = diagonal_tile+1
-                    L_receive_requests[t] =
-                        temp_Ireduce!(@view(b[(t-1)*tile_size+1:min(t*tile_size,m)]), +,
-                                      distributed_comm; root=0)
-                end
-            else
-                # Need the [1:length(row_range)] selection, even though for most tiles
-                # this is just the full range, because the last row may have a different
-                # size
-                @views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
-                             y[col_range], one(T), L_rhs_update_buffer[row_range])
-            end
-            if step_needs_synchronize_this_block[step] == 1
-                # Synchronize to avoid race conditions.
-                synchronize_shared()
-            end
+        if shared_comm_rank == 0
+            L_rhs_update_buffer .= 0.0
         end
-    else
-        for step ∈ 1:length(my_L_tile_row_ranges)
-            row_range = my_L_tile_row_ranges[step]
-            col_range = my_L_tile_col_ranges[step]
-            if !isempty(row_range)
-                # Need the [1:length(row_range)] selection, even though for most tiles
-                # this is just the full range, because the last row may have a different
-                # size
-                @views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
-                             y[col_range], one(T), L_rhs_update_buffer[row_range])
+
+        if A_lu.is_root
+            for step ∈ 1:length(my_L_tile_row_ranges)
+                diagonal_tile = diagonal_indices[step]
+                row_range = my_L_tile_row_ranges[step]
+                col_range = my_L_tile_col_ranges[step]
+                if diagonal_tile > 0
+                    # Wait to ensure that contributions from all other blocks have been added
+                    # to `b`.
+                    MPI.Wait(L_receive_requests[diagonal_tile])
+                    # Root process always wrote to b[tile_range] on the previous step, so no
+                    # need to synchronize before this calculation.
+                    # Still need to add this block's contributions to `b`.
+                    @views @. y[col_range] = b[col_range] + L_rhs_update_buffer[col_range]
+                    # Need the [1:length(row_range),1:length(col_range)] selection, even
+                    # though for most tiles this is just the full range, because the last row
+                    # and column may have a different size
+                    @views trsv!('L', 'N', 'U',
+                                 my_L_tiles[1:length(row_range),1:length(col_range),step],
+                                 y[col_range])
+                    if diagonal_tile < n_tiles
+                        L_send_requests[diagonal_tile] = temp_Ibcast!(@view(y[col_range]),
+                                                                      distributed_comm; root=0)
+                        # Start MPI.Ireduce!() ready for the next diagonal tile. MPI
+                        # non-blocking collective operations have to be called in the same
+                        # order on all ranks
+                        # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm),
+                        # so we cannot start this operation earlier.
+                        t = diagonal_tile+1
+                        L_receive_requests[t] =
+                            temp_Ireduce!(@view(b[(t-1)*tile_size+1:min(t*tile_size,m)]), +,
+                                          distributed_comm; root=0)
+                    end
+                else
+                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    #@views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                    #             y[col_range], one(T), L_rhs_update_buffer[row_range])
+                    @views gemv!('N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                                 y[col_range], one(T), L_rhs_update_buffer[row_range])
+                end
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
+                end
             end
-            if shared_comm_rank == 0
-                # `diagonal_indices[step]` is non-zero if the root process is handling a
-                # diagonal tile on this step.
-                maybe_diagonal_tile = diagonal_indices[step]
-                if maybe_diagonal_tile > 0
-                    # Data from the maybe_diagonal_tile is available, so start the
-                    # MPI.Ibcast!(). Also the maybe_diagonal_tile+1 row is guaranteed to be
-                    # completed, as only the root process will handle any tiles from that row
-                    # from this step on, so start the MPI.Ireduce!(). MPI non-blocking
-                    # collective operations have to be called in the same order on all ranks
-                    # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm), so we
-                    # have to match the order that these operations are started on the root
-                    # process.
-                    if maybe_diagonal_tile < n_tiles
-                        L_receive_requests[maybe_diagonal_tile] =
-                            temp_Ibcast!(@view(y[(maybe_diagonal_tile-1)*tile_size+1:min(maybe_diagonal_tile*tile_size, m)]),
-                                         distributed_comm; root=0)
-                        # We have sorted the tiles so that the shared_comm_rank=0 process
-                        # always handles the lowest row in the block, so if
-                        # `t` was handled on this step on this block, it was definitely
-                        # handled on this rank, so we do not need to synchronize.
-                        t = maybe_diagonal_tile + 1
-                        L_send_requests[t] =
-                            temp_Ireduce!(@view(L_rhs_update_buffer[(t-1)*tile_size+1:min(t*tile_size,m)]),
-                                          +, distributed_comm; root=0)
+        else
+            for step ∈ 1:length(my_L_tile_row_ranges)
+                row_range = my_L_tile_row_ranges[step]
+                col_range = my_L_tile_col_ranges[step]
+                if !isempty(row_range)
+                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    #@views gemm!('N', 'N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                    #             y[col_range], one(T), L_rhs_update_buffer[row_range])
+                    @views gemv!('N', -one(T), my_L_tiles[1:length(row_range),:,step],
+                                 y[col_range], one(T), L_rhs_update_buffer[row_range])
+                end
+                if shared_comm_rank == 0
+                    # `diagonal_indices[step]` is non-zero if the root process is handling a
+                    # diagonal tile on this step.
+                    maybe_diagonal_tile = diagonal_indices[step]
+                    if maybe_diagonal_tile > 0
+                        # Data from the maybe_diagonal_tile is available, so start the
+                        # MPI.Ibcast!(). Also the maybe_diagonal_tile+1 row is guaranteed to be
+                        # completed, as only the root process will handle any tiles from that row
+                        # from this step on, so start the MPI.Ireduce!(). MPI non-blocking
+                        # collective operations have to be called in the same order on all ranks
+                        # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm), so we
+                        # have to match the order that these operations are started on the root
+                        # process.
+                        if maybe_diagonal_tile < n_tiles
+                            L_receive_requests[maybe_diagonal_tile] =
+                                temp_Ibcast!(@view(y[(maybe_diagonal_tile-1)*tile_size+1:min(maybe_diagonal_tile*tile_size, m)]),
+                                             distributed_comm; root=0)
+                            # We have sorted the tiles so that the shared_comm_rank=0 process
+                            # always handles the lowest row in the block, so if
+                            # `t` was handled on this step on this block, it was definitely
+                            # handled on this rank, so we do not need to synchronize.
+                            t = maybe_diagonal_tile + 1
+                            L_send_requests[t] =
+                                temp_Ireduce!(@view(L_rhs_update_buffer[(t-1)*tile_size+1:min(t*tile_size,m)]),
+                                              +, distributed_comm; root=0)
+                        end
+                    end
+                    # Ensure data required for the next tiles processed on the block has arrived.
+                    for tile ∈ @view new_column_triggers[:,step]
+                        if tile == 0
+                            # No more to do
+                            break
+                        end
+                        MPI.Wait(L_receive_requests[tile])
                     end
                 end
-                # Ensure data required for the next tiles processed on the block has arrived.
-                for tile ∈ @view new_column_triggers[:,step]
-                    if tile == 0
-                        # No more to do
-                        break
-                    end
-                    MPI.Wait(L_receive_requests[tile])
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
                 end
-            end
-            if step_needs_synchronize_this_block[step] == 1
-                # Synchronize to avoid race conditions.
-                synchronize_shared()
             end
         end
     end
@@ -652,120 +858,129 @@ function L_solve!(y, A_lu::DenseLU{T}, b) where T
 end
 
 function U_solve!(x, A_lu::DenseLU{T}, y) where T
-    m = A_lu.m
-    n_tiles = A_lu.n_tiles
-    tile_size = A_lu.tile_size
-    my_U_tiles = A_lu.my_U_tiles
-    my_U_tile_row_ranges = A_lu.my_U_tile_row_ranges
-    my_U_tile_col_ranges = A_lu.my_U_tile_col_ranges
-    diagonal_indices = A_lu.diagonal_indices
-    synchronize_shared = A_lu.synchronize_shared
-    U_receive_requests = A_lu.U_receive_requests
-    U_send_requests = A_lu.U_send_requests
-    new_column_triggers = A_lu.new_column_triggers
-    step_needs_synchronize_this_block = A_lu.step_needs_synchronize_this_block
-    U_rhs_update_buffer = A_lu.U_rhs_update_buffer
-    shared_comm_rank = A_lu.shared_comm_rank
-    distributed_comm = A_lu.distributed_comm
+    @sc_timeit A_lu.timer "U_solve!" begin
+        m = A_lu.m
+        n_tiles = A_lu.n_tiles
+        tile_size = A_lu.tile_size
+        my_U_tiles = A_lu.my_U_tiles
+        my_U_tile_row_ranges = A_lu.my_U_tile_row_ranges
+        my_U_tile_col_ranges = A_lu.my_U_tile_col_ranges
+        diagonal_indices = A_lu.diagonal_indices
+        synchronize_shared = A_lu.synchronize_shared
+        U_receive_requests = A_lu.U_receive_requests
+        U_send_requests = A_lu.U_send_requests
+        new_column_triggers = A_lu.new_column_triggers
+        step_needs_synchronize_this_block = A_lu.step_needs_synchronize_this_block
+        U_rhs_update_buffer = A_lu.U_rhs_update_buffer
+        shared_comm_rank = A_lu.shared_comm_rank
+        distributed_comm = A_lu.distributed_comm
 
-    if shared_comm_rank == 0
-        U_rhs_update_buffer .= 0.0
-    end
-
-    if A_lu.is_root
-        for step ∈ 1:length(my_U_tile_row_ranges)
-            diagonal_tile = diagonal_indices[step]
-            row_range = my_U_tile_row_ranges[step]
-            col_range = my_U_tile_col_ranges[step]
-            if diagonal_tile > 0
-                # Wait to ensure that contributions from all other blocks have been added
-                # to `y`.
-                MPI.Wait(U_receive_requests[diagonal_tile])
-                # Root process always wrote to b[tile_range] on the previous step, so no
-                # need to synchronize before this calculation.
-                # Still need to add this block's contributions to `y`.
-                @views @. x[col_range] = y[col_range] + U_rhs_update_buffer[col_range]
-                # Need the [1:length(row_range),1:length(col_range)] selection, even
-                # though for most tiles this is just the full range, because the last row
-                # and column may have a different size
-                @views trsv!('U', 'N', 'N',
-                             my_U_tiles[1:length(row_range),1:length(col_range),step],
-                             x[col_range])
-                U_send_requests[diagonal_tile] = temp_Ibcast!(@view(x[col_range]),
-                                                              distributed_comm; root=0)
-                if diagonal_tile < n_tiles
-                    # Start MPI.Ireduce!() ready for the next diagonal tile. MPI
-                    # non-blocking collective operations have to be called in the same
-                    # order on all ranks
-                    # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm),
-                    # so we cannot start this operation earlier.
-                    t = diagonal_tile+1
-                    U_receive_requests[t] =
-                        temp_Ireduce!(@view(y[max(m-t*tile_size+1,1):m-(t-1)*tile_size]),
-                                      +, distributed_comm; root=0)
-                end
-            else
-                # Need the [1:length(row_range)] selection, even though for most tiles
-                # this is just the full range, because the last row may have a different
-                # size
-                @views gemm!('N', 'N', -one(T), my_U_tiles[1:length(row_range),:,step],
-                             x[col_range], one(T), U_rhs_update_buffer[row_range])
-            end
-            if step_needs_synchronize_this_block[step] == 1
-                # Synchronize to avoid race conditions.
-                synchronize_shared()
-            end
+        if shared_comm_rank == 0
+            U_rhs_update_buffer .= 0.0
         end
-    else
-        for step ∈ 1:length(my_U_tile_row_ranges)
-            row_range = my_U_tile_row_ranges[step]
-            col_range = my_U_tile_col_ranges[step]
-            if !isempty(row_range)
-                # Need the [1:length(row_range)] selection, even though for most tiles
-                # this is just the full range, because the last row may have a different
-                # size
-                @views gemm!('N', 'N', -one(T), my_U_tiles[1:length(row_range),:,step],
-                             x[col_range], one(T), U_rhs_update_buffer[row_range])
-            end
-            # Get data required for the next tiles processed on the block.
-            if shared_comm_rank == 0
-                # `diagonal_indices[step]` is non-zero if the root process is handling a
-                # diagonal tile on this step.
-                maybe_diagonal_tile = diagonal_indices[step]
-                if maybe_diagonal_tile > 0
-                    # Data from the maybe_diagonal_tile is available, so start the
-                    # MPI.Ibcast!(). Also the maybe_diagonal_tile+1 row is guaranteed to be
-                    # completed, as only the root process will handle any tiles from that row
-                    # from this step on, so start the MPI.Ireduce!(). MPI non-blocking
-                    # collective operations have to be called in the same order on all ranks
-                    # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm), so we
-                    # have to match the order that these operations are started on the root
-                    # process.
-                    U_receive_requests[maybe_diagonal_tile] =
-                        temp_Ibcast!(@view(x[max(m-maybe_diagonal_tile*tile_size+1,1):m-(maybe_diagonal_tile-1)*tile_size]),
-                                     distributed_comm; root=0)
-                    if maybe_diagonal_tile < n_tiles
-                        # We have sorted the tiles so that the shared_comm_rank=0 process
-                        # always handles the lowest row in the block, so if
-                        # `t` was handled on this step on this block, it was definitely
-                        # handled on this rank, so we do not need to synchronize.
-                        t = maybe_diagonal_tile + 1
-                        U_send_requests[t] =
-                            temp_Ireduce!(@view(U_rhs_update_buffer[max(m-t*tile_size+1,1):m-(t-1)*tile_size]),
+
+        if A_lu.is_root
+            for step ∈ 1:length(my_U_tile_row_ranges)
+                diagonal_tile = diagonal_indices[step]
+                row_range = my_U_tile_row_ranges[step]
+                col_range = my_U_tile_col_ranges[step]
+                if diagonal_tile > 0
+                    # Wait to ensure that contributions from all other blocks have been added
+                    # to `y`.
+                    MPI.Wait(U_receive_requests[diagonal_tile])
+                    # Root process always wrote to b[tile_range] on the previous step, so no
+                    # need to synchronize before this calculation.
+                    # Still need to add this block's contributions to `y`.
+                    @views @. x[col_range] = y[col_range] + U_rhs_update_buffer[col_range]
+                    # Need the [1:length(row_range),1:length(col_range)] selection, even
+                    # though for most tiles this is just the full range, because the last row
+                    # and column may have a different size
+                    @views trsv!('U', 'N', 'N',
+                                 my_U_tiles[1:length(row_range),1:length(col_range),step],
+                                 x[col_range])
+                    U_send_requests[diagonal_tile] = temp_Ibcast!(@view(x[col_range]),
+                                                                  distributed_comm; root=0)
+                    if diagonal_tile < n_tiles
+                        # Start MPI.Ireduce!() ready for the next diagonal tile. MPI
+                        # non-blocking collective operations have to be called in the same
+                        # order on all ranks
+                        # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm),
+                        # so we cannot start this operation earlier.
+                        t = diagonal_tile+1
+                        itile_rev = n_tiles - t + 1
+                        U_receive_requests[t] =
+                            temp_Ireduce!(@view(y[(itile_rev-1)*tile_size+1:min(itile_rev*tile_size,m)]),
                                           +, distributed_comm; root=0)
                     end
+                else
+                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    #@views gemm!('N', 'N', -one(T), my_U_tiles[:,1:length(col_range),step],
+                    #             x[col_range], one(T), U_rhs_update_buffer[row_range])
+                    @views gemv!('N', -one(T), my_U_tiles[:,1:length(col_range),step],
+                                 x[col_range], one(T), U_rhs_update_buffer[row_range])
                 end
-                for tile ∈ @view new_column_triggers[:,step]
-                    if tile == 0
-                        # No more to do
-                        break
-                    end
-                    MPI.Wait(U_receive_requests[tile])
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
                 end
             end
-            if step_needs_synchronize_this_block[step] == 1
-                # Synchronize to avoid race conditions.
-                synchronize_shared()
+        else
+            for step ∈ 1:length(my_U_tile_row_ranges)
+                row_range = my_U_tile_row_ranges[step]
+                col_range = my_U_tile_col_ranges[step]
+                if !isempty(row_range)
+                    # Need the [1:length(row_range)] selection, even though for most tiles
+                    # this is just the full range, because the last row may have a different
+                    # size
+                    #@views gemm!('N', 'N', -one(T), my_U_tiles[:,1:length(col_range),step],
+                    #             x[col_range], one(T), U_rhs_update_buffer[row_range])
+                    @views gemv!('N', -one(T), my_U_tiles[:,1:length(col_range),step],
+                                 x[col_range], one(T), U_rhs_update_buffer[row_range])
+                end
+                # Get data required for the next tiles processed on the block.
+                if shared_comm_rank == 0
+                    # `diagonal_indices[step]` is non-zero if the root process is handling a
+                    # diagonal tile on this step.
+                    maybe_diagonal_tile = diagonal_indices[step]
+                    if maybe_diagonal_tile > 0
+                        # Data from the maybe_diagonal_tile is available, so start the
+                        # MPI.Ibcast!(). Also the maybe_diagonal_tile+1 row is guaranteed to be
+                        # completed, as only the root process will handle any tiles from that row
+                        # from this step on, so start the MPI.Ireduce!(). MPI non-blocking
+                        # collective operations have to be called in the same order on all ranks
+                        # (https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report/node126.htm), so we
+                        # have to match the order that these operations are started on the root
+                        # process.
+                        itile_rev = n_tiles - maybe_diagonal_tile + 1
+                        U_receive_requests[maybe_diagonal_tile] =
+                            temp_Ibcast!(@view(x[(itile_rev-1)*tile_size+1:min(itile_rev*tile_size,m)]),
+                                         distributed_comm; root=0)
+                        if maybe_diagonal_tile < n_tiles
+                            # We have sorted the tiles so that the shared_comm_rank=0 process
+                            # always handles the lowest row in the block, so if
+                            # `t` was handled on this step on this block, it was definitely
+                            # handled on this rank, so we do not need to synchronize.
+                            t = maybe_diagonal_tile + 1
+                            itile_rev = n_tiles - t + 1
+                            U_send_requests[t] =
+                                temp_Ireduce!(@view(U_rhs_update_buffer[(itile_rev-1)*tile_size+1:min(itile_rev*tile_size,m)]),
+                                              +, distributed_comm; root=0)
+                        end
+                    end
+                    for tile ∈ @view new_column_triggers[:,step]
+                        if tile == 0
+                            # No more to do
+                            break
+                        end
+                        MPI.Wait(U_receive_requests[tile])
+                    end
+                end
+                if step_needs_synchronize_this_block[step] == 1
+                    # Synchronize to avoid race conditions.
+                    synchronize_shared()
+                end
             end
         end
     end
