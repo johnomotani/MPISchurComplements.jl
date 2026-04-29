@@ -390,7 +390,8 @@ vector'.
 `skip_factorization=true` can be passed to create an MPISchurComplement instance without
 calculating the factorization corresponding to the input matrices. `ldiv!()` called with
 this instance will give incorrect results unless `update_schur_complement!()` is called
-first.
+first. In this case, `B`, `C`, and `D` can be passed `nothing` or an element type instead
+of matrices as the matrix values will not be used.
 
 `check_lu=false` can be passed to disable checks when performing dense LU factorizations.
 This may increase the speed of the factorization, but leaves it up to the user to
@@ -399,8 +400,9 @@ guarantee correctness of the input matrices.
 A `TimerOutput` instance can be passed to `timer` to record timings of various
 subroutines.
 """
-function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMatrix,
-                              D::AbstractMatrix,
+function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,Type},
+                              C::Union{AbstractMatrix,Nothing,Type},
+                              D::Union{AbstractMatrix,Nothing,Type},
                               owned_top_vector_entries::Union{UnitRange{Int64},Vector{Int64}},
                               owned_bottom_vector_entries::Union{UnitRange{Int64},Vector{Int64}};
                               B_global_column_range::Union{UnitRange{Int64},Vector{Int64},Nothing}=nothing,
@@ -418,7 +420,21 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                               check_lu::Bool=true,
                               timer::Union{TimerOutput,Nothing}=nothing)
 
-    data_type = eltype(D)
+    if !skip_factorization
+        if !(isa(B, AbstractMatrix) && isa(C, AbstractMatrix) && isa(D, AbstractMatrix))
+            error("When `skip_factorization=false`, matrices must be passed for `B`, "
+                  * "`C`, and `D`.")
+        end
+        data_type = eltype(D)
+    elseif isa(D, type)
+        data_type = D
+    elseif isa(B, type)
+        data_type = B
+    elseif isa(C, type)
+        data_type = C
+    else
+        data_type = Float64
+    end
 
     # Simpler to only support one type (`Vector{Int64}`) for ranges, so convert
     # UnitRange inputs to Vector.
@@ -679,12 +695,12 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
 
     @boundscheck size(A_factorization, 1) == top_vec_global_size || error(BoundsError, " Rows in A_factorization do not match size of 'top vector'.")
     @boundscheck size(A_factorization, 2) == top_vec_global_size || error(BoundsError, " Columns in A_factorization do not match size of 'top vector'.")
-    @boundscheck size(B, 1) == top_vec_local_size || error(BoundsError, " Rows in B do not match locally-owned 'top vector' entries.")
-    @boundscheck size(B, 2) == length(B_local_column_range) + size(B_local_column_repeats, 2) || error(BoundsError, " Columns in B do not match index ranges.")
-    @boundscheck size(C, 1) == length(C_local_row_range) + size(C_local_row_repeats, 2) || error(BoundsError, " Rows in C do not match index ranges.")
-    @boundscheck size(C, 2) == top_vec_local_size || error(BoundsError, " Columns in C do not match locally-owned 'top vector' entries.")
-    @boundscheck size(D, 1) == bottom_vec_local_size || error(BoundsError, " Rows in D do not match locally-owned 'bottom vector' entries.")
-    @boundscheck size(D, 2) == length(D_local_column_range) + size(D_local_column_repeats, 2) || error(BoundsError, " Columns in D do not match index ranges.")
+    @boundscheck !isa(B, AbstractMatrix) || size(B, 1) == top_vec_local_size || error(BoundsError, " Rows in B do not match locally-owned 'top vector' entries.")
+    @boundscheck !isa(B, AbstractMatrix) || size(B, 2) == length(B_local_column_range) + size(B_local_column_repeats, 2) || error(BoundsError, " Columns in B do not match index ranges.")
+    @boundscheck !isa(C, AbstractMatrix) || size(C, 1) == length(C_local_row_range) + size(C_local_row_repeats, 2) || error(BoundsError, " Rows in C do not match index ranges.")
+    @boundscheck !isa(C, AbstractMatrix) || size(C, 2) == top_vec_local_size || error(BoundsError, " Columns in C do not match locally-owned 'top vector' entries.")
+    @boundscheck !isa(D, AbstractMatrix) || size(D, 1) == bottom_vec_local_size || error(BoundsError, " Rows in D do not match locally-owned 'bottom vector' entries.")
+    @boundscheck !isa(D, AbstractMatrix) || size(D, 2) == length(D_local_column_range) + size(D_local_column_repeats, 2) || error(BoundsError, " Columns in D do not match index ranges.")
 
     if shared_comm != MPI.COMM_SELF && (allocate_shared_float === nothing
                                         || allocate_shared_int === nothing)
