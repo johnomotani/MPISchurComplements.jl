@@ -410,11 +410,11 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                   * "`C`, and `D`.")
         end
         data_type = eltype(D)
-    elseif isa(D, type)
+    elseif isa(D, Type)
         data_type = D
-    elseif isa(B, type)
+    elseif isa(B, Type)
         data_type = B
-    elseif isa(C, type)
+    elseif isa(C, Type)
         data_type = C
     else
         data_type = Float64
