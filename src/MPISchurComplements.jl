@@ -677,8 +677,6 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
             separate_repeated_indices(D_global_column_range)
     end
 
-    @boundscheck size(A_factorization, 1) == top_vec_global_size || error(BoundsError, " Rows in A_factorization do not match size of 'top vector'.")
-    @boundscheck size(A_factorization, 2) == top_vec_global_size || error(BoundsError, " Columns in A_factorization do not match size of 'top vector'.")
     @boundscheck !isa(B, AbstractMatrix) || size(B, 1) == top_vec_local_size || error(BoundsError, " Rows in B do not match locally-owned 'top vector' entries.")
     @boundscheck !isa(B, AbstractMatrix) || size(B, 2) == length(B_local_column_range) + size(B_local_column_repeats, 2) || error(BoundsError, " Columns in B do not match index ranges.")
     @boundscheck !isa(C, AbstractMatrix) || size(C, 1) == length(C_local_row_range) + size(C_local_row_repeats, 2) || error(BoundsError, " Rows in C do not match index ranges.")
@@ -940,7 +938,6 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
                                   C::AbstractMatrix, D::AbstractMatrix)
     timer = sc.timer
     @sc_timeit timer "update_schur_complement" begin
-        @boundscheck A === missing || length(sc.owned_top_vector_entries) == size(A, 1) || error(BoundsError, " Number of rows in A does not match number of locally owned top_vector_entries")
         @boundscheck size(sc.Ainv_dot_B, 1) == size(B, 1) || error(BoundsError, " Number of rows in B does not match number of rows in original Ainv_dot_B")
         @boundscheck length(sc.B_local_column_range) + size(sc.B_local_column_repeats, 2) == size(B, 2) || error(BoundsError, " Number of columns in B does not match number of columns in original B")
         # Don't check size(C, 1) because we don't store the full row range. There will be an
