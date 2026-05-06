@@ -23,7 +23,8 @@ macro sc_timeit(timer, name, expr)
 end
 
 
-struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,Tbv,Tgy,
+struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,TC<:AbstractMatrix{Tf},
+                          TSC<:AbstractMatrix{Tf},TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,Tbv,Tgy,
                           TBob,Trangeno,Tsync,Ttimer}
     A_factorization::TA
     Ainv_dot_B::TAiB
