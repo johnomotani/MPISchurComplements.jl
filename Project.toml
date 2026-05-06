@@ -1,6 +1,6 @@
 name = "MPISchurComplements"
 uuid = "586db363-8230-43f3-b4b3-2c5432ab38c6"
-version = "0.1.0"
+version = "1.0.0"
 authors = ["John Omotani <john.omotani@ukaea.uk>"]
 
 [deps]
