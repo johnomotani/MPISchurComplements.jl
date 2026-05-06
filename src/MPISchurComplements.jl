@@ -25,7 +25,7 @@ end
 
 struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,TC<:AbstractMatrix{Tf},
                           TSC<:AbstractMatrix{Tf},TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,Tbv,Tgy,
-                          TBob,Trangeno,Tsync,Ttimer}
+                          TBob,Trangeno,Tsync,Ttimer} <: Factorization{Tf}
     A_factorization::TA
     Ainv_dot_B::TAiB
     Ainv_dot_B_local::TAiBl
