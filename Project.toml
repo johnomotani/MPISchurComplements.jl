@@ -21,6 +21,7 @@ Primes = "0.5.7"
 SparseArrays = "1.11.0"
 StableRNGs = "1"
 TimerOutputs = "0.5.29"
+julia = "1.12"
 
 [extras]
 Combinatorics = "861a8166-3701-5b0c-9a16-15d98fcdc6aa"
