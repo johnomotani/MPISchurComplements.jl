@@ -25,6 +25,7 @@ export MPISchurComplement, mpi_schur_complement, update_schur_complement!, ldiv!
 using LinearAlgebra
 import LinearAlgebra: ldiv!
 using MPI
+using MPIDenseLUs
 using SparseArrays
 using TimerOutputs
 
@@ -40,8 +41,6 @@ macro sc_timeit(timer, name, expr)
     end
 end
 
-include("DenseLUs/DenseLUs.jl")
-using .DenseLUs
 
 struct MPISchurComplement{TA,TAiB,TAiBl,TB,TC,TSC,TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,Tbv,Tgy,
                           TBob,Trangeno,Tsync,Ttimer}
@@ -346,7 +345,7 @@ together the matrices passed on each distributed-MPI rank gives the full, global
 overlap can be passed on any distributed rank, as long as the contributions from each
 distributed rank add up to the full value).
 
-`comm` is the MPI communicator containing all processes to be used by DenseLU.
+`comm` is the MPI communicator containing all processes to be used by MPIDenseLU.
 
 `shared_comm` is the MPI communicator to use for shared-memory communications.
 
@@ -377,20 +376,22 @@ done (requires `use_sparse=true`). There is no saving in setup time because `Ain
 still has to be calculated, to be multiplied by `C` when calculating `schur_complement`.
 There is also no memory saving as a dense B-sized buffer array is needed.
 
-By default, when `shared_comm` is passed the DenseLUs module provided as part of
-MPISchurComplements.jl is used to factorize/solve the Schur complement matrix (which is
-dense) using a shared-memory parallel implementation (at present only the solve
-(`ldiv!()`) phase is parallelised, not the factorization (`lu!`)) and when `shared_comm`
-is not passed the serial implementation from LinearAlgebra (which uses LAPACK/BLAS) is
-used.  `parallel_schur` can be passed to force use of the serial (`false`) or parallel
-DenseLUs (`true`) implementations. When using DenseLUs, `schur_tile_size` can be used to
-set the `tile_size` argument to `dense_lu()`; the default is to use the smaller of 256 and
-the largest 2^n smaller than half of the size of the global 'bottom vector'.
+By default, when `distributed_comm` and/or`shared_comm` are passed the MPIDenseLUs package
+is used to factorize/solve the Schur complement matrix (which is dense) using a hybrid
+distributed+shared-memory MPI parallel implementation (both factorization `lu!()` and
+solve `ldiv!()` phases are parallelised) and when neither communicator is is passed the
+serial implementation from LinearAlgebra (which uses LAPACK/BLAS) is used.
+`parallel_schur` can be passed to force use of the serial (`false`) or parallel
+MPIDenseLUs (`true`) implementations. When using MPIDenseLUs, `schur_tile_size` can be
+used to set the `tile_size` argument to `mpi_dense_lu()`; the default is to use the
+smaller of 128 and the largest 2^n smaller than half of the size of the global 'bottom
+vector'.
 
 `skip_factorization=true` can be passed to create an MPISchurComplement instance without
 calculating the factorization corresponding to the input matrices. `ldiv!()` called with
 this instance will give incorrect results unless `update_schur_complement!()` is called
-first.
+first. In this case, `B`, `C`, and `D` can be passed `nothing` or an element type instead
+of matrices as the matrix values will not be used.
 
 `check_lu=false` can be passed to disable checks when performing dense LU factorizations.
 This may increase the speed of the factorization, but leaves it up to the user to
@@ -399,8 +400,9 @@ guarantee correctness of the input matrices.
 A `TimerOutput` instance can be passed to `timer` to record timings of various
 subroutines.
 """
-function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMatrix,
-                              D::AbstractMatrix,
+function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,Type},
+                              C::Union{AbstractMatrix,Nothing,Type},
+                              D::Union{AbstractMatrix,Nothing,Type},
                               owned_top_vector_entries::Union{UnitRange{Int64},Vector{Int64}},
                               owned_bottom_vector_entries::Union{UnitRange{Int64},Vector{Int64}};
                               B_global_column_range::Union{UnitRange{Int64},Vector{Int64},Nothing}=nothing,
@@ -413,12 +415,26 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
                               allocate_shared_int::Union{Function,Nothing}=nothing,
                               synchronize_shared::Union{Function,Nothing}=nothing,
                               use_sparse=true, separate_Ainv_B=false,
-                              parallel_schur=shared_comm!==nothing,
+                              parallel_schur=(distributed_comm!==nothing || shared_comm!==nothing),
                               schur_tile_size=nothing, skip_factorization=false,
                               check_lu::Bool=true,
                               timer::Union{TimerOutput,Nothing}=nothing)
 
-    data_type = eltype(D)
+    if !skip_factorization
+        if !(isa(B, AbstractMatrix) && isa(C, AbstractMatrix) && isa(D, AbstractMatrix))
+            error("When `skip_factorization=false`, matrices must be passed for `B`, "
+                  * "`C`, and `D`.")
+        end
+        data_type = eltype(D)
+    elseif isa(D, type)
+        data_type = D
+    elseif isa(B, type)
+        data_type = B
+    elseif isa(C, type)
+        data_type = C
+    else
+        data_type = Float64
+    end
 
     # Simpler to only support one type (`Vector{Int64}`) for ranges, so convert
     # UnitRange inputs to Vector.
@@ -679,12 +695,12 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
 
     @boundscheck size(A_factorization, 1) == top_vec_global_size || error(BoundsError, " Rows in A_factorization do not match size of 'top vector'.")
     @boundscheck size(A_factorization, 2) == top_vec_global_size || error(BoundsError, " Columns in A_factorization do not match size of 'top vector'.")
-    @boundscheck size(B, 1) == top_vec_local_size || error(BoundsError, " Rows in B do not match locally-owned 'top vector' entries.")
-    @boundscheck size(B, 2) == length(B_local_column_range) + size(B_local_column_repeats, 2) || error(BoundsError, " Columns in B do not match index ranges.")
-    @boundscheck size(C, 1) == length(C_local_row_range) + size(C_local_row_repeats, 2) || error(BoundsError, " Rows in C do not match index ranges.")
-    @boundscheck size(C, 2) == top_vec_local_size || error(BoundsError, " Columns in C do not match locally-owned 'top vector' entries.")
-    @boundscheck size(D, 1) == bottom_vec_local_size || error(BoundsError, " Rows in D do not match locally-owned 'bottom vector' entries.")
-    @boundscheck size(D, 2) == length(D_local_column_range) + size(D_local_column_repeats, 2) || error(BoundsError, " Columns in D do not match index ranges.")
+    @boundscheck !isa(B, AbstractMatrix) || size(B, 1) == top_vec_local_size || error(BoundsError, " Rows in B do not match locally-owned 'top vector' entries.")
+    @boundscheck !isa(B, AbstractMatrix) || size(B, 2) == length(B_local_column_range) + size(B_local_column_repeats, 2) || error(BoundsError, " Columns in B do not match index ranges.")
+    @boundscheck !isa(C, AbstractMatrix) || size(C, 1) == length(C_local_row_range) + size(C_local_row_repeats, 2) || error(BoundsError, " Rows in C do not match index ranges.")
+    @boundscheck !isa(C, AbstractMatrix) || size(C, 2) == top_vec_local_size || error(BoundsError, " Columns in C do not match locally-owned 'top vector' entries.")
+    @boundscheck !isa(D, AbstractMatrix) || size(D, 1) == bottom_vec_local_size || error(BoundsError, " Rows in D do not match locally-owned 'bottom vector' entries.")
+    @boundscheck !isa(D, AbstractMatrix) || size(D, 2) == length(D_local_column_range) + size(D_local_column_repeats, 2) || error(BoundsError, " Columns in D do not match index ranges.")
 
     if shared_comm != MPI.COMM_SELF && (allocate_shared_float === nothing
                                         || allocate_shared_int === nothing)
@@ -855,13 +871,13 @@ function mpi_schur_complement(A_factorization, B::AbstractMatrix, C::AbstractMat
     if parallel_schur
         if schur_tile_size === nothing
             power_of_2 = floor(Int64, log2(bottom_vec_global_size / 2))
-            schur_tile_size = min(256, 2^power_of_2)
+            schur_tile_size = min(128, 2^power_of_2)
         end
         schur_complement_factorization =
-            dense_lu(schur_complement, schur_tile_size, comm, shared_comm,
-                     distributed_comm, allocate_shared_float, allocate_shared_int;
-                     synchronize_shared=synchronize_shared, skip_factorization=true,
-                     check_lu=check_lu, timer=timer)
+            mpi_dense_lu(schur_complement, schur_tile_size, comm, shared_comm,
+                         distributed_comm, allocate_shared_float, allocate_shared_int;
+                         synchronize_shared=synchronize_shared, skip_factorization=true,
+                         check_lu=check_lu, timer=timer)
     else
         if shared_rank == 0 && distributed_rank == 0
             schur_complement_factorization =
@@ -1148,7 +1164,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             # `sc.schur_complement_factorization`) could be parallelised with shared memory and/or
             # distributed MPI, but we expect this step not to be a bottleneck, so it is done in
             # serial (at least for now).
-            if isa(sc.schur_complement_factorization, DenseLU)
+            if isa(sc.schur_complement_factorization, MPIDenseLU)
                 synchronize_shared()
                 lu!(sc.schur_complement_factorization, schur_complement)
             elseif shared_rank == 0 && distributed_rank == 0
