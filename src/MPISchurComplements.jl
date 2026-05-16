@@ -1164,10 +1164,11 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
                 synchronize_shared()
                 lu!(sc.schur_complement_factorization, schur_complement)
             elseif shared_rank == 0 && distributed_rank == 0
-                new_lu = lu!(schur_complement; check=check_lu)
                 schur_complement_factorization = sc.schur_complement_factorization
-                schur_complement_factorization.factors .= new_lu.factors
-                schur_complement_factorization.ipiv .= new_lu.ipiv
+                factors = schur_complement_factorization.factors
+                factors .= schur_complement
+                ipiv = schur_complement_factorization.ipiv
+                LAPACK.getrf!(factors, ipiv; check=check_lu)
             end
         end
     end
