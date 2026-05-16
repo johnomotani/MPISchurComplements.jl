@@ -24,8 +24,8 @@ end
 
 
 struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,TC<:AbstractMatrix{Tf},
-                          TSC<:AbstractMatrix{Tf},TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,Tbv,Tgy,
-                          TBob,Trangeno,Tsync,Ttimer} <: Factorization{Tf}
+                          TSC<:AbstractMatrix{Tf},TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,Tltv,
+                          Tbv,Tgy,TBob,Trangeno,Tsync,Ttimer} <: Factorization{Tf}
     A_factorization::TA
     Ainv_dot_B::TAiB
     Ainv_dot_B_local::TAiBl
@@ -54,6 +54,7 @@ struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,TC<:AbstractMatrix{
     C_dot_Ainv_dot_u::TCAiu
     Ainv_dot_B_dot_y::TAiBy
     top_vec_buffer::Ttv
+    local_top_vec_buffer::Tltv
     top_vec_local_size::Int64
     bottom_vec_buffer::Tbv
     bottom_vec_local_size::Int64
@@ -83,6 +84,7 @@ struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,TC<:AbstractMatrix{
     shared_rank::Int64
     distributed_comm::MPI.Comm
     distributed_rank::Int64
+    distributed_nproc::Int64
     synchronize_shared::Tsync
     use_sparse::Bool
     separate_Ainv_B::Bool
@@ -262,6 +264,7 @@ end
                          allocate_shared_int::Union{Function,Nothing}=nothing,
                          synchronize_shared::Union{Function,Nothing}=nothing,
                          use_sparse::Bool=true, separate_Ainv_B::Bool=false,
+                         sparse_Ainv_B::Bool=false,
                          parallel_schur::Union{Bool,Factorization}=(distributed_comm!==nothing || shared_comm!==nothing),
                          schur_complement_buffer::Union{AbstractMatrix,Nothing}=nothing,
                          schur_tile_size::Union{Integer,Nothing}=nothing,
@@ -361,6 +364,9 @@ done (requires `use_sparse=true`). There is no saving in setup time because `Ain
 still has to be calculated, to be multiplied by `C` when calculating `schur_complement`.
 There is also no memory saving as a dense B-sized buffer array is needed.
 
+When `separate_Ainv_B=false`, `sparse_Ainv_B=true` can be passed to use sparse matrix
+storage for `Ainv_dot_B`.
+
 By default, when `distributed_comm` and/or`shared_comm` are passed the MPIDenseLUs package
 is used to factorize/solve the Schur complement matrix (which is dense) using a hybrid
 distributed+shared-memory MPI parallel implementation (both factorization `lu!()` and
@@ -405,6 +411,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                               allocate_shared_int::Union{Function,Nothing}=nothing,
                               synchronize_shared::Union{Function,Nothing}=nothing,
                               use_sparse::Bool=true, separate_Ainv_B::Bool=false,
+                              sparse_Ainv_B::Bool=false,
                               parallel_schur::Union{Bool,Factorization}=(distributed_comm!==nothing || shared_comm!==nothing),
                               schur_complement_buffer::Union{AbstractMatrix,Nothing}=nothing,
                               schur_tile_size::Union{Integer,Nothing}=nothing,
@@ -827,6 +834,13 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         Ainv_dot_B_local = nothing
         B_local = sparse(zeros(data_type, length(local_top_vector_unique_entries_partial),
                                bottom_vec_global_size))
+    elseif sparse_Ainv_B
+        # Store the chunk of Ainv_dot_B needed by this shared-memory process as a sparse
+        # array.
+        Ainv_dot_B_local = sparse(zeros(data_type,
+                                        length(local_top_vector_unique_entries_partial),
+                                        bottom_vec_global_size))
+        B_local = nothing
     else
         # Store the chunk of Ainv_dot_B needed by this shared-memory process as a contiguous
         # array.
@@ -853,6 +867,11 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         schur_complement = schur_complement_buffer
     end
     top_vec_buffer = allocate_shared_float(top_vec_local_size)
+    if sparse_Ainv_B
+        local_top_vec_buffer = Vector{data_type}(undef, length(local_top_vector_unique_entries_partial))
+    else
+        local_top_vec_buffer = nothing
+    end
     bottom_vec_buffer = allocate_shared_float(bottom_vec_global_size)
     global_y = allocate_shared_float(bottom_vec_global_size)
 
@@ -905,9 +924,10 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                                           schur_complement_local_range_partial,
                                           Ainv_dot_u, C_dot_Ainv_dot_B, C_dot_Ainv_dot_u,
                                           Ainv_dot_B_dot_y, top_vec_buffer,
-                                          top_vec_local_size, bottom_vec_buffer,
-                                          bottom_vec_local_size, global_y,
-                                          top_vec_global_size, bottom_vec_global_size,
+                                          local_top_vec_buffer, top_vec_local_size,
+                                          bottom_vec_buffer, bottom_vec_local_size,
+                                          global_y, top_vec_global_size,
+                                          bottom_vec_global_size,
                                           owned_top_vector_entries,
                                           local_top_vector_range_partial,
                                           local_top_vector_unique_entries_partial,
@@ -926,8 +946,9 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                                           local_bottom_vector_repeats_partial,
                                           comm, shared_comm, shared_rank,
                                           distributed_comm, distributed_rank,
-                                          synchronize_shared, use_sparse, separate_Ainv_B,
-                                          parallel_schur, check_lu, timer)
+                                          distributed_nproc, synchronize_shared,
+                                          use_sparse, separate_Ainv_B, parallel_schur,
+                                          check_lu, timer)
 
     if !skip_factorization
         update_schur_complement!(sc_factorization, missing, B, C, D)
@@ -1122,11 +1143,16 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             # Read out the local entries of `Ainv_dot_B` here, rather than just after `Ainv_dot_B`
             # is calculated, in order to avoid adding another `synchronize_shared()` call.
             if !separate_Ainv_B
-                # Note that we need to transpose Ainv_dot_B_local for the slightly hacked
-                # matrix-vector multiply implementation used in `ldiv!()` to ensure
-                # consistency of results.
-                for i ∈ 1:size(Ainv_dot_B_local, 1), (j1, j2) ∈ enumerate(local_top_vector_unique_entries_partial)
-                    Ainv_dot_B_local[i,j1] = Ainv_dot_B[j2,i]
+                if isa(Ainv_dot_B_local, SparseMatrixCSC)
+                    update_sparse_matrix!(Ainv_dot_B_local,
+                                          sparse(@view(Ainv_dot_B[local_top_vector_unique_entries_partial,:])))
+                else
+                    # Note that we need to transpose Ainv_dot_B_local for the slightly
+                    # hacked matrix-vector multiply implementation used in `ldiv!()` to
+                    # ensure consistency of results.
+                    for i ∈ 1:size(Ainv_dot_B_local, 1), (j1, j2) ∈ enumerate(local_top_vector_unique_entries_partial)
+                        Ainv_dot_B_local[i,j1] = Ainv_dot_B[j2,i]
+                    end
                 end
             end
 
@@ -1235,6 +1261,7 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
     @sc_timeit timer "ldiv!" begin
         distributed_comm = sc.distributed_comm
         distributed_rank = sc.distributed_rank
+        distributed_nproc = sc.distributed_nproc
         parallel_schur = sc.parallel_schur
         A_factorization = sc.A_factorization
         Ainv_dot_B_local = sc.Ainv_dot_B_local
@@ -1290,7 +1317,13 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
             end
 
             if parallel_schur
+                if distributed_nproc > 1
+                    synchronize_shared()
+                end
                 ldiv!(global_y, schur_complement_factorization, bottom_vec_buffer)
+                if distributed_nproc > 1
+                    synchronize_shared()
+                end
             else
                 if shared_rank == 0 && distributed_rank == 0
                     ldiv!(global_y, schur_complement_factorization, bottom_vec_buffer)
@@ -1325,25 +1358,34 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
 
                 ldiv!(A_factorization, top_vec_buffer)
             else
-                # This commented-out implementation should probably be the most
-                # performant, but may result in inconsistent floating-point errors in
-                # results that should be identical (i.e. identical rows and RHS, but the
-                # rows are in a different place in the matrix). This would mean that
-                # downstream code might have to communicate to ensure exact consistency of
-                # the results.
-                #mul!(Ainv_dot_B_dot_y, Ainv_dot_B_local, global_y)
-                #for (i2, i1) ∈ enumerate(local_top_vector_unique_entries_partial)
-                #    top_vec_buffer[i1] = Ainv_dot_B_dot_y
-                #end
-                # The following implementation might be slightly less performant (although
-                # on a quick check in serial the difference is negligible - note that we
-                # have transposed Ainv_dot_B_local for this version for efficiency, so
-                # that the slice Ainv_dot_B_local[:,i] that we need is contiguous in
-                # memory), but should produce exactly consistent results for identical
-                # row/RHS inputs. The results then do not need to be communicated, which
-                # should more than compensate for any loss in performance of this step.
-                for (count, i) ∈ enumerate(local_top_vector_unique_entries_partial)
-                    top_vec_buffer[i] = @views dot(Ainv_dot_B_local[:,count], global_y)
+                if isa(Ainv_dot_B_local, SparseMatrixCSC)
+                    local_top_vec_buffer = sc.local_top_vec_buffer
+                    @views mul!(local_top_vec_buffer, Ainv_dot_B_local, global_y)
+                    for (i2, i1) ∈ enumerate(local_top_vector_unique_entries_partial)
+                        top_vec_buffer[i1] = local_top_vec_buffer[i2]
+                    end
+                else
+                    # This commented-out implementation should probably be the most
+                    # performant, but may result in inconsistent floating-point errors in
+                    # results that should be identical (i.e. identical rows and RHS, but
+                    # the rows are in a different place in the matrix). This would mean
+                    # that downstream code might have to communicate to ensure exact
+                    # consistency of the results.
+                    #mul!(Ainv_dot_B_dot_y, Ainv_dot_B_local, global_y)
+                    #for (i2, i1) ∈ enumerate(local_top_vector_unique_entries_partial)
+                    #    top_vec_buffer[i1] = Ainv_dot_B_dot_y
+                    #end
+                    # The following implementation might be slightly less performant
+                    # (although on a quick check in serial the difference is negligible -
+                    # note that we have transposed Ainv_dot_B_local for this version for
+                    # efficiency, so that the slice Ainv_dot_B_local[:,i] that we need is
+                    # contiguous in memory), but should produce exactly consistent results
+                    # for identical row/RHS inputs. The results then do not need to be
+                    # communicated, which should more than compensate for any loss in
+                    # performance of this step.
+                    for (count, i) ∈ enumerate(local_top_vector_unique_entries_partial)
+                        top_vec_buffer[i] = @views dot(Ainv_dot_B_local[:,count], global_y)
+                    end
                 end
 
                 # Fill in any repeated entries in `top_vec_buffer`. 'to' and 'from' are kinda
