@@ -261,10 +261,11 @@ end
                          allocate_shared_float::Union{Function,Nothing}=nothing,
                          allocate_shared_int::Union{Function,Nothing}=nothing,
                          synchronize_shared::Union{Function,Nothing}=nothing,
-                         use_sparse=true, separate_Ainv_B=false,
-                         parallel_schur=(distributed_comm!==nothing || shared_comm!==nothing),
-                         schur_tile_size=nothing, skip_factorization=false,
-                         check_lu::Bool=true,
+                         use_sparse::Bool=true, separate_Ainv_B::Bool=false,
+                         parallel_schur::Union{Bool,Factorization}=(distributed_comm!==nothing || shared_comm!==nothing),
+                         schur_complement_buffer::Union{AbstractMatrix,Nothing}=nothing,
+                         schur_tile_size::Union{Integer,Nothing}=nothing,
+                         skip_factorization::Bool=false, check_lu::Bool=true,
                          timer::Union{TimerOutput,Nothing}=nothing)
 
 Initialise an MPISchurComplement struct representing a 2x2 block-structured matrix
@@ -369,7 +370,12 @@ serial implementation from LinearAlgebra (which uses LAPACK/BLAS) is used.
 MPIDenseLUs (`true`) implementations. When using MPIDenseLUs, `schur_tile_size` can be
 used to set the `tile_size` argument to `mpi_dense_lu()`; the default is to use the
 smaller of 128 and the largest 2^n smaller than half of the size of the global 'bottom
-vector'.
+vector'. Alternatively, a `Factorization` instance can be passed to `parallel_schur`, and
+this will be used to factorize (with `lu!()`) and solve (with `ldiv!()`) the Schur
+complement matrix.
+
+To use a non-dense matrix type for `schur_complement`, pass the buffer to use as
+`schur_complement_buffer`.
 
 `skip_factorization=true` can be passed to create an MPISchurComplement instance without
 calculating the factorization corresponding to the input matrices. `ldiv!()` called with
@@ -398,10 +404,11 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                               allocate_shared_float::Union{Function,Nothing}=nothing,
                               allocate_shared_int::Union{Function,Nothing}=nothing,
                               synchronize_shared::Union{Function,Nothing}=nothing,
-                              use_sparse=true, separate_Ainv_B=false,
-                              parallel_schur=(distributed_comm!==nothing || shared_comm!==nothing),
-                              schur_tile_size=nothing, skip_factorization=false,
-                              check_lu::Bool=true,
+                              use_sparse::Bool=true, separate_Ainv_B::Bool=false,
+                              parallel_schur::Union{Bool,Factorization}=(distributed_comm!==nothing || shared_comm!==nothing),
+                              schur_complement_buffer::Union{AbstractMatrix,Nothing}=nothing,
+                              schur_tile_size::Union{Integer,Nothing}=nothing,
+                              skip_factorization::Bool=false, check_lu::Bool=true,
                               timer::Union{TimerOutput,Nothing}=nothing)
 
     if !skip_factorization
@@ -840,7 +847,11 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     else
         Ainv_dot_B_dot_y = nothing
     end
-    schur_complement = allocate_shared_float(bottom_vec_global_size, bottom_vec_global_size)
+    if schur_complement_buffer === nothing
+        schur_complement = allocate_shared_float(bottom_vec_global_size, bottom_vec_global_size)
+    else
+        schur_complement = schur_complement_buffer
+    end
     top_vec_buffer = allocate_shared_float(top_vec_local_size)
     bottom_vec_buffer = allocate_shared_float(bottom_vec_global_size)
     global_y = allocate_shared_float(bottom_vec_global_size)
@@ -850,7 +861,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         fake_C = sparse(fake_C)
     end
 
-    if parallel_schur
+    if isa(parallel_schur, Bool) && parallel_schur
         if schur_tile_size === nothing
             power_of_2 = floor(Int64, log2(bottom_vec_global_size / 2))
             schur_tile_size = min(128, 2^power_of_2)
@@ -860,7 +871,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                          distributed_comm, allocate_shared_float, allocate_shared_int;
                          synchronize_shared=synchronize_shared, skip_factorization=true,
                          check_lu=check_lu, timer=timer)
-    else
+    elseif isa(parallel_schur, Bool)
         if shared_rank == 0 && distributed_rank == 0
             schur_complement_factorization =
                 lu!(Matrix{data_type}(I, bottom_vec_global_size, bottom_vec_global_size);
@@ -868,6 +879,10 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         else
             schur_complement_factorization = nothing
         end
+    else
+        # Use a user-provided solver for Schur complement matrix solve.
+        schur_complement_factorization = parallel_schur
+        parallel_schur = true
     end
 
     sc_factorization = MPISchurComplement(A_factorization, Ainv_dot_B, Ainv_dot_B_local,
@@ -965,6 +980,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
         D_local_column_repeats_partial = sc.D_local_column_repeats_partial
         schur_complement = sc.schur_complement
         schur_complement_local_range_partial = sc.schur_complement_local_range_partial
+        parallel_schur = sc.parallel_schur
         local_top_vector_repeats = sc.local_top_vector_repeats
         local_top_vector_repeats_partial = sc.local_top_vector_repeats_partial
         unique_bottom_vector_entries = sc.unique_bottom_vector_entries
@@ -1150,20 +1166,21 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
                 MPI.Reduce!(schur_complement, +, distributed_comm; root=0)
             end
 
-            # `schur_complement` has been gathered/assembled onto the global rank-0 process, and
-            # is now LU-factorized in serial.
-            # Unless the original matrices were all block-diagonal in some consistent way (in
-            # which case the solve could probably be done more efficiently by splitting the full
-            # matrix into the disconnected pieces), `schur_complement` will generally be a dense
-            # matrix, so not worth having an option for a sparse LU factorization here. Possibly
-            # this LU factorization (and the corresponding `ldiv!()` using
-            # `sc.schur_complement_factorization`) could be parallelised with shared memory and/or
-            # distributed MPI, but we expect this step not to be a bottleneck, so it is done in
-            # serial (at least for now).
-            if isa(sc.schur_complement_factorization, MPIDenseLU)
+            if parallel_schur
                 synchronize_shared()
                 lu!(sc.schur_complement_factorization, schur_complement)
             elseif shared_rank == 0 && distributed_rank == 0
+                # `schur_complement` has been gathered/assembled onto the global rank-0
+                # process, and is now LU-factorized in serial.
+                # Unless the original matrices were all block-diagonal in some consistent
+                # way (in which case the solve could probably be done more efficiently by
+                # splitting the full matrix into the disconnected pieces),
+                # `schur_complement` will generally be a dense matrix, so not worth having
+                # an option for a sparse LU factorization here. Possibly this LU
+                # factorization (and the corresponding `ldiv!()` using
+                # `sc.schur_complement_factorization`) could be parallelised with shared
+                # memory and/or distributed MPI, but we expect this step not to be a
+                # bottleneck, so it is done in serial (at least for now).
                 schur_complement_factorization = sc.schur_complement_factorization
                 factors = schur_complement_factorization.factors
                 factors .= schur_complement
