@@ -223,7 +223,8 @@ function get_fe_like_matrix(n_element_list...; allocate_array_float, rng,
 end
 
 function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
-                                  separate_Ainv_B=false, parallel_schur=true)
+                                  separate_Ainv_B=false, sparse_Ainv_B=false,
+                                  parallel_schur=true)
     comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
         shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
         local_win_store_float, local_win_store_int = get_comms(n_shared)
@@ -430,7 +431,7 @@ function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               separate_Ainv_B=separate_Ainv_B,
-                              parallel_schur=parallel_schur)
+                              sparse_Ainv_B=sparse_Ainv_B, parallel_schur=parallel_schur)
 
     function test_once(M_assembled)
         ldiv!(local_x, local_y, sc, local_u, local_v)
@@ -571,7 +572,8 @@ function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
 end
 
 function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, periodic=false,
-                                  separate_Ainv_B=false, parallel_schur=true)
+                                  separate_Ainv_B=false, sparse_Ainv_B=false,
+                                  parallel_schur=true)
     comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
         shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
         local_win_store_float, local_win_store_int = get_comms(n_shared)
@@ -895,7 +897,7 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, periodic=false,
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               separate_Ainv_B=separate_Ainv_B,
-                              parallel_schur=parallel_schur)
+                              sparse_Ainv_B=sparse_Ainv_B, parallel_schur=parallel_schur)
 
     function test_once(M_assembled)
         ldiv!(local_x, local_y, sc, local_u, local_v)
@@ -1063,7 +1065,8 @@ end
 # make the remainder of the matrix block-diagonal parts (i.e. split into disconnected
 # parts).
 function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, periodic=false,
-                                      separate_Ainv_B=false, parallel_schur=true)
+                                      separate_Ainv_B=false, sparse_Ainv_B=false,
+                                      parallel_schur=true)
     comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
         shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
         local_win_store_float, local_win_store_int = get_comms(n_shared)
@@ -1348,7 +1351,7 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, periodic=fals
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               separate_Ainv_B=separate_Ainv_B,
-                              parallel_schur=parallel_schur)
+                              sparse_Ainv_B=sparse_Ainv_B, parallel_schur=parallel_schur)
 
     function test_once(M_assembled)
         ldiv!(local_x, local_y, sc, local_u, local_v)
@@ -1504,18 +1507,19 @@ function finite_element_tests()
             n_shared = 1
             while n_shared ≤ nproc
                 n_distributed = nproc ÷ n_shared
-                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, parallel_schur=$parallel_schur" for (n1,n2,tol) ∈ (
+                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, sparse_Ainv_B=$sparse_Ainv_B, parallel_schur=$parallel_schur" for (n1,n2,tol) ∈ (
                         (max(2, n_distributed), max(2, n_distributed), 3.0e-11),
                         (16, 8, 1.0e-9),
                         (24, 32, 3.0e-8),
-                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true), parallel_schur ∈ (true, false)
-                    println("finite element 1D1V n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, parallel_schur=$parallel_schur")
+                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true), sparse_Ainv_B ∈ (false, true), parallel_schur ∈ (true, false)
+                    println("finite element 1D1V n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, sparse_Ainv_B=$sparse_Ainv_B, parallel_schur=$parallel_schur")
                     # Note that here n1 and n2 are numbers of elements, not total grid sizes.
                     # Total grid sizes are
                     # (n1*(ngrid-1)+1)*(n2*(ngrid-1)+1)=(n1*2+1)*(n2*2+1).
                     finite_element_1D1V_test(n1, n2, tol; n_shared=n_shared,
                                              periodic=periodic,
                                              separate_Ainv_B=separate_Ainv_B,
+                                             sparse_Ainv_B=sparse_Ainv_B,
                                              parallel_schur=parallel_schur)
                 end
                 n_shared *= 2
@@ -1525,15 +1529,16 @@ function finite_element_tests()
             n_shared = 1
             while n_shared ≤ nproc
                 n_distributed = nproc ÷ n_shared
-                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, parallel_schur=$parallel_schur" for (n1,n2,tol) ∈ (
+                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, sparse_Ainv_B=$sparse_Ainv_B, parallel_schur=$parallel_schur" for (n1,n2,tol) ∈ (
                         (max(2, n_distributed), max(2, n_distributed), 2.0e-8),
                         (8, 4, 4.0e-8),
                         (4, 12, 6.0e-9),
-                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true), parallel_schur ∈ (true, false)
-                    println("finite element 2D1V n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, parallel_schur=$parallel_schur")
+                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true), sparse_Ainv_B ∈ (false, true), parallel_schur ∈ (true, false)
+                    println("finite element 2D1V n_shared=$n_shared ($n1,$n2), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, sparse_Ainv_B=$sparse_Ainv_B, parallel_schur=$parallel_schur")
                     finite_element_2D1V_test(n1, n2, 3, tol; n_shared=n_shared,
                                              periodic=periodic,
                                              separate_Ainv_B=separate_Ainv_B,
+                                             sparse_Ainv_B=sparse_Ainv_B,
                                              parallel_schur=parallel_schur)
                 end
                 n_shared *= 2
@@ -1544,7 +1549,7 @@ function finite_element_tests()
             while n_shared ≤ nproc
                 n_distributed = nproc ÷ n_shared
                 tol = 4.0e-9
-                @testset "n_shared=$n_shared ($s1,$s2,$s3), periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, parallel_schur=$parallel_schur" for (s1,s2,s3) ∈ (
+                @testset "n_shared=$n_shared ($s1,$s2,$s3), periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, sparse_Ainv_B=$sparse_Ainv_B, parallel_schur=$parallel_schur" for (s1,s2,s3) ∈ (
                         (1, 1, 2),
                         (1, 1, 4),
                         (1, 2, 1),
@@ -1571,11 +1576,12 @@ function finite_element_tests()
                         (4, 4, 1),
                         (4, 4, 2),
                         (4, 4, 4),
-                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true), parallel_schur ∈ (true, false)
-                    println("finite element 3D split n_shared=$n_shared ($s1,$s2,$s3), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, parallel_schur=$parallel_schur")
+                       ), periodic ∈ (false, true), separate_Ainv_B ∈ (false, true), sparse_Ainv_B ∈ (false, true), parallel_schur ∈ (true, false)
+                    println("finite element 3D split n_shared=$n_shared ($s1,$s2,$s3), tol=$tol, periodic=$periodic, separate_Ainv_B=$separate_Ainv_B, sparse_Ainv_B=$sparse_Ainv_B, parallel_schur=$parallel_schur")
                     finite_element_3D_split_test(s1, s2, s3, tol; n_shared=n_shared,
                                                  periodic=periodic,
                                                  separate_Ainv_B=separate_Ainv_B,
+                                                 sparse_Ainv_B=sparse_Ainv_B,
                                                  parallel_schur=parallel_schur)
                 end
                 n_shared *= 2
