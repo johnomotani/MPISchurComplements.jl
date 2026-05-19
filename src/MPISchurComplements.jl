@@ -550,7 +550,6 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         filter!((i) -> length(all_top_vector_overlaps[i]) > 0, sorted_overlap_ranks)
         # MPI ranks are given by 0-based index, but sorted_overlap_ranks are 1-based
         overlap_ranks = sorted_overlap_ranks .- 1
-        top_vector_offset = first(owned_top_vector_entries) - 1
         for idist ∈ sorted_overlap_ranks
             this_overlap = all_top_vector_overlaps[idist]
             this_local_overlap = find_local_vector_inds(this_overlap, owned_top_vector_entries)
