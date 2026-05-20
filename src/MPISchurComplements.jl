@@ -40,7 +40,6 @@ struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,TC<:AbstractMatrix{
     C::TC
     C_global_row_range_partial::Trange
     C_local_row_range_partial::Trange
-    C_local_row_repeats::Matrix{Int64}
     C_local_row_repeats_partial::Matrix{Int64}
     D_global_column_range_partial::Trange
     D_local_column_range_partial::Trange
@@ -912,7 +911,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                                           B_local_column_repeats,
                                           B_local_column_repeats_partial, fake_C,
                                           C_global_row_range_partial,
-                                          C_local_row_range_partial, C_local_row_repeats,
+                                          C_local_row_range_partial,
                                           C_local_row_repeats_partial,
                                           D_global_column_range_partial,
                                           D_local_column_range_partial,
@@ -991,7 +990,6 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
         B_local_column_repeats_partial = sc.B_local_column_repeats_partial
         C_global_row_range_partial = sc.C_global_row_range_partial
         C_local_row_range_partial = sc.C_local_row_range_partial
-        C_local_row_repeats = sc.C_local_row_repeats
         C_local_row_repeats_partial = sc.C_local_row_repeats_partial
         C_dot_Ainv_dot_B = sc.C_dot_Ainv_dot_B
         D_global_column_range_partial = sc.D_global_column_range_partial
@@ -1107,12 +1105,8 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             # contributions from repeated row indices into a single row (that will then be
             # included in the stored `sc.C`, i.e. the 'to' rows are included in
             # `sc.C_local_row_range_partial` while the 'from' rows are not).
-            if length(C_local_row_repeats) > 0
-                # Handle repeated columns in serial for now. Look at this again if it becomes a
-                # bottleneck.
-                for j ∈ 1:size(C, 2), (to, from) ∈ eachcol(C_local_row_repeats_partial)
-                    C[to,j] += C[from,j]
-                end
+            for j ∈ 1:size(C, 2), (to, from) ∈ eachcol(C_local_row_repeats_partial)
+                C[to,j] += C[from,j]
             end
             # When using shared memory, only store the slice of C that this process needs.
             if use_sparse
