@@ -8,6 +8,7 @@ import LinearAlgebra: ldiv!
 using MPI
 using MPIDenseLUs
 using SparseArrays
+using SparseMatricesCSR
 using TimerOutputs
 
 const Trange = Vector{Int64}
@@ -242,6 +243,30 @@ function update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
     colptr .= new_colptr
     resize!(rowval, length(new_rowval))
     rowval .= new_rowval
+    resize!(nzval, length(new_nzval))
+    nzval .= new_nzval
+    return nothing
+end
+
+"""
+    update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
+                          new_A::SparseMatrixCSR{Bi,Tf,Ti}) where {Bi,Tf,Ti}
+
+Update the values of `A` in-place to the values of `new_A`. May not be ideally efficient
+because it requires resizing Vectors.
+"""
+function update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
+                               new_A::SparseMatrixCSR{Bi,Tf,Ti}) where {Bi,Tf,Ti}
+    rowptr = A.rowptr
+    colval = A.colval
+    nzval = A.nzval
+    new_rowptr = new_A.rowptr
+    new_colval = new_A.colval
+    new_nzval = new_A.nzval
+    resize!(rowptr, length(new_rowptr))
+    rowptr .= new_rowptr
+    resize!(colval, length(new_colval))
+    colval .= new_colval
     resize!(nzval, length(new_nzval))
     nzval .= new_nzval
     return nothing
@@ -875,7 +900,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
 
     fake_C = zeros(data_type, length(C_local_row_range_partial), top_vec_local_size)
     if use_sparse
-        fake_C = sparse(fake_C)
+        fake_C = sparsecsr(fake_C)
     end
 
     if isa(parallel_schur, Bool) && parallel_schur
@@ -1111,7 +1136,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             # When using shared memory, only store the slice of C that this process needs.
             if use_sparse
                 C = @view C[sc.C_local_row_range_partial,:]
-                C = sparse(C)
+                C = sparsecsr(C)
                 update_sparse_matrix!(sc.C, C)
             else
                 # Make a copy because C_local_row_range_partial might not be a contiguous range of
@@ -1293,7 +1318,7 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
             synchronize_shared()
 
             # Only have the local entries of v, so add those to the local entries in
-            # bottom_vec_buffer before recducing.
+            # bottom_vec_buffer before reducing.
             # Need to avoid double counting of any overlapping entries in `v`.
             for (i1, i2) ∈ zip(global_bottom_vector_entries_no_overlap_partial, local_bottom_vector_entries_no_overlap_partial)
                 bottom_vec_buffer[i1] += v[i2]
