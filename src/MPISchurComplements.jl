@@ -8,6 +8,7 @@ import LinearAlgebra: ldiv!
 using MPI
 using MPIDenseLUs
 using SparseArrays
+using SparseArrays: FixedSparseCSC
 using SparseMatricesCSR
 using TimerOutputs
 
@@ -269,6 +270,43 @@ function update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
     colval .= new_colval
     resize!(nzval, length(new_nzval))
     nzval .= new_nzval
+    return nothing
+end
+
+"""
+    update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
+                          new_A::FixedMatrixCSC{Tf,Ti}) where {Tf,Ti}
+
+Update the values of `A` in-place to the values of `new_A`. May not be ideally efficient
+because it requires resizing Vectors. For this FixedMatrixCSC version, also filter out
+zeros because FixedMatrixCSC was probably defined with a maximal stencil, which might
+contain extra zeros.
+"""
+function update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
+                               new_A::FixedSparseCSC{Tf,Ti}) where {Tf,Ti}
+    colptr = A.colptr
+    rowval = A.rowval
+    nzval = A.nzval
+    new_colptr = new_A.colptr
+    new_rowval = new_A.rowval
+    new_nzval = new_A.nzval
+    resize!(colptr, 0)
+    resize!(rowval, 0)
+    resize!(nzval, 0)
+    count = 1
+    for col ∈ 1:new_A.n
+        push!(colptr, count)
+        colstart = new_colptr[col]
+        colend = new_colptr[col+1] - 1
+        for new_i ∈ colstart:colend
+            if !iszero(new_nzval[new_i])
+                push!(rowval, new_rowval[new_i])
+                push!(nzval, new_nzval[new_i])
+                count += 1
+            end
+        end
+    end
+    push!(colptr, count)
     return nothing
 end
 
