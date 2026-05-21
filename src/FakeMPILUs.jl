@@ -266,7 +266,7 @@ function ldiv!(x::AbstractVector, Alu::FakeMPILU, b::AbstractVector)
         rhs_buffer = Alu.rhs_buffer
 
         # This drops any repeated entries in `b`.
-        rhs_buffer[Alu.global_vector_ranges[1]] .= b[local_unique_vector_range]
+        @views rhs_buffer[Alu.global_vector_ranges[1]] .= b[local_unique_vector_range]
         for iproc ∈ 1:nproc-1
             this_vector_range = Alu.global_vector_ranges[iproc+1]
             this_rhs_buffer = zeros(eltype(rhs_buffer), length(this_vector_range))
