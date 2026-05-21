@@ -287,6 +287,8 @@ end
                          allocate_shared_float::Union{Function,Nothing}=nothing,
                          allocate_shared_int::Union{Function,Nothing}=nothing,
                          synchronize_shared::Union{Function,Nothing}=nothing,
+                         Ainv_dot_B_buffer::Union{AbstractMatrix,Nothing}=nothing,
+                         schur_complement_buffer::Union{AbstractMatrix,Nothing}=nothing,
                          use_sparse::Bool=true, separate_Ainv_B::Bool=false,
                          sparse_Ainv_B::Bool=false,
                          parallel_schur::Union{Bool,Factorization}=(distributed_comm!==nothing || shared_comm!==nothing),
@@ -404,8 +406,9 @@ vector'. Alternatively, a `Factorization` instance can be passed to `parallel_sc
 this will be used to factorize (with `lu!()`) and solve (with `ldiv!()`) the Schur
 complement matrix.
 
-To use a non-dense matrix type for `schur_complement`, pass the buffer to use as
-`schur_complement_buffer`.
+To use a non-dense matrix type for `Ainv_dot_B` or `schur_complement`, pass the buffer(s)
+to use as `Ainv_dot_B_buffer` or `schur_complement_buffer`. If you are using shared-memory
+parallelism, these must be shared-memory buffers.
 
 `skip_factorization=true` can be passed to create an MPISchurComplement instance without
 calculating the factorization corresponding to the input matrices. `ldiv!()` called with
@@ -434,6 +437,8 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                               allocate_shared_float::Union{Function,Nothing}=nothing,
                               allocate_shared_int::Union{Function,Nothing}=nothing,
                               synchronize_shared::Union{Function,Nothing}=nothing,
+                              Ainv_dot_B_buffer::Union{AbstractMatrix,Nothing}=nothing,
+                              schur_complement_buffer::Union{AbstractMatrix,Nothing}=nothing,
                               use_sparse::Bool=true, separate_Ainv_B::Bool=false,
                               sparse_Ainv_B::Bool=false,
                               parallel_schur::Union{Bool,Factorization}=(distributed_comm!==nothing || shared_comm!==nothing),
@@ -848,7 +853,11 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     end
 
     # Allocate buffer arrays
-    Ainv_dot_B = allocate_shared_float(top_vec_local_size, bottom_vec_global_size)
+    if Ainv_dot_B_buffer === nothing
+        Ainv_dot_B = allocate_shared_float(top_vec_local_size, bottom_vec_global_size)
+    else
+        Ainv_dot_B = Ainv_dot_B_buffer
+    end
     if separate_Ainv_B
         if !use_sparse
             error("It will always be more expensive to use `separate_Ainv_B` when "
