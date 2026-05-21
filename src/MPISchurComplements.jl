@@ -1051,6 +1051,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
         overlap_ranks = sc.overlap_ranks
         distributed_comm = sc.distributed_comm
         distributed_rank = sc.distributed_rank
+        distributed_nproc = sc.distributed_nproc
         shared_rank = sc.shared_rank
         synchronize_shared = sc.synchronize_shared
         use_sparse = sc.use_sparse
@@ -1218,7 +1219,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
                 schur_complement[i1,j1] += D[i2,j2]
             end
             synchronize_shared()
-            if shared_rank == 0
+            if shared_rank == 0 && distributed_nproc > 1
                 MPI.Reduce!(schur_complement, +, distributed_comm; root=0)
             end
 
