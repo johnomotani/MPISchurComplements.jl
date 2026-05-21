@@ -869,9 +869,9 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     elseif sparse_Ainv_B
         # Store the chunk of Ainv_dot_B needed by this shared-memory process as a sparse
         # array.
-        Ainv_dot_B_local = sparse(zeros(data_type,
-                                        length(local_top_vector_unique_entries_partial),
-                                        bottom_vec_global_size))
+        Ainv_dot_B_local = spzeros(data_type,
+                                   length(local_top_vector_unique_entries_partial),
+                                   bottom_vec_global_size)
         B_local = nothing
     else
         # Store the chunk of Ainv_dot_B needed by this shared-memory process as a contiguous
