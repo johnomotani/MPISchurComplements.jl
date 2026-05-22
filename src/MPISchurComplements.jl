@@ -923,11 +923,11 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     # C_dot_Ainv_dot_u and C_dot_Ainv_dot_B are purely local buffers.
     C_dot_Ainv_dot_u = Vector{data_type}(undef, length(C_global_row_range_partial))
     if sparse_Ainv_B
-        C_dot_Ainv_dot_B = Matrix{data_type}(undef, length(C_global_row_range_partial),
-                                             bottom_vec_global_size)
-    else
         C_dot_Ainv_dot_B = spzeros(data_type, length(C_global_row_range_partial),
                                    bottom_vec_global_size)
+    else
+        C_dot_Ainv_dot_B = Matrix{data_type}(undef, length(C_global_row_range_partial),
+                                             bottom_vec_global_size)
     end
     if separate_Ainv_B
         Ainv_dot_B_dot_y = Vector{data_type}(undef, length(local_top_vector_unique_entries_partial))
@@ -948,9 +948,11 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     bottom_vec_buffer = allocate_shared_float(bottom_vec_global_size)
     global_y = allocate_shared_float(bottom_vec_global_size)
 
-    fake_C = zeros(data_type, length(C_local_row_range_partial), top_vec_local_size)
     if use_sparse
-        fake_C = sparsecsr(fake_C)
+        fake_C = sparsecsr(Int64[], Int64[], data_type[],
+                           length(C_local_row_range_partial), top_vec_local_size)
+    else
+        fake_C = zeros(data_type, length(C_local_row_range_partial), top_vec_local_size)
     end
 
     if isa(parallel_schur, Bool) && parallel_schur
