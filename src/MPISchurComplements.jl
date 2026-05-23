@@ -1116,7 +1116,15 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             # then copy this entry into all the repeated positions. This converts the columns of
             # `B` into 'vectors' (with the same structure as `u`) that can be passed to
             # `A_factorization` to find `Ainv_dot_B`.
-            Ainv_dot_B[:,B_column_range_partial] .= 0
+            if isa(Ainv_dot_B, AbstractSparseMatrix)
+                Ainv_dot_B_colptr = Ainv_dot_B.colptr
+                Ainv_dot_B_nzval = Ainv_dot_B.nzval
+                Ainv_dot_B_first_i = Ainv_dot_B_colptr[B_column_range_partial[1]]
+                Ainv_dot_B_last_i = Ainv_dot_B_colptr[B_column_range_partial[end]+1] - 1
+                Ainv_dot_B_nzval[Ainv_dot_B_first_i:Ainv_dot_B_last_i] .= 0.0
+            else
+                Ainv_dot_B[:,B_column_range_partial] .= 0
+            end
             if length(local_top_vector_repeats) > 0 || length(local_bottom_vector_repeats) > 0
                 # Add up entries that are repeated on this subdomain.
                 for j ∈ 1:size(B, 2), (to, from) ∈ eachcol(local_top_vector_repeats_partial)
@@ -1129,8 +1137,23 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
             else
                 synchronize_shared()
             end
-            for (j1, j2) ∈ zip(B_global_column_range_partial, B_local_column_range_partial), i ∈ 1:size(Ainv_dot_B, 1)
-                Ainv_dot_B[i,j1] = B[i,j2]
+            if isa(Ainv_dot_B, AbstractSparseMatrix)
+                B_sparse = sparse(@view B[:,B_local_column_range_partial])
+                B_colptr = B_sparse.colptr
+                B_rowval = B_sparse.rowval
+                B_nzval = B_sparse.nzval
+                for (j2, j1) ∈ enumerate(B_global_column_range_partial)
+                    Bi_start = B_colptr[j2]
+                    Bi_end = B_colptr[j2+1] - 1
+                    for Bi ∈ Bi_start:Bi_end
+                        i = B_rowval[Bi]
+                        Ainv_dot_B[i, j1] = B_nzval[Bi]
+                    end
+                end
+            else
+                for (j1, j2) ∈ zip(B_global_column_range_partial, B_local_column_range_partial), i ∈ 1:size(Ainv_dot_B, 1)
+                    Ainv_dot_B[i,j1] = B[i,j2]
+                end
             end
             synchronize_shared()
 
