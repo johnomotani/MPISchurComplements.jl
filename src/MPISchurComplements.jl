@@ -1038,6 +1038,284 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     return sc_factorization
 end
 
+function update_A_factorization!(sc::MPISchurComplement, A)
+    timer = sc.timer
+    A_factorization = sc.A_factorization
+
+    # When `A===missing`, this was called from the `mpi_schur_complement()` constructor,
+    # where we assume `A_factorization` was already initialized.
+    if A !== missing
+        @sc_timeit timer "lu(A)" begin
+            lu!(A_factorization, A)
+        end
+    end
+    return nothing
+end
+
+function update_Ainv_dot_B!(sc, B)
+    timer = sc.timer
+    A_factorization = sc.A_factorization
+    Ainv_dot_B = sc.Ainv_dot_B
+    local_top_vector_repeats = sc.local_top_vector_repeats
+    local_bottom_vector_repeats = sc.local_bottom_vector_repeats
+    B_column_range_partial = sc.B_column_range_partial
+    B_local_column_repeats_partial = sc.B_local_column_repeats_partial
+    B_local_column_range_partial = sc.B_local_column_range_partial
+    B_global_column_range_partial = sc.B_global_column_range_partial
+    overlap_ranks = sc.overlap_ranks
+    local_top_vector_repeats_partial = sc.local_top_vector_repeats_partial
+    local_top_vector_unique_entries_partial = sc.local_top_vector_unique_entries_partial
+    local_top_vector_overlaps = sc.local_top_vector_overlaps
+    B_overlap_buffers_send = sc.B_overlap_buffers_send
+    B_overlap_buffers_recv = sc.B_overlap_buffers_recv
+    separate_Ainv_B = sc.separate_Ainv_B
+    shared_rank = sc.shared_rank
+    distributed_comm = sc.distributed_comm
+    synchronize_shared = sc.synchronize_shared
+
+    @sc_timeit timer "Ainv_dot_B" begin
+        # Use `Ainv_dot_B` as a local-rows/global-columns sized buffer to collect `B` into.
+        # This is slightly inefficient, as there will be chunks that are all-zero that we do
+        # not need to collect, but this way seems the simplest to implement, as we need the
+        # not-locally-owned columns of B in all locally owned rows, to pass to `ldiv!()`
+        # below.
+        # When there are repeated entries in `B`, need to add them up into a single entry, and
+        # then copy this entry into all the repeated positions. This converts the columns of
+        # `B` into 'vectors' (with the same structure as `u`) that can be passed to
+        # `A_factorization` to find `Ainv_dot_B`.
+        if isa(Ainv_dot_B, AbstractSparseMatrix)
+            Ainv_dot_B_colptr = Ainv_dot_B.colptr
+            Ainv_dot_B_nzval = Ainv_dot_B.nzval
+            Ainv_dot_B_first_i = Ainv_dot_B_colptr[first(B_column_range_partial)]
+            Ainv_dot_B_last_i = Ainv_dot_B_colptr[last(B_column_range_partial)+1] - 1
+            Ainv_dot_B_nzval[Ainv_dot_B_first_i:Ainv_dot_B_last_i] .= 0.0
+        else
+            Ainv_dot_B[:,B_column_range_partial] .= 0
+        end
+        if length(local_top_vector_repeats) > 0 || length(local_bottom_vector_repeats) > 0
+            # Add up entries that are repeated on this subdomain.
+            for j ∈ 1:size(B, 2), (to, from) ∈ eachcol(local_top_vector_repeats_partial)
+                B[to,j] += B[from,j]
+            end
+            synchronize_shared()
+            for (to, from) ∈ eachcol(B_local_column_repeats_partial)
+                @views B[:,to] .+= B[:,from]
+            end
+        else
+            synchronize_shared()
+        end
+        if isa(Ainv_dot_B, AbstractSparseMatrix)
+            B_sparse = sparse(@view B[:,B_local_column_range_partial])
+            B_colptr = B_sparse.colptr
+            B_rowval = B_sparse.rowval
+            B_nzval = B_sparse.nzval
+            for (j2, j1) ∈ enumerate(B_global_column_range_partial)
+                Bi_start = B_colptr[j2]
+                Bi_end = B_colptr[j2+1] - 1
+                for Bi ∈ Bi_start:Bi_end
+                    i = B_rowval[Bi]
+                    Ainv_dot_B[i, j1] = B_nzval[Bi]
+                end
+            end
+        else
+            for (j1, j2) ∈ zip(B_global_column_range_partial, B_local_column_range_partial), i ∈ 1:size(Ainv_dot_B, 1)
+                Ainv_dot_B[i,j1] = B[i,j2]
+            end
+        end
+        synchronize_shared()
+
+        # Add up the rows of B that overlap between different subdomains (temporarily stored
+        # in `Ainv_dot_B`).  Note only non-repeated points in the overlaps are communicated,
+        # to reduce the amount of communication.
+        if shared_rank == 0
+            reqs = MPI.Request[]
+            for (overlap_range, buffer_send, buffer_recv, overlap_rank) ∈
+                    zip(local_top_vector_overlaps, B_overlap_buffers_send,
+                        B_overlap_buffers_recv, overlap_ranks)
+                for j ∈ 1:size(Ainv_dot_B, 2), (i1, i2) ∈ enumerate(overlap_range)
+                    buffer_send[i1,j] = Ainv_dot_B[i2,j]
+                end
+                # Iallreduce seems not to be included in the nice Julia API, so have to use
+                # lower level call here.
+                push!(reqs, MPI.Isend(buffer_send, distributed_comm; dest=overlap_rank))
+                push!(reqs, MPI.Irecv!(buffer_recv, distributed_comm; source=overlap_rank))
+            end
+            MPI.Waitall(reqs)
+            for (overlap_range, buffer) ∈ zip(local_top_vector_overlaps, B_overlap_buffers_recv)
+                for j ∈ 1:size(Ainv_dot_B, 2), (i2, i1) ∈ enumerate(overlap_range)
+                    Ainv_dot_B[i1,j] += buffer[i2,j]
+                end
+            end
+        end
+        synchronize_shared()
+        if length(local_top_vector_repeats) > 0
+            # Now that overlaps have been comunicated, all contributions have been added the
+            # 'to' places, so we can now copy back these periodic entries to the 'from'
+            # places.
+            for j ∈ 1:size(Ainv_dot_B, 2), (to, from) ∈ eachcol(local_top_vector_repeats_partial)
+                Ainv_dot_B[from,j] = Ainv_dot_B[to,j]
+            end
+            if !separate_Ainv_B
+                synchronize_shared()
+            end
+        end
+
+        # At this point `Ainv_dot_B` contains the dense array of `B`.
+        if separate_Ainv_B
+            update_sparse_matrix!(sc.B, sparse(@view Ainv_dot_B[local_top_vector_unique_entries_partial,:]))
+            synchronize_shared()
+        end
+        ldiv!(A_factorization, Ainv_dot_B)
+    end
+    return nothing
+end
+
+function update_C!(sc, C)
+    timer = sc.timer
+    C_local_row_repeats_partial = sc.C_local_row_repeats_partial
+
+    @sc_timeit timer "C" begin
+        # A representation of C is stored where no rows are repeated, so need to add up all
+        # contributions from repeated row indices into a single row (that will then be
+        # included in the stored `sc.C`, i.e. the 'to' rows are included in
+        # `sc.C_local_row_range_partial` while the 'from' rows are not).
+        for j ∈ 1:size(C, 2), (to, from) ∈ eachcol(C_local_row_repeats_partial)
+            C[to,j] += C[from,j]
+        end
+        # When using shared memory, only store the slice of C that this process needs.
+        if issparse(sc.C)
+            new_C_view = @view C[sc.C_local_row_range_partial,:]
+            new_C = sparsecsr(new_C_view)
+            #new_C = transpose(sparse(transpose(new_C_view)))
+            update_sparse_matrix!(sc.C, new_C)
+        else
+            # Make a copy because C_local_row_range_partial might not be a contiguous range of
+            # indices, but performance will be better if `C` is a contiguously-allocated
+            # array.
+            sc_C = sc.C
+            for j ∈ 1:size(C, 2), (i1, i2) ∈ enumerate(sc.C_local_row_range_partial)
+                sc_C[i1,j] = C[i2,j]
+            end
+            new_C = sc_C
+        end
+    end
+    return new_C
+end
+
+function update_schur_complement_factorization!(sc, D, new_C)
+    timer = sc.timer
+    schur_complement = sc.schur_complement
+    schur_complement_local_range_partial = sc.schur_complement_local_range_partial
+    separate_Ainv_B = sc.separate_Ainv_B
+    Ainv_dot_B = sc.Ainv_dot_B
+    Ainv_dot_B_local = sc.Ainv_dot_B_local
+    local_top_vector_unique_entries_partial = sc.local_top_vector_unique_entries_partial
+    C_dot_Ainv_dot_B = sc.C_dot_Ainv_dot_B
+    C_global_row_range_partial = sc.C_global_row_range_partial
+    schur_complement = sc.schur_complement
+    schur_complement_factorization = sc.schur_complement_factorization
+    local_bottom_vector_repeats = sc.local_bottom_vector_repeats
+    local_bottom_vector_repeats_partial = sc.local_bottom_vector_repeats_partial
+    D_local_column_repeats = sc.D_local_column_repeats
+    D_local_column_repeats_partial = sc.D_local_column_repeats_partial
+    D_global_column_range_partial = sc.D_global_column_range_partial
+    D_local_column_range_partial = sc.D_local_column_range_partial
+    unique_bottom_vector_entries = sc.unique_bottom_vector_entries
+    local_bottom_vector_unique_entries = sc.local_bottom_vector_unique_entries
+    distributed_comm = sc.distributed_comm
+    shared_rank = sc.shared_rank
+    distributed_nproc = sc.distributed_nproc
+    distributed_comm = sc.distributed_comm
+    synchronize_shared = sc.synchronize_shared
+    check_lu = sc.check_lu
+
+    @sc_timeit timer "schur_complement" begin
+        # Initialise `schur_complement` to zero, because when `new_C` does not include all rows,
+        # the matrix multiplication below would not initialise all elements.
+        for j ∈ schur_complement_local_range_partial
+            schur_complement[:,j] .= 0.0
+        end
+        synchronize_shared()
+
+        # Read out the local entries of `Ainv_dot_B` here, rather than just after `Ainv_dot_B`
+        # is calculated, in order to avoid adding another `synchronize_shared()` call.
+        if !separate_Ainv_B
+            if isa(Ainv_dot_B_local, SparseMatrixCSC)
+                # Convert Ainv_dot_B to SparseMatrixCSC in this call to resolve possible
+                # type instability.
+                update_sparse_matrix!(Ainv_dot_B_local,
+                                      sparse(@view(SparseMatrixCSC(Ainv_dot_B)[local_top_vector_unique_entries_partial,:])))
+            else
+                # Note that we need to transpose Ainv_dot_B_local for the slightly
+                # hacked matrix-vector multiply implementation used in `ldiv!()` to
+                # ensure consistency of results.
+                for i ∈ 1:size(Ainv_dot_B_local, 1), (j1, j2) ∈ enumerate(local_top_vector_unique_entries_partial)
+                    Ainv_dot_B_local[i,j1] = Ainv_dot_B[j2,i]
+                end
+            end
+        end
+
+        # We store locally all columns in `Ainv_dot_B` (only local rows) and all rows of `C`
+        # (only local columns). Therefore we can take the matrix product `Ainv_dot_B*C` with
+        # the local chunks, then do a sum-reduce to get the final result. The
+        # `schur_complement` buffer is full size on every rank.
+        mul!(C_dot_Ainv_dot_B, new_C, Ainv_dot_B, -1.0, 0.0)
+        for j ∈ 1:size(schur_complement, 2), (i2, i1) ∈ enumerate(C_global_row_range_partial)
+            schur_complement[i1,j] = C_dot_Ainv_dot_B[i2,j]
+        end
+        synchronize_shared()
+        # Only get the local rows for D, so just add these to the local rows of
+        # `schur_complement`.
+        # As `schur_Complement` does not have any repeated entries, need to add up any locally
+        # repeated entries of D (columns then rows) so that we can then select the 'assembled'
+        # version of `D` to add to `schur_complement`. Any entries that are repeated on
+        # different subdomains will be taken care of when the local contributions to
+        # `schur_complement` are added together in the `MPI.Reduce!()` below, as there may be
+        # non-zero contributions to some entries from multiple subdomains.
+        if length(local_bottom_vector_repeats) > 0
+            for j ∈ 1:size(D, 2), (to, from) ∈ eachcol(local_bottom_vector_repeats_partial)
+                D[to,j] += D[from,j]
+            end
+            synchronize_shared()
+        end
+        if length(D_local_column_repeats) > 0
+            for (to, from) ∈ eachcol(D_local_column_repeats_partial)
+                @views D[:,to] .+= D[:,from]
+            end
+        end
+        for (j1, j2) ∈ zip(D_global_column_range_partial, D_local_column_range_partial), (i1, i2) ∈ zip(unique_bottom_vector_entries, local_bottom_vector_unique_entries)
+            schur_complement[i1,j1] += D[i2,j2]
+        end
+        synchronize_shared()
+        if shared_rank == 0 && distributed_nproc > 1
+            MPI.Reduce!(schur_complement, +, distributed_comm; root=0)
+        end
+
+        if isa(schur_complement_factorization, LU)
+            # `schur_complement` has been gathered/assembled onto the global rank-0
+            # process, and is now LU-factorized in serial.
+            # Unless the original matrices were all block-diagonal in some consistent
+            # way (in which case the solve could probably be done more efficiently by
+            # splitting the full matrix into the disconnected pieces),
+            # `schur_complement` will generally be a dense matrix, so not worth having
+            # an option for a sparse LU factorization here. Possibly this LU
+            # factorization (and the corresponding `ldiv!()` using
+            # `schur_complement_factorization`) could be parallelised with shared
+            # memory and/or distributed MPI, but we expect this step not to be a
+            # bottleneck, so it is done in serial (at least for now).
+            factors = schur_complement_factorization.factors
+            factors .= schur_complement
+            ipiv = schur_complement_factorization.ipiv
+            LAPACK.getrf!(factors, ipiv; check=check_lu)
+        elseif !isa(schur_complement_factorization, Nothing)
+            synchronize_shared()
+            lu!(schur_complement_factorization, schur_complement)
+        end
+    end
+
+    return nothing
+end
+
 """
     update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
                              C::AbstractMatrix, D::AbstractMatrix)
@@ -1063,257 +1341,10 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
         @boundscheck length(sc.owned_bottom_vector_entries) == size(D, 1) || error(BoundsError, " Number of rows in D does not match number of locally owned bottom_vector_entries")
         @boundscheck length(sc.D_local_column_range_partial) == 0 || maximum(sc.D_local_column_range_partial) ≤ size(D, 2) || error(BoundsError, " Number of columns in D is smaller than the largest index in D_local_column_range")
 
-        A_factorization = sc.A_factorization
-        Ainv_dot_B = sc.Ainv_dot_B
-        Ainv_dot_B_local = sc.Ainv_dot_B_local
-        B_column_range_partial = sc.B_column_range_partial
-        B_global_column_range_partial = sc.B_global_column_range_partial
-        B_local_column_range = sc.B_local_column_range
-        B_local_column_range_partial = sc.B_local_column_range_partial
-        B_local_column_repeats_partial = sc.B_local_column_repeats_partial
-        C_global_row_range_partial = sc.C_global_row_range_partial
-        C_local_row_range_partial = sc.C_local_row_range_partial
-        C_local_row_repeats_partial = sc.C_local_row_repeats_partial
-        C_dot_Ainv_dot_B = sc.C_dot_Ainv_dot_B
-        D_global_column_range_partial = sc.D_global_column_range_partial
-        D_local_column_range_partial = sc.D_local_column_range_partial
-        D_local_column_repeats = sc.D_local_column_repeats
-        D_local_column_repeats_partial = sc.D_local_column_repeats_partial
-        schur_complement = sc.schur_complement
-        schur_complement_local_range_partial = sc.schur_complement_local_range_partial
-        parallel_schur = sc.parallel_schur
-        local_top_vector_repeats = sc.local_top_vector_repeats
-        local_top_vector_repeats_partial = sc.local_top_vector_repeats_partial
-        unique_bottom_vector_entries = sc.unique_bottom_vector_entries
-        global_bottom_vector_range_partial = sc.global_bottom_vector_range_partial
-        local_bottom_vector_unique_entries = sc.local_bottom_vector_unique_entries
-        local_bottom_vector_repeats = sc.local_bottom_vector_repeats
-        local_bottom_vector_repeats_partial = sc.local_bottom_vector_repeats_partial
-        local_top_vector_range_partial = sc.local_top_vector_range_partial
-        local_top_vector_unique_entries_partial = sc.local_top_vector_unique_entries_partial
-        local_top_vector_overlaps = sc.local_top_vector_overlaps
-        B_overlap_buffers_send = sc.B_overlap_buffers_send
-        B_overlap_buffers_recv = sc.B_overlap_buffers_recv
-        overlap_ranks = sc.overlap_ranks
-        distributed_comm = sc.distributed_comm
-        distributed_rank = sc.distributed_rank
-        distributed_nproc = sc.distributed_nproc
-        shared_rank = sc.shared_rank
-        synchronize_shared = sc.synchronize_shared
-        use_sparse = sc.use_sparse
-        separate_Ainv_B = sc.separate_Ainv_B
-        check_lu = sc.check_lu
-
-        # When `A===missing`, this was called from the `mpi_schur_complement()` constructor,
-        # where we assume `A_factorization` was already initialized.
-        if A !== missing
-            @sc_timeit timer "lu(A)" begin
-                lu!(A_factorization, A)
-            end
-        end
-
-        @sc_timeit timer "Ainv_dot_B" begin
-            # Use `Ainv_dot_B` as a local-rows/global-columns sized buffer to collect `B` into.
-            # This is slightly inefficient, as there will be chunks that are all-zero that we do
-            # not need to collect, but this way seems the simplest to implement, as we need the
-            # not-locally-owned columns of B in all locally owned rows, to pass to `ldiv!()`
-            # below.
-            # When there are repeated entries in `B`, need to add them up into a single entry, and
-            # then copy this entry into all the repeated positions. This converts the columns of
-            # `B` into 'vectors' (with the same structure as `u`) that can be passed to
-            # `A_factorization` to find `Ainv_dot_B`.
-            if isa(Ainv_dot_B, AbstractSparseMatrix)
-                Ainv_dot_B_colptr = Ainv_dot_B.colptr
-                Ainv_dot_B_nzval = Ainv_dot_B.nzval
-                Ainv_dot_B_first_i = Ainv_dot_B_colptr[B_column_range_partial[1]]
-                Ainv_dot_B_last_i = Ainv_dot_B_colptr[B_column_range_partial[end]+1] - 1
-                Ainv_dot_B_nzval[Ainv_dot_B_first_i:Ainv_dot_B_last_i] .= 0.0
-            else
-                Ainv_dot_B[:,B_column_range_partial] .= 0
-            end
-            if length(local_top_vector_repeats) > 0 || length(local_bottom_vector_repeats) > 0
-                # Add up entries that are repeated on this subdomain.
-                for j ∈ 1:size(B, 2), (to, from) ∈ eachcol(local_top_vector_repeats_partial)
-                    B[to,j] += B[from,j]
-                end
-                synchronize_shared()
-                for (to, from) ∈ eachcol(B_local_column_repeats_partial)
-                    @views B[:,to] .+= B[:,from]
-                end
-            else
-                synchronize_shared()
-            end
-            if isa(Ainv_dot_B, AbstractSparseMatrix)
-                B_sparse = sparse(@view B[:,B_local_column_range_partial])
-                B_colptr = B_sparse.colptr
-                B_rowval = B_sparse.rowval
-                B_nzval = B_sparse.nzval
-                for (j2, j1) ∈ enumerate(B_global_column_range_partial)
-                    Bi_start = B_colptr[j2]
-                    Bi_end = B_colptr[j2+1] - 1
-                    for Bi ∈ Bi_start:Bi_end
-                        i = B_rowval[Bi]
-                        Ainv_dot_B[i, j1] = B_nzval[Bi]
-                    end
-                end
-            else
-                for (j1, j2) ∈ zip(B_global_column_range_partial, B_local_column_range_partial), i ∈ 1:size(Ainv_dot_B, 1)
-                    Ainv_dot_B[i,j1] = B[i,j2]
-                end
-            end
-            synchronize_shared()
-
-            # Add up the rows of B that overlap between different subdomains (temporarily stored
-            # in `Ainv_dot_B`).  Note only non-repeated points in the overlaps are communicated,
-            # to reduce the amount of communication.
-            if shared_rank == 0
-                reqs = MPI.Request[]
-                for (overlap_range, buffer_send, buffer_recv, overlap_rank) ∈
-                        zip(local_top_vector_overlaps, B_overlap_buffers_send,
-                            B_overlap_buffers_recv, overlap_ranks)
-                    for j ∈ 1:size(Ainv_dot_B, 2), (i1, i2) ∈ enumerate(overlap_range)
-                        buffer_send[i1,j] = Ainv_dot_B[i2,j]
-                    end
-                    # Iallreduce seems not to be included in the nice Julia API, so have to use
-                    # lower level call here.
-                    push!(reqs, MPI.Isend(buffer_send, distributed_comm; dest=overlap_rank))
-                    push!(reqs, MPI.Irecv!(buffer_recv, distributed_comm; source=overlap_rank))
-                end
-                MPI.Waitall(reqs)
-                for (overlap_range, buffer) ∈ zip(local_top_vector_overlaps, B_overlap_buffers_recv)
-                    for j ∈ 1:size(Ainv_dot_B, 2), (i2, i1) ∈ enumerate(overlap_range)
-                        Ainv_dot_B[i1,j] += buffer[i2,j]
-                    end
-                end
-            end
-            synchronize_shared()
-            if length(local_top_vector_repeats) > 0
-                # Now that overlaps have been comunicated, all contributions have been added the
-                # 'to' places, so we can now copy back these periodic entries to the 'from'
-                # places.
-                for j ∈ 1:size(Ainv_dot_B, 2), (to, from) ∈ eachcol(local_top_vector_repeats_partial)
-                    Ainv_dot_B[from,j] = Ainv_dot_B[to,j]
-                end
-                if !separate_Ainv_B
-                    synchronize_shared()
-                end
-            end
-
-            # At this point `Ainv_dot_B` contains the dense array of `B`.
-            if separate_Ainv_B
-                update_sparse_matrix!(sc.B, sparse(@view Ainv_dot_B[local_top_vector_unique_entries_partial,:]))
-                synchronize_shared()
-            end
-            ldiv!(A_factorization, Ainv_dot_B)
-        end
-
-        @sc_timeit timer "C" begin
-            # A representation of C is stored where no rows are repeated, so need to add up all
-            # contributions from repeated row indices into a single row (that will then be
-            # included in the stored `sc.C`, i.e. the 'to' rows are included in
-            # `sc.C_local_row_range_partial` while the 'from' rows are not).
-            for j ∈ 1:size(C, 2), (to, from) ∈ eachcol(C_local_row_repeats_partial)
-                C[to,j] += C[from,j]
-            end
-            # When using shared memory, only store the slice of C that this process needs.
-            if use_sparse
-                C = @view C[sc.C_local_row_range_partial,:]
-                C = sparsecsr(C)
-                update_sparse_matrix!(sc.C, C)
-            else
-                # Make a copy because C_local_row_range_partial might not be a contiguous range of
-                # indices, but performance will be better if `C` is a contiguously-allocated
-                # array.
-                sc_C = sc.C
-                for j ∈ 1:size(C, 2), (i1, i2) ∈ enumerate(sc.C_local_row_range_partial)
-                    sc_C[i1,j] = C[i2,j]
-                end
-                C = sc_C
-            end
-        end
-
-        @sc_timeit timer "schur_complement" begin
-            # Initialise `schur_complement` to zero, because when `C` does not include all rows,
-            # the matrix multiplication below would not initialise all elements.
-            for j ∈ schur_complement_local_range_partial
-                schur_complement[:,j] .= 0.0
-            end
-            synchronize_shared()
-
-            # Read out the local entries of `Ainv_dot_B` here, rather than just after `Ainv_dot_B`
-            # is calculated, in order to avoid adding another `synchronize_shared()` call.
-            if !separate_Ainv_B
-                if isa(Ainv_dot_B_local, SparseMatrixCSC)
-                    update_sparse_matrix!(Ainv_dot_B_local,
-                                          sparse(@view(Ainv_dot_B[local_top_vector_unique_entries_partial,:])))
-                else
-                    # Note that we need to transpose Ainv_dot_B_local for the slightly
-                    # hacked matrix-vector multiply implementation used in `ldiv!()` to
-                    # ensure consistency of results.
-                    for i ∈ 1:size(Ainv_dot_B_local, 1), (j1, j2) ∈ enumerate(local_top_vector_unique_entries_partial)
-                        Ainv_dot_B_local[i,j1] = Ainv_dot_B[j2,i]
-                    end
-                end
-            end
-
-            # We store locally all columns in `Ainv_dot_B` (only local rows) and all rows of `C`
-            # (only local columns). Therefore we can take the matrix product `Ainv_dot_B*C` with
-            # the local chunks, then do a sum-reduce to get the final result. The
-            # `schur_complement` buffer is full size on every rank.
-            mul!(C_dot_Ainv_dot_B, C, Ainv_dot_B, -1.0, 0.0)
-            for j ∈ 1:size(schur_complement, 2), (i2, i1) ∈ enumerate(C_global_row_range_partial)
-                schur_complement[i1,j] = C_dot_Ainv_dot_B[i2,j]
-            end
-            synchronize_shared()
-            # Only get the local rows for D, so just add these to the local rows of
-            # `schur_complement`.
-            # As `schur_Complement` does not have any repeated entries, need to add up any locally
-            # repeated entries of D (columns then rows) so that we can then select the 'assembled'
-            # version of `D` to add to `schur_complement`. Any entries that are repeated on
-            # different subdomains will be taken care of when the local contributions to
-            # `schur_complement` are added together in the `MPI.Reduce!()` below, as there may be
-            # non-zero contributions to some entries from multiple subdomains.
-            if length(local_bottom_vector_repeats) > 0
-                for j ∈ 1:size(D, 2), (to, from) ∈ eachcol(local_bottom_vector_repeats_partial)
-                    D[to,j] += D[from,j]
-                end
-                synchronize_shared()
-            end
-            if length(D_local_column_repeats) > 0
-                for (to, from) ∈ eachcol(D_local_column_repeats_partial)
-                    @views D[:,to] .+= D[:,from]
-                end
-            end
-            for (j1, j2) ∈ zip(D_global_column_range_partial, D_local_column_range_partial), (i1, i2) ∈ zip(unique_bottom_vector_entries, local_bottom_vector_unique_entries)
-                schur_complement[i1,j1] += D[i2,j2]
-            end
-            synchronize_shared()
-            if shared_rank == 0 && distributed_nproc > 1
-                MPI.Reduce!(schur_complement, +, distributed_comm; root=0)
-            end
-
-            if parallel_schur
-                synchronize_shared()
-                lu!(sc.schur_complement_factorization, schur_complement)
-            elseif shared_rank == 0 && distributed_rank == 0
-                # `schur_complement` has been gathered/assembled onto the global rank-0
-                # process, and is now LU-factorized in serial.
-                # Unless the original matrices were all block-diagonal in some consistent
-                # way (in which case the solve could probably be done more efficiently by
-                # splitting the full matrix into the disconnected pieces),
-                # `schur_complement` will generally be a dense matrix, so not worth having
-                # an option for a sparse LU factorization here. Possibly this LU
-                # factorization (and the corresponding `ldiv!()` using
-                # `sc.schur_complement_factorization`) could be parallelised with shared
-                # memory and/or distributed MPI, but we expect this step not to be a
-                # bottleneck, so it is done in serial (at least for now).
-                schur_complement_factorization = sc.schur_complement_factorization
-                factors = schur_complement_factorization.factors
-                factors .= schur_complement
-                ipiv = schur_complement_factorization.ipiv
-                LAPACK.getrf!(factors, ipiv; check=check_lu)
-            end
-        end
+        update_A_factorization!(sc, A)
+        update_Ainv_dot_B!(sc, B)
+        new_C = update_C!(sc, C)
+        update_schur_complement_factorization!(sc, D, new_C)
     end
 
     return nothing
