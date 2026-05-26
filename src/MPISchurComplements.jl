@@ -1272,8 +1272,19 @@ function update_schur_complement_factorization!(sc, D, new_C)
     @sc_timeit timer "schur_complement" begin
         # Initialise `schur_complement` to zero, because when `new_C` does not include all rows,
         # the matrix multiplication below would not initialise all elements.
-        for j ∈ schur_complement_local_range_partial
-            schur_complement[:,j] .= 0.0
+        if issparse(schur_complement)
+            schur_colptr = schur_complement.colptr
+            schur_nzval = schur_complement.nzval
+            for j ∈ schur_complement_local_range_partial
+                for flat_i ∈ schur_colptr[j]:schur_colptr[j+1]-1
+                    schur_nzval[j] = 0.0
+                end
+            end
+        else
+            nrows = size(schur_complement)
+            for j ∈ schur_complement_local_range_partial, i ∈ 1:nrows
+                schur_complement[i,j] = 0.0
+            end
         end
         synchronize_shared()
 
@@ -1304,8 +1315,21 @@ function update_schur_complement_factorization!(sc, D, new_C)
         else
             mul!(C_dot_Ainv_dot_B, new_C, Ainv_dot_B, -1.0, 0.0)
         end
-        for j ∈ 1:size(schur_complement, 2), (i2, i1) ∈ enumerate(C_global_row_range_partial)
-            schur_complement[i1,j] = C_dot_Ainv_dot_B[i2,j]
+        if issparse(C_dot_Ainv_dot_B)
+            C_dot_Ainv_dot_B_colptr = C_dot_Ainv_dot_B.colptr
+            C_dot_Ainv_dot_B_rowval = C_dot_Ainv_dot_B.rowval
+            C_dot_Ainv_dot_B_nzval = C_dot_Ainv_dot_B.nzval
+            for j ∈ 1:size(schur_complement, 2)
+                for flat_i ∈ C_dot_Ainv_dot_B_colptr[j]:C_dot_Ainv_dot_B_colptr[j+1]-1
+                    i = C_dot_Ainv_dot_B_rowval[flat_i]
+                    global_i = C_global_row_range_partial[i]
+                    schur_complement[global_i,j] = C_dot_Ainv_dot_B_nzval[flat_i]
+                end
+            end
+        else
+            for j ∈ 1:size(schur_complement, 2), (i2, i1) ∈ enumerate(C_global_row_range_partial)
+                schur_complement[i1,j] = C_dot_Ainv_dot_B[i2,j]
+            end
         end
         synchronize_shared()
         # Only get the local rows for D, so just add these to the local rows of
@@ -1327,8 +1351,21 @@ function update_schur_complement_factorization!(sc, D, new_C)
                 @views D[:,to] .+= D[:,from]
             end
         end
-        for (j1, j2) ∈ zip(D_global_column_range_partial, D_local_column_range_partial), (i1, i2) ∈ zip(unique_bottom_vector_entries, local_bottom_vector_unique_entries)
-            schur_complement[i1,j1] += D[i2,j2]
+        if issparse(D)
+            D_sparse = sparse(@view D[:,D_local_column_range_partial])
+            D_colptr = D_sparse.colptr
+            D_rowval = D_sparse.rowval
+            D_nzval = D_sparse.nzval
+            for (j2, j1) ∈ enumerate(D_global_column_range_partial)
+                for flat_i ∈ D_colptr[j2]:D_colptr[j2+1]-1
+                    i = D_rowval[flat_i]
+                    schur_complement[i,j1] += D_nzval[flat_i]
+                end
+            end
+        else
+            for (j1, j2) ∈ zip(D_global_column_range_partial, D_local_column_range_partial), (i1, i2) ∈ zip(unique_bottom_vector_entries, local_bottom_vector_unique_entries)
+                schur_complement[i1,j1] += D[i2,j2]
+            end
         end
         synchronize_shared()
         if shared_rank == 0 && distributed_nproc > 1
