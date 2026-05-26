@@ -8,7 +8,7 @@ import LinearAlgebra: ldiv!
 using MPI
 using MPIDenseLUs
 using SparseArrays
-using SparseArrays: FixedSparseCSC
+using SparseArrays: FixedSparseCSC, AbstractSparseMatrixCSC
 using SparseMatricesCSR
 using TimerOutputs
 
@@ -308,6 +308,169 @@ function update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
     end
     push!(colptr, count)
     return nothing
+end
+
+function get_partial_FixedSparseCSC_buffer(row_range, existing_buffer, data_type)
+    # Initialize buffer with the same non-zero pattern as existing_buffer, but only for a
+    # subset of rows given by row_range.
+    ncol = size(existing_buffer, 2)
+    if isempty(row_range)
+        return FixedSparseCSC(0, ncol, ones(Int64, ncol + 1), Int64[], zeros(data_type, 0))
+    end
+    colptr = Int64[1]
+    rowval = Int64[]
+    firstrow = first(row_range)
+    lastrow = last(row_range)
+    existing_colptr = existing_buffer.colptr
+    existing_rowval = existing_buffer.rowval
+    for j ∈ 1:ncol
+        existing_col_start = existing_colptr[j]
+        existing_col_end = existing_colptr[j+1]-1
+        existing_col_rowval = @view existing_rowval[existing_col_start:existing_col_end]
+        n_existing = existing_col_end - existing_col_start + 1
+        if n_existing == 0 || first(existing_col_rowval) > lastrow || last(existing_col_rowval) < firstrow
+            # Definitely no overlapping entries in this column, so skip.
+            push!(colptr, length(rowval) + 1)
+            continue
+        end
+        count = max(searchsortedlast(existing_col_rowval, firstrow) - 1, 1)
+        for (i, i_global) ∈ enumerate(row_range)
+            while count ≤ n_existing && existing_col_rowval[count] < i_global
+                count += 1
+            end
+            if count > n_existing
+                break
+            end
+            if existing_col_rowval[count] == i_global
+                push!(rowval, i)
+            end
+        end
+        push!(colptr, length(rowval) + 1)
+    end
+    nzval = zeros(data_type, length(rowval))
+    buffer = FixedSparseCSC(length(row_range), ncol, colptr, rowval, nzval)
+    return buffer
+end
+
+# SparseMatrixCSR multiplying SparseMatrixCSC currently (26/5/2026) uses the generic
+# AbstractMatrix implementation, which is very slow. The following is a more optimised
+# implementation. Adapted from `SparseArrays._spmatmul!(C, A, B, α, β)`.
+# SparseArrays.jl license:
+### MIT License
+###
+### Copyright (c) 2018-2024 SparseArrays.jl contributors: https://github.com/JuliaSparse/SparseArrays.jl/contributors
+###
+### Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+###
+### The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+###
+### THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+# Slow non-inlined functions for throwing the error without messing up the caller
+@noinline function _matmul_size_error(mC, nC, mA, nA, mB, nB, At, Bt)
+    if At == 'N'
+        Anames = "first", "second"
+    else
+        Anames = "second", "first"
+    end
+    if Bt == 'N'
+        Bnames = "first", "second"
+    else
+        Bnames = "second", "first"
+    end
+    nA == mB ||
+        throw(DimensionMismatch("$(Anames[2]) dimension of A, $nA, does not match the $(Bnames[1]) dimension of B, $mB"))
+    mA == mC ||
+        throw(DimensionMismatch("$(Anames[1]) dimension of A, $mA, does not match the first dimension of C, $mC"))
+    nB == nC ||
+        throw(DimensionMismatch("$(Bnames[2]) dimension of B, $nB, does not match the second dimension of C, $nC"))
+    # unreachable
+    throw(DimensionMismatch("Unknown dimension mismatch"))
+end
+# `_matmul_size_AB()`, that SparseArrays uses in _spmul!(), is an internal function in
+# SparseArrays which might change in future, so just copy a slightly simplified version
+# here to avoid having to follow any changes.
+@inline function _matmul_size(C, A, B)
+    mC = size(C, 1)
+    nC = size(C, 2)
+    mA = size(A, 1)
+    nA = size(A, 2)
+    mB = size(B, 1)
+    nB = size(B, 2)
+
+    if (nA != mB) | (mA != mC) | (nB != nC)
+        _matmul_size_error(mC, nC, mA, nA, mB, nB, At, Bt)
+    end
+    return mC, nC, mA, nA, mB, nB
+end
+function csr_mul!(C::AbstractSparseMatrixCSC{Tf}, A::SparseMatrixCSR{Bi,Tf},
+                  B::AbstractSparseMatrixCSC{Tf}, α::Number, β::Number) where {Bi,Tf}
+    if Bi != 1
+        error("Only 1-based indexing supported here")
+    end
+    Cax2 = axes(C, 2)
+    Aax1 = axes(A, 1)
+    mC, nC, mA, nA, mB, nB = _matmul_size(C, A, B)
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    rp = A.rowptr
+    isone(β) || LinearAlgebra._rmul_or_fill!(C, β)
+    if α isa Bool && !α
+        return
+    end
+    Bcp = B.colptr
+    Brv = rowvals(B)
+    Bnz = nonzeros(B)
+    Ccp = C.colptr
+    Crv = rowvals(C)
+    Cnz = nonzeros(C)
+    @inbounds for k in Cax2
+        B_flat_start = Bcp[k]
+        B_flat_end = Bcp[k+1]-1
+        Bcol_rv = @view Brv[B_flat_start:B_flat_end]
+        Bcol_nz = @view Bnz[B_flat_start:B_flat_end]
+        nb = B_flat_end - B_flat_start + 1
+        C_flat_start = Ccp[k]
+        C_flat_end = Ccp[k+1]-1
+        Ccol_rv = @view Crv[C_flat_start:C_flat_end]
+        Ccol_nz = @view Cnz[C_flat_start:C_flat_end]
+        nc = C_flat_end - C_flat_start + 1
+        C_count = max(searchsortedlast(Ccol_rv, first(Aax1)) - 1, 1)
+        for row in Aax1
+            temp = zero(Tf)
+            firstj = rp[row]
+            lastj = rp[row+1]-1
+            if lastj < firstj
+                # No entries on this row.
+                continue
+            end
+            B_count = max(searchsortedlast(Bcol_rv, cv[firstj]) - 1, 1)
+            for j in firstj:lastj
+                cvj = cv[j]
+                while B_count ≤ nb && Bcol_rv[B_count] < cvj
+                    B_count += 1
+                end
+                if B_count ≤ nb && Bcol_rv[B_count] == cvj
+                    temp = muladd(nzv[j], Bcol_nz[B_count], temp)
+                end
+            end
+            temp = α isa Bool ? temp : temp * α
+            if temp != zero(Tf)
+                if isa(C, FixedSparseCSC)
+                    # Non-zero pattern must already be set.
+                    while Ccol_rv[C_count] < row
+                        C_count += 1
+                    end
+                    if Ccol_rv[C_count] != row
+                        error("Attempting to insert into structural zero of C.")
+                    end
+                    Ccol_nz[C_count] = temp
+                else
+                    C[row,k] = temp
+                end
+            end
+        end
+    end
+    return C
 end
 
 """
@@ -929,8 +1092,14 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     # C_dot_Ainv_dot_u and C_dot_Ainv_dot_B are purely local buffers.
     C_dot_Ainv_dot_u = Vector{data_type}(undef, length(C_global_row_range_partial))
     if sparse_Ainv_B
-        C_dot_Ainv_dot_B = spzeros(data_type, length(C_global_row_range_partial),
-                                   bottom_vec_global_size)
+        if isa(schur_complement_buffer, FixedSparseCSC)
+            C_dot_Ainv_dot_B =
+                get_partial_FixedSparseCSC_buffer(C_global_row_range_partial,
+                                                  schur_complement_buffer, data_type)
+        else
+            C_dot_Ainv_dot_B = spzeros(data_type, length(C_global_row_range_partial),
+                                       bottom_vec_global_size)
+        end
     else
         C_dot_Ainv_dot_B = Matrix{data_type}(undef, length(C_global_row_range_partial),
                                              bottom_vec_global_size)
@@ -1259,7 +1428,11 @@ function update_schur_complement_factorization!(sc, D, new_C)
         # (only local columns). Therefore we can take the matrix product `Ainv_dot_B*C` with
         # the local chunks, then do a sum-reduce to get the final result. The
         # `schur_complement` buffer is full size on every rank.
-        mul!(C_dot_Ainv_dot_B, new_C, Ainv_dot_B, -1.0, 0.0)
+        if isa(new_C, SparseMatrixCSR) && isa(Ainv_dot_B, AbstractSparseMatrixCSC)
+            csr_mul!(C_dot_Ainv_dot_B, new_C, Ainv_dot_B, -1.0, 0.0)
+        else
+            mul!(C_dot_Ainv_dot_B, new_C, Ainv_dot_B, -1.0, 0.0)
+        end
         for j ∈ 1:size(schur_complement, 2), (i2, i1) ∈ enumerate(C_global_row_range_partial)
             schur_complement[i1,j] = C_dot_Ainv_dot_B[i2,j]
         end
