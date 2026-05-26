@@ -338,18 +338,52 @@ function csr_mul!(C::AbstractSparseMatrixCSC{Tf}, A::SparseMatrixCSR{Bi,Tf},
     if α isa Bool && !α
         return
     end
-    fixed_B = SparseArrays._fix_size(B, mB, nB)
-    fixed_C = SparseArrays._fix_size(C, mC, nC)
+    Bcp = B.colptr
+    Brv = rowvals(B)
+    Bnz = nonzeros(B)
+    Ccp = C.colptr
+    Crv = rowvals(C)
+    Cnz = nonzeros(C)
     @inbounds for k in Cax2
+        B_flat_start = Bcp[k]
+        B_flat_end = Bcp[k+1]-1
+        Bcol_rv = @view Brv[B_flat_start:B_flat_end]
+        Bcol_nz = @view Bnz[B_flat_start:B_flat_end]
+        nb = B_flat_end - B_flat_start + 1
+        C_flat_start = Ccp[k]
+        C_flat_end = Ccp[k+1]-1
+        Ccol_rv = @view Crv[C_flat_start:C_flat_end]
+        Ccol_nz = @view Cnz[C_flat_start:C_flat_end]
+        nc = C_flat_end - C_flat_start + 1
+        C_count = max(searchsortedlast(Ccol_rv, first(Aax1)) - 1, 1)
         for row in Aax1
             temp = zero(Tf)
-            for j in rp[row]:rp[row+1]-1
+            firstj = rp[row]
+            lastj = rp[row+1]-1
+            B_count = max(searchsortedlast(Bcol_rv, cv[firstj]) - 1, 1)
+            for j in firstj:lastj
                 cvj = cv[j]
-                temp = muladd(nzv[j], fixed_B[cvj,k], temp)
+                while B_count ≤ nb && Bcol_rv[B_count] < cvj
+                    B_count += 1
+                end
+                if B_count ≤ nb && Bcol_rv[B_count] == cvj
+                    temp = muladd(nzv[j], Bcol_nz[B_count], temp)
+                end
             end
             temp = α isa Bool ? temp : temp * α
             if temp != zero(Tf)
-                fixed_C[row, k] = temp
+                if isa(C, FixedSparseCSC)
+                    # Non-zero pattern must already be set.
+                    while Ccol_rv[C_count] < row
+                        C_count += 1
+                    end
+                    if Ccol_rv[C_count] != row
+                        error("Attempting to insert into structural zero of C.")
+                    end
+                    Ccol_nz[C_count] = temp
+                else
+                    C[row,k] = temp
+                end
             end
         end
     end
@@ -969,8 +1003,38 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     # C_dot_Ainv_dot_u and C_dot_Ainv_dot_B are purely local buffers.
     C_dot_Ainv_dot_u = Vector{data_type}(undef, length(C_global_row_range_partial))
     if sparse_Ainv_B
-        C_dot_Ainv_dot_B = spzeros(data_type, length(C_global_row_range_partial),
-                                   bottom_vec_global_size)
+        if isa(schur_complement_buffer, FixedSparseCSC)
+            # Initialize C_dot_Ainv_dot_B with the same non-zero pattern as schur_complement_buffer.
+            C_dot_Ainv_dot_B_colptr = Int64[1]
+            C_dot_Ainv_dot_B_rowval = Int64[]
+            sc_colptr = schur_complement_buffer.colptr
+            sc_rowval = schur_complement_buffer.rowval
+            ncol = size(schur_complement_buffer, 2)
+            for j ∈ 1:ncol
+                sc_col_start = sc_colptr[j]
+                sc_col_end = sc_colptr[j+1]-1
+                sc_col_rowval = @view sc_rowval[sc_col_start:sc_col_end]
+                nsc = sc_col_end - sc_col_start + 1
+                count = 1
+                for (i, i_global) ∈ enumerate(C_global_row_range_partial)
+                    while count ≤ nsc && sc_col_rowval[count] < i_global
+                        count += 1
+                    end
+                    if count ≤ nsc && sc_col_rowval[count] == i_global
+                        push!(C_dot_Ainv_dot_B_rowval, i)
+                    end
+                end
+                push!(C_dot_Ainv_dot_B_colptr, length(C_dot_Ainv_dot_B_rowval) + 1)
+            end
+            C_dot_Ainv_dot_B_nzval = zeros(data_type, length(C_dot_Ainv_dot_B_rowval))
+            C_dot_Ainv_dot_B = FixedSparseCSC(length(C_global_row_range_partial), ncol,
+                                              C_dot_Ainv_dot_B_colptr,
+                                              C_dot_Ainv_dot_B_rowval,
+                                              C_dot_Ainv_dot_B_nzval)
+        else
+            C_dot_Ainv_dot_B = spzeros(data_type, length(C_global_row_range_partial),
+                                       bottom_vec_global_size)
+        end
     else
         C_dot_Ainv_dot_B = Matrix{data_type}(undef, length(C_global_row_range_partial),
                                              bottom_vec_global_size)
@@ -1281,7 +1345,7 @@ function update_schur_complement_factorization!(sc, D, new_C)
                 end
             end
         else
-            nrows = size(schur_complement)
+            nrows = size(schur_complement, 2)
             for j ∈ schur_complement_local_range_partial, i ∈ 1:nrows
                 schur_complement[i,j] = 0.0
             end
