@@ -8,7 +8,7 @@ import LinearAlgebra: ldiv!
 using MPI
 using MPIDenseLUs
 using SparseArrays
-using SparseArrays: FixedSparseCSC
+using SparseArrays: FixedSparseCSC, AbstractSparseMatrixCSC
 using SparseMatricesCSR
 using TimerOutputs
 
@@ -308,6 +308,52 @@ function update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
     end
     push!(colptr, count)
     return nothing
+end
+
+# SparseMatrixCSR multiplying SparseMatrixCSC currently (26/5/2026) uses the generic
+# AbstractMatrix implementation, which is very slow. The following is a more optimised
+# implementation. Adapted from `SparseArrays._spmatmul!(C, A, B, α, β)`.
+# SparseArrays.jl license:
+### MIT License
+###
+### Copyright (c) 2018-2024 SparseArrays.jl contributors: https://github.com/JuliaSparse/SparseArrays.jl/contributors
+###
+### Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+###
+### The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+###
+### THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+function csr_mul!(C::AbstractSparseMatrixCSC{Tf}, A::SparseMatrixCSR{Bi,Tf},
+                  B::AbstractSparseMatrixCSC{Tf}, α::Number, β::Number) where {Bi,Tf}
+    if Bi != 1
+        error("Only 1-based indexing supported here")
+    end
+    Cax2 = axes(C, 2)
+    Aax1 = axes(A, 1)
+    mC, nC, mA, nA, mB, nB = SparseArrays._matmul_size_AB(C, A, B)
+    nzv = nonzeros(A)
+    cv = colvals(A)
+    rp = A.rowptr
+    isone(β) || LinearAlgebra._rmul_or_fill!(C, β)
+    if α isa Bool && !α
+        return
+    end
+    fixed_B = SparseArrays._fix_size(B, mB, nB)
+    fixed_C = SparseArrays._fix_size(C, mC, nC)
+    @inbounds for k in Cax2
+        for row in Aax1
+            temp = zero(Tf)
+            for j in rp[row]:rp[row+1]-1
+                cvj = cv[j]
+                temp = muladd(nzv[j], fixed_B[cvj,k], temp)
+            end
+            temp = α isa Bool ? temp : temp * α
+            if temp != zero(Tf)
+                fixed_C[row, k] = temp
+            end
+        end
+    end
+    return C
 end
 
 """
@@ -1253,7 +1299,11 @@ function update_schur_complement_factorization!(sc, D, new_C)
         # (only local columns). Therefore we can take the matrix product `Ainv_dot_B*C` with
         # the local chunks, then do a sum-reduce to get the final result. The
         # `schur_complement` buffer is full size on every rank.
-        mul!(C_dot_Ainv_dot_B, new_C, Ainv_dot_B, -1.0, 0.0)
+        if isa(new_C, SparseMatrixCSR) && isa(Ainv_dot_B, AbstractSparseMatrixCSC)
+            csr_mul!(C_dot_Ainv_dot_B, new_C, Ainv_dot_B, -1.0, 0.0)
+        else
+            mul!(C_dot_Ainv_dot_B, new_C, Ainv_dot_B, -1.0, 0.0)
+        end
         for j ∈ 1:size(schur_complement, 2), (i2, i1) ∈ enumerate(C_global_row_range_partial)
             schur_complement[i1,j] = C_dot_Ainv_dot_B[i2,j]
         end
