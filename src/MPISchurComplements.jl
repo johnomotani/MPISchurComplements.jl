@@ -402,6 +402,10 @@ function csr_mul!(C::AbstractSparseMatrixCSC{Tf}, A::SparseMatrixCSR{Bi,Tf},
             temp = zero(Tf)
             firstj = rp[row]
             lastj = rp[row+1]-1
+            if lastj < firstj
+                # No entries on this row.
+                continue
+            end
             B_count = max(searchsortedlast(Bcol_rv, cv[firstj]) - 1, 1)
             for j in firstj:lastj
                 cvj = cv[j]
