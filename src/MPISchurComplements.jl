@@ -310,6 +310,48 @@ function update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
     return nothing
 end
 
+function get_partial_FixedSparseCSC_buffer(row_range, existing_buffer, data_type)
+    # Initialize buffer with the same non-zero pattern as existing_buffer, but only for a
+    # subset of rows given by row_range.
+    ncol = size(existing_buffer, 2)
+    if isempty(row_range)
+        return FixedSparseCSC(0, ncol, ones(Int64, ncol + 1), Int64[], zeros(data_type, 0))
+    end
+    colptr = Int64[1]
+    rowval = Int64[]
+    firstrow = first(row_range)
+    lastrow = last(row_range)
+    existing_colptr = existing_buffer.colptr
+    existing_rowval = existing_buffer.rowval
+    for j ∈ 1:ncol
+        existing_col_start = existing_colptr[j]
+        existing_col_end = existing_colptr[j+1]-1
+        existing_col_rowval = @view existing_rowval[existing_col_start:existing_col_end]
+        n_existing = existing_col_end - existing_col_start + 1
+        if n_existing == 0 || first(existing_col_rowval) > lastrow || last(existing_col_rowval) < firstrow
+            # Definitely no overlapping entries in this column, so skip.
+            push!(colptr, length(rowval) + 1)
+            continue
+        end
+        count = max(searchsortedlast(existing_col_rowval, firstrow) - 1, 1)
+        for (i, i_global) ∈ enumerate(row_range)
+            while count ≤ n_existing && existing_col_rowval[count] < i_global
+                count += 1
+            end
+            if count > n_existing
+                break
+            end
+            if existing_col_rowval[count] == i_global
+                push!(rowval, i)
+            end
+        end
+        push!(colptr, length(rowval) + 1)
+    end
+    nzval = zeros(data_type, length(rowval))
+    buffer = FixedSparseCSC(length(row_range), ncol, colptr, rowval, nzval)
+    return buffer
+end
+
 # SparseMatrixCSR multiplying SparseMatrixCSC currently (26/5/2026) uses the generic
 # AbstractMatrix implementation, which is very slow. The following is a more optimised
 # implementation. Adapted from `SparseArrays._spmatmul!(C, A, B, α, β)`.
@@ -1004,33 +1046,9 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     C_dot_Ainv_dot_u = Vector{data_type}(undef, length(C_global_row_range_partial))
     if sparse_Ainv_B
         if isa(schur_complement_buffer, FixedSparseCSC)
-            # Initialize C_dot_Ainv_dot_B with the same non-zero pattern as schur_complement_buffer.
-            C_dot_Ainv_dot_B_colptr = Int64[1]
-            C_dot_Ainv_dot_B_rowval = Int64[]
-            sc_colptr = schur_complement_buffer.colptr
-            sc_rowval = schur_complement_buffer.rowval
-            ncol = size(schur_complement_buffer, 2)
-            for j ∈ 1:ncol
-                sc_col_start = sc_colptr[j]
-                sc_col_end = sc_colptr[j+1]-1
-                sc_col_rowval = @view sc_rowval[sc_col_start:sc_col_end]
-                nsc = sc_col_end - sc_col_start + 1
-                count = 1
-                for (i, i_global) ∈ enumerate(C_global_row_range_partial)
-                    while count ≤ nsc && sc_col_rowval[count] < i_global
-                        count += 1
-                    end
-                    if count ≤ nsc && sc_col_rowval[count] == i_global
-                        push!(C_dot_Ainv_dot_B_rowval, i)
-                    end
-                end
-                push!(C_dot_Ainv_dot_B_colptr, length(C_dot_Ainv_dot_B_rowval) + 1)
-            end
-            C_dot_Ainv_dot_B_nzval = zeros(data_type, length(C_dot_Ainv_dot_B_rowval))
-            C_dot_Ainv_dot_B = FixedSparseCSC(length(C_global_row_range_partial), ncol,
-                                              C_dot_Ainv_dot_B_colptr,
-                                              C_dot_Ainv_dot_B_rowval,
-                                              C_dot_Ainv_dot_B_nzval)
+            C_dot_Ainv_dot_B =
+                get_partial_FixedSparseCSC_buffer(C_global_row_range_partial,
+                                                  schur_complement_buffer, data_type)
         else
             C_dot_Ainv_dot_B = spzeros(data_type, length(C_global_row_range_partial),
                                        bottom_vec_global_size)
