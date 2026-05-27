@@ -226,13 +226,13 @@ function find_local_vector_inds(global_inds::AbstractArray, owned_global_inds)
 end
 
 """
-    update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
+    update_sparse_matrix!(A::AbstractSparseMatrixCSC{Tf,Ti},
                           new_A::SparseMatrixCSC{Tf,Ti}) where {Tf,Ti}
 
 Update the values of `A` in-place to the values of `new_A`. May not be ideally efficient
 because it requires resizing Vectors.
 """
-function update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
+function update_sparse_matrix!(A::AbstractSparseMatrixCSC{Tf,Ti},
                                new_A::SparseMatrixCSC{Tf,Ti}) where {Tf,Ti}
     colptr = A.colptr
     rowval = A.rowval
@@ -274,7 +274,7 @@ function update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
 end
 
 """
-    update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
+    update_sparse_matrix!(A::AbstractSparseMatrixCSC{Tf,Ti},
                           new_A::FixedMatrixCSC{Tf,Ti}) where {Tf,Ti}
 
 Update the values of `A` in-place to the values of `new_A`. May not be ideally efficient
@@ -282,7 +282,7 @@ because it requires resizing Vectors. For this FixedMatrixCSC version, also filt
 zeros because FixedMatrixCSC was probably defined with a maximal stencil, which might
 contain extra zeros.
 """
-function update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
+function update_sparse_matrix!(A::AbstractSparseMatrixCSC{Tf,Ti},
                                new_A::FixedSparseCSC{Tf,Ti}) where {Tf,Ti}
     colptr = A.colptr
     rowval = A.rowval
@@ -303,6 +303,61 @@ function update_sparse_matrix!(A::SparseMatrixCSC{Tf,Ti},
                 push!(rowval, new_rowval[new_i])
                 push!(nzval, new_nzval[new_i])
                 count += 1
+            end
+        end
+    end
+    push!(colptr, count)
+    return nothing
+end
+
+"""
+    update_sparse_matrix!(A::AbstractSparseMatrixCSC{Tf,Ti},
+                          new_A::FixedMatrixCSC{Tf,Ti}, rowinds) where {Tf,Ti}
+
+Update the values of `A` in-place to the values of `new_A`. May not be ideally efficient
+because it requires resizing Vectors. For this FixedMatrixCSC version, also filter out
+zeros because FixedMatrixCSC was probably defined with a maximal stencil, which might
+contain extra zeros.
+
+`rowinds` gives the subset of rows in `new_A` that should be copied into `A`.
+"""
+function update_sparse_matrix!(A::AbstractSparseMatrixCSC{Tf,Ti},
+                               new_A::FixedSparseCSC{Tf,Ti}, rowinds) where {Tf,Ti}
+    colptr = A.colptr
+    rowval = A.rowval
+    nzval = A.nzval
+    new_colptr = new_A.colptr
+    new_rowval = new_A.rowval
+    new_nzval = new_A.nzval
+    resize!(colptr, 0)
+    resize!(rowval, 0)
+    resize!(nzval, 0)
+    count = 1
+    n_rowinds = length(rowinds)
+    for col ∈ 1:new_A.n
+        push!(colptr, count)
+        colstart = new_colptr[col]
+        colend = new_colptr[col+1] - 1
+        if colend < colstart
+            continue
+        end
+        row_count = max(searchsortedlast(rowinds, new_rowval[colstart]) - 1, 1)
+        for new_i ∈ colstart:colend
+            rv = new_rowval[new_i]
+            while row_count ≤ n_rowinds && rowinds[row_count] < rv
+                row_count += 1
+            end
+            if row_count > n_rowinds
+                continue
+            end
+            if rowinds[row_count] == rv
+                newval = new_nzval[new_i]
+                if !iszero(newval)
+                    push!(rowval, row_count)
+                    push!(nzval, newval)
+                    count += 1
+                    row_count += 1
+                end
             end
         end
     end
@@ -1288,7 +1343,14 @@ function update_Ainv_dot_B!(sc, B)
 
         # At this point `Ainv_dot_B` contains the dense array of `B`.
         if separate_Ainv_B
-            update_sparse_matrix!(sc.B, sparse(@view Ainv_dot_B[local_top_vector_unique_entries_partial,:]))
+            if issparse(Ainv_dot_B)
+                update_sparse_matrix!(sc.B, Ainv_dot_B, local_top_vector_unique_entries_partial)
+            else
+                sc_B = sc.B
+                for j ∈ 1:size(Ainv_dot_B, 2), (i1, i2) ∈ enumerate(local_top_vector_unique_entries_partial)
+                    sc_B[i1,j] = Ainv_dot_B[i2,j]
+                end
+            end
             synchronize_shared()
         end
         ldiv!(A_factorization, Ainv_dot_B)
@@ -1380,8 +1442,8 @@ function update_schur_complement_factorization!(sc, D, new_C)
             if isa(Ainv_dot_B_local, SparseMatrixCSC)
                 # Convert Ainv_dot_B to SparseMatrixCSC in this call to resolve possible
                 # type instability.
-                update_sparse_matrix!(Ainv_dot_B_local,
-                                      sparse(@view(SparseMatrixCSC(Ainv_dot_B)[local_top_vector_unique_entries_partial,:])))
+                update_sparse_matrix!(Ainv_dot_B_local, Ainv_dot_B,
+                                      local_top_vector_unique_entries_partial)
             else
                 # Note that we need to transpose Ainv_dot_B_local for the slightly
                 # hacked matrix-vector multiply implementation used in `ldiv!()` to
