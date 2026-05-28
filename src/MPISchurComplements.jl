@@ -664,6 +664,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                               skip_factorization::Bool=false, check_lu::Bool=true,
                               timer::Union{TimerOutput,Nothing}=nothing)
 
+@sc_timeit timer "Init: initial stuff" begin
     if !skip_factorization
         if !(isa(B, AbstractMatrix) && isa(C, AbstractMatrix) && isa(D, AbstractMatrix))
             error("When `skip_factorization=false`, matrices must be passed for `B`, "
@@ -704,6 +705,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         distributed_nproc = -1
         distributed_rank = -1
     end
+end
 
     top_vec_local_size = length(owned_top_vector_entries)
     bottom_vec_local_size = length(owned_bottom_vector_entries)
@@ -725,6 +727,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
             return distributed_ranges
         end
 
+@sc_timeit timer "Init: get distributed ranges" begin
         top_vector_distributed_ranges = get_distributed_ranges(owned_top_vector_entries)
         bottom_vector_distributed_ranges = get_distributed_ranges(owned_bottom_vector_entries)
 
@@ -738,6 +741,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                                       for r ∈ top_vector_distributed_ranges; init=0)
         bottom_vec_global_size = maximum(maximum(r; init=0)
                                          for r ∈ bottom_vector_distributed_ranges; init=0)
+end
 
         # Find all overlaps (i.e. intersections) between locally-owned range and
         # remotely-owned ranges on all other processes.
@@ -764,6 +768,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
             return overlaps
         end
 
+@sc_timeit timer "Init: get overlaps" begin
         # For 'bottom vector' need to work out a set of non-overlapping ranges so that
         # each distributed rank owns a unique set of entries.
         bottom_vector_overlaps = get_overlaps(owned_bottom_vector_entries,
@@ -808,6 +813,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         unique_top_vector_entries, local_top_vector_unique_entries,
         local_top_vector_repeats =
             separate_repeated_indices(owned_top_vector_entries)
+end
     else
         top_vec_global_size = nothing
         bottom_vec_global_size = nothing
@@ -862,6 +868,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         end
     end
 
+@sc_timeit timer "Init: communicate shared parameters" begin
     distributed_rank = shared_broadcast_int(distributed_rank)
     distributed_nproc = shared_broadcast_int(distributed_nproc)
     top_vec_global_size = shared_broadcast_int(top_vec_global_size)
@@ -875,7 +882,9 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     unique_bottom_vector_entries = shared_broadcast_range(unique_bottom_vector_entries)
     local_bottom_vector_unique_entries = shared_broadcast_range(local_bottom_vector_unique_entries)
     local_bottom_vector_repeats = shared_broadcast_matrix(local_bottom_vector_repeats)
+end
 
+@sc_timeit timer "Init: set extra ranges" begin
     # If Matrix ranges were not passed explicitly, set them from the top/bottom vector
     # ranges.
     if B_global_column_range === nothing
@@ -935,7 +944,9 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         D_global_column_range, D_local_column_range, D_local_column_repeats =
             separate_repeated_indices(D_global_column_range)
     end
+end
 
+@sc_timeit timer "Init: bounds checks and default allocators" begin
     @boundscheck !isa(B, AbstractMatrix) || size(B, 1) == top_vec_local_size || error(BoundsError, " Rows in B do not match locally-owned 'top vector' entries.")
     @boundscheck !isa(B, AbstractMatrix) || size(B, 2) == length(B_local_column_range) + size(B_local_column_repeats, 2) || error(BoundsError, " Columns in B do not match index ranges.")
     @boundscheck !isa(C, AbstractMatrix) || size(C, 1) == length(C_local_row_range) + size(C_local_row_repeats, 2) || error(BoundsError, " Rows in C do not match index ranges.")
@@ -957,10 +968,12 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     if allocate_shared_int === nothing
         allocate_shared_int = (args...) -> zeros(Int64, args...)
     end
+end
 
     # Define indices that will be handled by this process in shared-memory-parallelised
     # operations.
     if shared_comm == MPI.COMM_SELF
+@sc_timeit timer "Init: get index ranges serial" begin
         synchronize_shared = ()->nothing
         B_column_range_partial = 1:bottom_vec_global_size
         B_global_column_range_partial = B_global_column_range
@@ -983,6 +996,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         B_local_column_repeats_partial = local_bottom_vector_repeats
         C_local_row_repeats_partial = C_local_row_repeats
         D_local_column_repeats_partial = D_local_column_repeats
+end
     else
         if synchronize_shared === nothing
             synchronize_shared = ()->MPI.Barrier(shared_comm)
@@ -1030,6 +1044,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
             return global_entries[imin:imax], local_entries[imin:imax]
         end
 
+@sc_timeit timer "Init: get index ranges" begin
         B_column_range_partial, _ =
             get_shared_partial_ranges(1:bottom_vec_global_size, 1:bottom_vec_global_size)
         B_global_column_range_partial, B_local_column_range_partial =
@@ -1067,8 +1082,13 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                                                                 C_local_row_range_partial)
         D_local_column_repeats_partial = get_partial_repeated_inds(D_local_column_repeats,
                                                                    D_local_column_range_partial)
+end
     end
+@sc_timeit timer "Init: extra sync A" begin
+synchronize_shared()
+end
 
+@sc_timeit timer "Init: allocate buffer arrays" begin
     # Allocate buffer arrays
     if Ainv_dot_B_buffer === nothing
         if sparse_Ainv_B
@@ -1106,45 +1126,72 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     Ainv_dot_u = allocate_shared_float(top_vec_local_size)
     # C_dot_Ainv_dot_u and C_dot_Ainv_dot_B are purely local buffers.
     C_dot_Ainv_dot_u = Vector{data_type}(undef, length(C_global_row_range_partial))
+end
     if sparse_Ainv_B
         if isa(schur_complement_buffer, FixedSparseCSC)
+@sc_timeit timer "Init: allocate C_dot_Ainv_dot_B buffer FixedSparseCSC" begin
             C_dot_Ainv_dot_B =
                 get_partial_FixedSparseCSC_buffer(C_global_row_range_partial,
                                                   schur_complement_buffer, data_type)
+end
         else
+@sc_timeit timer "Init: allocate C_dot_Ainv_dot_B buffer generic sparse" begin
             C_dot_Ainv_dot_B = spzeros(data_type, length(C_global_row_range_partial),
                                        bottom_vec_global_size)
+end
         end
     else
+@sc_timeit timer "Init: allocate C_dot_Ainv_dot_B buffer dense" begin
         C_dot_Ainv_dot_B = Matrix{data_type}(undef, length(C_global_row_range_partial),
                                              bottom_vec_global_size)
+end
     end
+@sc_timeit timer "Init: extra sync B" begin
+synchronize_shared()
+end
+@sc_timeit timer "Init: allocate Ainv_dot_B_dot_y" begin
     if separate_Ainv_B
         Ainv_dot_B_dot_y = Vector{data_type}(undef, length(local_top_vector_unique_entries_partial))
     else
         Ainv_dot_B_dot_y = nothing
     end
+end
+@sc_timeit timer "Init: allocate/assign schur_complement buffer" begin
     if schur_complement_buffer === nothing
         schur_complement = allocate_shared_float(bottom_vec_global_size, bottom_vec_global_size)
     else
         schur_complement = schur_complement_buffer
     end
+end
+@sc_timeit timer "Init: allocate top_vec_buffer" begin
     top_vec_buffer = allocate_shared_float(top_vec_local_size)
+end
+@sc_timeit timer "Init: allocate local_top_vec_buffer" begin
     if sparse_Ainv_B
         local_top_vec_buffer = Vector{data_type}(undef, length(local_top_vector_unique_entries_partial))
     else
         local_top_vec_buffer = nothing
     end
+end
+@sc_timeit timer "Init: allocate bottom_vec_buffer" begin
     bottom_vec_buffer = allocate_shared_float(bottom_vec_global_size)
+end
+@sc_timeit timer "Init: allocate global_y" begin
     global_y = allocate_shared_float(bottom_vec_global_size)
+end
 
+@sc_timeit timer "Init: allocate fake_C" begin
     if use_sparse
         fake_C = sparsecsr(Int64[], Int64[], data_type[],
                            length(C_local_row_range_partial), top_vec_local_size)
+        #fake_C = transpose(sparse(Int64[], Int64[], data_type[], top_vec_local_size,
+        #                          length(C_local_row_range_partial)))
     else
         fake_C = zeros(data_type, length(C_local_row_range_partial), top_vec_local_size)
     end
+end
 
+@sc_timeit timer "Init: create (maybe) schur_complement_factorization" begin
     if isa(parallel_schur, Bool) && parallel_schur
         if schur_tile_size === nothing
             power_of_2 = floor(Int64, log2(bottom_vec_global_size / 2))
@@ -1168,7 +1215,9 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         schur_complement_factorization = parallel_schur
         parallel_schur = true
     end
+end
 
+@sc_timeit timer "Init: create MPISchurComplement struct" begin
     sc_factorization = MPISchurComplement(A_factorization, Ainv_dot_B, Ainv_dot_B_local,
                                           B_local, B_column_range_partial,
                                           B_global_column_range,
@@ -1214,9 +1263,12 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                                           distributed_nproc, synchronize_shared,
                                           use_sparse, separate_Ainv_B, parallel_schur,
                                           check_lu, timer)
+end
 
     if !skip_factorization
+@sc_timeit timer "Init: call update_schur_complement!" begin
         update_schur_complement!(sc_factorization, missing, B, C, D)
+end
     end
 
     return sc_factorization
@@ -1267,6 +1319,7 @@ function update_Ainv_dot_B!(sc, B)
         # then copy this entry into all the repeated positions. This converts the columns of
         # `B` into 'vectors' (with the same structure as `u`) that can be passed to
         # `A_factorization` to find `Ainv_dot_B`.
+@sc_timeit timer "zero buffer" begin
         if isa(Ainv_dot_B, AbstractSparseMatrix)
             Ainv_dot_B_colptr = Ainv_dot_B.colptr
             Ainv_dot_B_nzval = Ainv_dot_B.nzval
@@ -1276,7 +1329,9 @@ function update_Ainv_dot_B!(sc, B)
         else
             Ainv_dot_B[:,B_column_range_partial] .= 0
         end
+end
         if length(local_top_vector_repeats) > 0 || length(local_bottom_vector_repeats) > 0
+@sc_timeit timer "local_repeats" begin
             # Add up entries that are repeated on this subdomain.
             for j ∈ 1:size(B, 2), (to, from) ∈ eachcol(local_top_vector_repeats_partial)
                 B[to,j] += B[from,j]
@@ -1285,11 +1340,17 @@ function update_Ainv_dot_B!(sc, B)
             for (to, from) ∈ eachcol(B_local_column_repeats_partial)
                 @views B[:,to] .+= B[:,from]
             end
+end
         else
+@sc_timeit timer "sync 1" begin
             synchronize_shared()
+end
         end
         if isa(Ainv_dot_B, AbstractSparseMatrix)
+@sc_timeit timer "get sparse B" begin
             B_sparse = sparse(@view B[:,B_local_column_range_partial])
+end
+@sc_timeit timer "copy sparse B to buffer" begin
             B_colptr = B_sparse.colptr
             B_rowval = B_sparse.rowval
             B_nzval = B_sparse.nzval
@@ -1301,16 +1362,22 @@ function update_Ainv_dot_B!(sc, B)
                     Ainv_dot_B[i, j1] = B_nzval[Bi]
                 end
             end
+end
         else
+@sc_timeit timer "copy dense B to buffer" begin
             for (j1, j2) ∈ zip(B_global_column_range_partial, B_local_column_range_partial), i ∈ 1:size(Ainv_dot_B, 1)
                 Ainv_dot_B[i,j1] = B[i,j2]
             end
+end
         end
+@sc_timeit timer "sync 2" begin
         synchronize_shared()
+end
 
         # Add up the rows of B that overlap between different subdomains (temporarily stored
         # in `Ainv_dot_B`).  Note only non-repeated points in the overlaps are communicated,
         # to reduce the amount of communication.
+@sc_timeit timer "handle non-local overlaps" begin
         if shared_rank == 0
             reqs = MPI.Request[]
             for (overlap_range, buffer_send, buffer_recv, overlap_rank) ∈
@@ -1343,9 +1410,11 @@ function update_Ainv_dot_B!(sc, B)
                 synchronize_shared()
             end
         end
+end
 
         # At this point `Ainv_dot_B` contains the dense array of `B`.
         if separate_Ainv_B
+@sc_timeit timer "update sparse B buffer" begin
             if issparse(Ainv_dot_B)
                 update_sparse_matrix!(sc.B, Ainv_dot_B, local_top_vector_unique_entries_partial)
             else
@@ -1355,8 +1424,11 @@ function update_Ainv_dot_B!(sc, B)
                 end
             end
             synchronize_shared()
+end
         end
+@sc_timeit timer "A^-1.B" begin
         ldiv!(A_factorization, Ainv_dot_B)
+end
     end
     return nothing
 end
@@ -1423,6 +1495,7 @@ function update_schur_complement_factorization!(sc, D, new_C)
     @sc_timeit timer "schur_complement" begin
         # Initialise `schur_complement` to zero, because when `new_C` does not include all rows,
         # the matrix multiplication below would not initialise all elements.
+@sc_timeit timer "zero schur_complement" begin
         if issparse(schur_complement)
             schur_colptr = schur_complement.colptr
             schur_nzval = schur_complement.nzval
@@ -1437,11 +1510,15 @@ function update_schur_complement_factorization!(sc, D, new_C)
                 schur_complement[i,j] = 0.0
             end
         end
+end
+@sc_timeit timer "sync 1" begin
         synchronize_shared()
+end
 
         # Read out the local entries of `Ainv_dot_B` here, rather than just after `Ainv_dot_B`
         # is calculated, in order to avoid adding another `synchronize_shared()` call.
         if !separate_Ainv_B
+@sc_timeit timer "update Ainv_dot_B_local" begin
             if isa(Ainv_dot_B_local, SparseMatrixCSC)
                 # Convert Ainv_dot_B to SparseMatrixCSC in this call to resolve possible
                 # type instability.
@@ -1455,17 +1532,27 @@ function update_schur_complement_factorization!(sc, D, new_C)
                     Ainv_dot_B_local[i,j1] = Ainv_dot_B[j2,i]
                 end
             end
+end
         end
 
         # We store locally all columns in `Ainv_dot_B` (only local rows) and all rows of `C`
         # (only local columns). Therefore we can take the matrix product `Ainv_dot_B*C` with
         # the local chunks, then do a sum-reduce to get the final result. The
         # `schur_complement` buffer is full size on every rank.
+#@sc_timeit timer "extra sync A" begin
+#    synchronize_shared()
+#end
+@sc_timeit timer "C.(A^-1.B)" begin
         if isa(new_C, SparseMatrixCSR) && isa(Ainv_dot_B, AbstractSparseMatrixCSC)
             csr_mul!(C_dot_Ainv_dot_B, new_C, Ainv_dot_B, -1.0, 0.0)
         else
             mul!(C_dot_Ainv_dot_B, new_C, Ainv_dot_B, -1.0, 0.0)
         end
+end
+#@sc_timeit timer "extra sync B" begin
+#    synchronize_shared()
+#end
+@sc_timeit timer "set schur_complement to -C.A^-1.B" begin
         if issparse(C_dot_Ainv_dot_B)
             C_dot_Ainv_dot_B_colptr = C_dot_Ainv_dot_B.colptr
             C_dot_Ainv_dot_B_rowval = C_dot_Ainv_dot_B.rowval
@@ -1482,7 +1569,10 @@ function update_schur_complement_factorization!(sc, D, new_C)
                 schur_complement[i1,j] = C_dot_Ainv_dot_B[i2,j]
             end
         end
+end
+@sc_timeit timer "sync 2" begin
         synchronize_shared()
+end
         # Only get the local rows for D, so just add these to the local rows of
         # `schur_complement`.
         # As `schur_Complement` does not have any repeated entries, need to add up any locally
@@ -1492,16 +1582,21 @@ function update_schur_complement_factorization!(sc, D, new_C)
         # `schur_complement` are added together in the `MPI.Reduce!()` below, as there may be
         # non-zero contributions to some entries from multiple subdomains.
         if length(local_bottom_vector_repeats) > 0
+@sc_timeit timer "D local row repeats" begin
             for j ∈ 1:size(D, 2), (to, from) ∈ eachcol(local_bottom_vector_repeats_partial)
                 D[to,j] += D[from,j]
             end
             synchronize_shared()
+end
         end
         if length(D_local_column_repeats) > 0
+@sc_timeit timer "D column repeats" begin
             for (to, from) ∈ eachcol(D_local_column_repeats_partial)
                 @views D[:,to] .+= D[:,from]
             end
+end
         end
+@sc_timeit timer "add D to schur_complement" begin
         if issparse(D)
             D_sparse = sparse(@view D[:,D_local_column_range_partial])
             D_colptr = D_sparse.colptr
@@ -1518,12 +1613,18 @@ function update_schur_complement_factorization!(sc, D, new_C)
                 schur_complement[i1,j1] += D[i2,j2]
             end
         end
+end
+@sc_timeit timer "sync 3" begin
         synchronize_shared()
+end
         if shared_rank == 0 && distributed_nproc > 1
+@sc_timeit timer "MPI.Reduce! schur_complement" begin
             MPI.Reduce!(schur_complement, +, distributed_comm; root=0)
+end
         end
 
         if isa(schur_complement_factorization, LU)
+@sc_timeit timer "serial LU schur_complement" begin
             # `schur_complement` has been gathered/assembled onto the global rank-0
             # process, and is now LU-factorized in serial.
             # Unless the original matrices were all block-diagonal in some consistent
@@ -1539,9 +1640,14 @@ function update_schur_complement_factorization!(sc, D, new_C)
             factors .= schur_complement
             ipiv = schur_complement_factorization.ipiv
             LAPACK.getrf!(factors, ipiv; check=check_lu)
+end
         elseif !isa(schur_complement_factorization, Nothing)
+@sc_timeit timer "sync 4" begin
             synchronize_shared()
+end
+@sc_timeit timer "parallel LU schur_complement" begin
             lu!(schur_complement_factorization, schur_complement)
+end
         end
     end
 
@@ -1573,10 +1679,18 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
         @boundscheck length(sc.owned_bottom_vector_entries) == size(D, 1) || error(BoundsError, " Number of rows in D does not match number of locally owned bottom_vector_entries")
         @boundscheck length(sc.D_local_column_range_partial) == 0 || maximum(sc.D_local_column_range_partial) ≤ size(D, 2) || error(BoundsError, " Number of columns in D is smaller than the largest index in D_local_column_range")
 
+@sc_timeit timer "wrap update_A_factorization!" begin
         update_A_factorization!(sc, A)
+end
+@sc_timeit timer "wrap update_Ainv_dot_B!" begin
         update_Ainv_dot_B!(sc, B)
+end
+@sc_timeit timer "wrap update_C!" begin
         new_C = update_C!(sc, C)
+end
+@sc_timeit timer "wrap update_schur_complement_factorization!" begin
         update_schur_complement_factorization!(sc, D, new_C)
+end
     end
 
     return nothing
@@ -1653,14 +1767,25 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
         @sc_timeit timer "v-C.Ainv.u" begin
             # Initialise to zero, because when C does not include all rows, the matrix
             # multiplication below would not initialise all elements.
+@sc_timeit timer "init zero" begin
             bottom_vec_buffer[schur_complement_local_range_partial] .= 0.0
+end
+@sc_timeit timer "sync A" begin
             synchronize_shared()
+end
+@sc_timeit timer "C*Ainv_dot_u" begin
             # Need all rows of C, but only the local columns - this is all that is stored in sc.C.
             mul!(C_dot_Ainv_dot_u, sc.C, Ainv_dot_u, -1.0, 0.0)
+end
+@sc_timeit timer "copy into bottom_vec_buffer" begin
             for (i2, i1) ∈ enumerate(sc.C_global_row_range_partial)
                 bottom_vec_buffer[i1] = C_dot_Ainv_dot_u[i2]
             end
+end
+@sc_timeit timer "sync B" begin
             synchronize_shared()
+end
+@sc_timeit timer "add v to buffer" begin
 
             # Only have the local entries of v, so add those to the local entries in
             # bottom_vec_buffer before reducing.
@@ -1668,7 +1793,10 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
             for (i1, i2) ∈ zip(global_bottom_vector_entries_no_overlap_partial, local_bottom_vector_entries_no_overlap_partial)
                 bottom_vec_buffer[i1] += v[i2]
             end
+end
+@sc_timeit timer "sync C" begin
             synchronize_shared()
+end
         end
 
         @sc_timeit timer "global_y" begin
@@ -1676,16 +1804,22 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
             # back to all other processes.
             global_y = sc.global_y
             if sc.shared_rank == 0
+@sc_timeit timer "Reduce! bottom_vec_buffer" begin
                 MPI.Reduce!(bottom_vec_buffer, +, distributed_comm; root=0)
+end
             end
 
             if parallel_schur
                 if distributed_nproc > 1
+@sc_timeit timer "sync 1" begin
                     synchronize_shared()
+end
                 end
                 ldiv!(global_y, schur_complement_factorization, bottom_vec_buffer)
                 if distributed_nproc > 1
+@sc_timeit timer "sync 2" begin
                     synchronize_shared()
+end
                 end
             else
                 if shared_rank == 0 && distributed_rank == 0
@@ -1694,9 +1828,13 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
             end
 
             if sc.shared_rank == 0
+@sc_timeit timer "Bcast! global_y" begin
                 MPI.Bcast!(global_y, distributed_comm; root=0)
+end
             end
+@sc_timeit timer "sync 3" begin
             synchronize_shared()
+end
         end
 
         @sc_timeit timer "Ainv.u-Ainv.B.y" begin
