@@ -311,8 +311,139 @@ function update_sparse_matrix!(A::AbstractSparseMatrixCSC{Tf,Ti},
 end
 
 """
-    update_sparse_matrix!(A::AbstractSparseMatrixCSC{Tf,Ti},
-                          new_A::FixedMatrixCSC{Tf,Ti}, rowinds) where {Tf,Ti}
+    update_sparse_matrix_select_columns!(A::FixedSparseCSC{Tf,Ti}, colinds,
+                                         new_A::AbstractSparseMatrixCSC{Tf,Ti},
+                                         new_colinds) where {Tf,Ti}
+
+Update the values of `A` in-place to the values of `new_A`. May not be ideally efficient
+because it requires resizing Vectors. For this FixedMatrixCSC version, also filter out
+zeros because FixedMatrixCSC was probably defined with a maximal stencil, which might
+contain extra zeros.
+
+`new_colinds` gives the subset of columns in `new_A` that should be copied into the subset
+of columns given by `colinds` in `A`.
+"""
+function update_sparse_matrix_select_columns!(A::FixedSparseCSC{Tf,Ti}, colinds,
+                                              new_A::AbstractSparseMatrixCSC{Tf,Ti},
+                                              new_colinds) where {Tf,Ti}
+    colptr = A.colptr
+    rowval = A.rowval
+    nzval = A.nzval
+    new_colptr = new_A.colptr
+    new_rowval = new_A.rowval
+    new_nzval = new_A.nzval
+    for (col, new_col) ∈ zip(colinds, new_colinds)
+        firsti = colptr[col]
+        lasti = colptr[col+1] - 1
+        new_firsti = new_colptr[new_col]
+        new_lasti = new_colptr[new_col+1] - 1
+        # Expect than usually the sparsity patterns of A and new_A will match, so the
+        # rowval entries for this column will be the same in both. Therefore no need to
+        # use `searchsortedlast()` to speed up finding the first matching entry.
+        i = firsti
+        for new_i ∈ new_firsti:new_lasti
+            new_row = new_rowval[new_i]
+            while i ≤ lasti && rowval[i] < new_row
+                i += 1
+            end
+            if i ≤ lasti && rowval[i] == new_row
+                nzval[i] = new_nzval[new_i]
+                i += 1
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+    update_sparse_matrix_select_columns!(A::FixedSparseCSC{Tf,Ti}, colinds,
+                                         new_A::AbstractSparseMatrixCSC{Tf,Ti},
+                                         new_colinds, new_rowinds) where {Tf,Ti}
+
+Update the values of `A` in-place to the values of `new_A`. May not be ideally efficient
+because it requires resizing Vectors. For this FixedMatrixCSC version, also filter out
+zeros because FixedMatrixCSC was probably defined with a maximal stencil, which might
+contain extra zeros.
+
+`new_colinds` gives the subset of columns in `new_A` that should be copied into the subset
+of columns given by `colinds` in `A`.
+
+`new_rowinds` gives the subset of rows in `new_A` that should be copied into `A`.
+"""
+function update_sparse_matrix_select_columns!(A::FixedSparseCSC{Tf,Ti}, colinds,
+                                              new_A::AbstractSparseMatrixCSC{Tf,Ti},
+                                              new_colinds, new_rowinds) where {Tf,Ti}
+    colptr = A.colptr
+    rowval = A.rowval
+    nzval = A.nzval
+    new_colptr = new_A.colptr
+    new_rowval = new_A.rowval
+    new_nzval = new_A.nzval
+    new_nrows = length(new_rowinds)
+    for (col, new_col) ∈ zip(colinds, new_colinds)
+        firsti = colptr[col]
+        lasti = colptr[col+1] - 1
+        new_firsti = new_colptr[new_col]
+        new_lasti = new_colptr[new_col+1] - 1
+        new_firstrow = new_rowval[new_firsti]
+        # Expect than usually the sparsity patterns of A and new_A will match, so the
+        # rowval entries for this column will be the same in both. Therefore no need to
+        # use `searchsortedlast()` to speed up finding the first matching entry for `i`.
+        i = firsti
+        row = max(searchsortedlast(new_rowinds, new_firstrow) - 1, 1)
+        for new_i ∈ new_firsti:new_lasti
+            new_row = new_rowval[new_i]
+            while row ≤ new_nrows && new_rowinds[row] < new_row
+                row += 1
+            end
+            if row > new_nrows
+                break
+            end
+            if new_rowinds[row] == new_row
+                while i ≤ lasti && rowval[i] < row
+                    i += 1
+                end
+                if i ≤ lasti && rowval[i] == row
+                    nzval[i] = new_nzval[new_i]
+                    i += 1
+                    row += 1
+                end
+            end
+        end
+    end
+    return nothing
+end
+function update_sparse_matrix_select_columns!(A::FixedSparseCSC{Tf,Ti}, colinds,
+                                              new_A::AbstractMatrix{Tf}, new_colinds,
+                                              new_rowinds) where {Tf,Ti}
+    colptr = A.colptr
+    rowval = A.rowval
+    nzval = A.nzval
+    new_nrows = length(new_rowinds)
+    for (col, new_col) ∈ zip(colinds, new_colinds)
+        firsti = colptr[col]
+        lasti = colptr[col+1] - 1
+        for i ∈ firsti:lasti
+            row = rowval[i]
+            new_row = new_rowinds[row]
+            nzval[i] = new_A[new_row,new_col]
+        end
+    end
+    return nothing
+end
+function update_sparse_matrix_select_columns!(A::FixedSparseCSC{Tf,Ti}, colinds,
+                                              new_A::SubArray{Tf,2},
+                                              new_colinds) where {Tf,Ti}
+    full_new_A = parent(new_A)
+    full_rowinds, full_colinds = new_A.indices
+    return update_sparse_matrix_select_columns!(A, colinds, full_new_A,
+                                                @view(full_colinds[new_colinds]),
+                                                full_rowinds)
+end
+
+"""
+    update_sparse_matrix_select_rows!(A::AbstractSparseMatrixCSC{Tf,Ti},
+                                      new_A::FixedSparseCSC{Tf,Ti}, rowinds) where {Tf,Ti}
 
 Update the values of `A` in-place to the values of `new_A`. May not be ideally efficient
 because it requires resizing Vectors. For this FixedMatrixCSC version, also filter out
@@ -321,8 +452,8 @@ contain extra zeros.
 
 `rowinds` gives the subset of rows in `new_A` that should be copied into `A`.
 """
-function update_sparse_matrix!(A::AbstractSparseMatrixCSC{Tf,Ti},
-                               new_A::FixedSparseCSC{Tf,Ti}, rowinds) where {Tf,Ti}
+function update_sparse_matrix_select_rows!(A::AbstractSparseMatrixCSC{Tf,Ti},
+                                           new_A::FixedSparseCSC{Tf,Ti}, rowinds) where {Tf,Ti}
     colptr = A.colptr
     rowval = A.rowval
     nzval = A.nzval
@@ -348,7 +479,7 @@ function update_sparse_matrix!(A::AbstractSparseMatrixCSC{Tf,Ti},
                 row_count += 1
             end
             if row_count > n_rowinds
-                continue
+                break
             end
             if rowinds[row_count] == rv
                 newval = new_nzval[new_i]
@@ -1329,18 +1460,8 @@ function update_Ainv_dot_B!(sc, B)
             synchronize_shared()
         end
         if isa(Ainv_dot_B, AbstractSparseMatrix)
-            B_sparse = sparse(@view B[:,B_local_column_range_partial])
-            B_colptr = B_sparse.colptr
-            B_rowval = B_sparse.rowval
-            B_nzval = B_sparse.nzval
-            for (j2, j1) ∈ enumerate(B_global_column_range_partial)
-                Bi_start = B_colptr[j2]
-                Bi_end = B_colptr[j2+1] - 1
-                for Bi ∈ Bi_start:Bi_end
-                    i = B_rowval[Bi]
-                    Ainv_dot_B[i, j1] = B_nzval[Bi]
-                end
-            end
+            update_sparse_matrix_select_columns!(Ainv_dot_B, B_global_column_range_partial,
+                                                 B, B_local_column_range_partial)
         else
             for (j1, j2) ∈ zip(B_global_column_range_partial, B_local_column_range_partial), i ∈ 1:size(Ainv_dot_B, 1)
                 Ainv_dot_B[i,j1] = B[i,j2]
@@ -1387,7 +1508,8 @@ function update_Ainv_dot_B!(sc, B)
         # At this point `Ainv_dot_B` contains the dense array of `B`.
         if separate_Ainv_B
             if issparse(Ainv_dot_B)
-                update_sparse_matrix!(sc.B, Ainv_dot_B, local_top_vector_unique_entries_partial)
+                update_sparse_matrix_select_rows!(sc.B, Ainv_dot_B,
+                                                  local_top_vector_unique_entries_partial)
             else
                 sc_B = sc.B
                 for j ∈ 1:size(Ainv_dot_B, 2), (i1, i2) ∈ enumerate(local_top_vector_unique_entries_partial)
@@ -1485,8 +1607,8 @@ function update_schur_complement_factorization!(sc, D, new_C)
             if isa(Ainv_dot_B_local, SparseMatrixCSC)
                 # Convert Ainv_dot_B to SparseMatrixCSC in this call to resolve possible
                 # type instability.
-                update_sparse_matrix!(Ainv_dot_B_local, Ainv_dot_B,
-                                      local_top_vector_unique_entries_partial)
+                update_sparse_matrix_select_rows!(Ainv_dot_B_local, Ainv_dot_B,
+                                                  local_top_vector_unique_entries_partial)
             else
                 # Note that we need to transpose Ainv_dot_B_local for the slightly
                 # hacked matrix-vector multiply implementation used in `ldiv!()` to
