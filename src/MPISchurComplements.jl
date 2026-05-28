@@ -1787,15 +1787,54 @@ function update_schur_complement_factorization!(sc, D)
                 @views D[:,to] .+= D[:,from]
             end
         end
-        if issparse(D)
-            D_sparse = sparse(@view D[:,D_local_column_range_partial])
-            D_colptr = D_sparse.colptr
-            D_rowval = D_sparse.rowval
-            D_nzval = D_sparse.nzval
-            for (j2, j1) ∈ enumerate(D_global_column_range_partial)
-                for flat_i ∈ D_colptr[j2]:D_colptr[j2+1]-1
-                    i = D_rowval[flat_i]
-                    schur_complement[i,j1] += D_nzval[flat_i]
+        if issparse(D) && issparse(schur_complement)
+            D_full = parent(D)
+            full_rowinds, full_colinds = D.indices
+            D_colptr = D_full.colptr
+            D_rowval = D_full.rowval
+            D_nzval = D_full.nzval
+            sc_colptr = schur_complement.colptr
+            sc_rowval = schur_complement.rowval
+            sc_nzval = schur_complement.nzval
+            nrow = length(unique_bottom_vector_entries)
+            for (j1, j2) ∈ zip(D_global_column_range_partial, D_local_column_range_partial)
+                full_j2 = full_colinds[j2]
+                first_i = sc_colptr[j1]
+                last_i = sc_colptr[j1+1] - 1
+                if last_i < first_i
+                    continue
+                end
+                # Assume D and schur_complement have same pattern of non-zeros, so no need
+                # to use searchsortedlast() to find the first flat_i that will be within
+                # the non-zeros of D.
+                flat_i = first_i
+
+                full_first_i = D_colptr[full_j2]
+                full_last_i = D_colptr[full_j2+1]-1
+                if full_last_i < full_first_i
+                    continue
+                end
+
+                first_row = sc_rowval[first_i]
+                row_counter = max(searchsortedlast(unique_bottom_vector_entries, first_row) - 1, 1)
+                for full_flat_i ∈ full_first_i:full_last_i
+                    full_row = D_rowval[full_flat_i]
+                    while row_counter ≤ nrow && full_rowinds[local_bottom_vector_unique_entries[row_counter]] < full_row
+                        row_counter += 1
+                    end
+                    if row_counter > nrow
+                        break
+                    end
+                    sc_row = unique_bottom_vector_entries[row_counter]
+                    while flat_i ≤ last_i && sc_rowval[flat_i] < sc_row
+                        flat_i += 1
+                    end
+                    if flat_i > last_i
+                        continue
+                    end
+                    if full_rowinds[sc_rowval[flat_i]] == full_row
+                        sc_nzval[flat_i] += D_nzval[full_flat_i]
+                    end
                 end
             end
         else
