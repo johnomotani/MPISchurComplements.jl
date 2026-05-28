@@ -1425,6 +1425,7 @@ function update_Ainv_dot_B!(sc, B)
     B_overlap_buffers_recv = sc.B_overlap_buffers_recv
     separate_Ainv_B = sc.separate_Ainv_B
     shared_rank = sc.shared_rank
+    distributed_nproc = sc.distributed_nproc
     distributed_comm = sc.distributed_comm
     synchronize_shared = sc.synchronize_shared
 
@@ -1472,7 +1473,7 @@ function update_Ainv_dot_B!(sc, B)
         # Add up the rows of B that overlap between different subdomains (temporarily stored
         # in `Ainv_dot_B`).  Note only non-repeated points in the overlaps are communicated,
         # to reduce the amount of communication.
-        if shared_rank == 0
+        if shared_rank == 0 && distributed_nproc > 1
             reqs = MPI.Request[]
             for (overlap_range, buffer_send, buffer_recv, overlap_rank) ∈
                     zip(local_top_vector_overlaps, B_overlap_buffers_send,
@@ -1806,6 +1807,7 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
         local_bottom_vector_entries_no_overlap_partial = sc.local_bottom_vector_entries_no_overlap_partial
         schur_complement_local_range_partial = sc.schur_complement_local_range_partial
         shared_rank = sc.shared_rank
+        distributed_nproc = sc.distributed_nproc
         synchronize_shared = sc.synchronize_shared
 
         @sc_timeit timer "Ainv.u" begin
@@ -1837,7 +1839,7 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
             # `global_y` is solved in serial on the global rank-0 process, and then communicated
             # back to all other processes.
             global_y = sc.global_y
-            if sc.shared_rank == 0
+            if sc.shared_rank == 0 && distributed_nproc > 1
                 MPI.Reduce!(bottom_vec_buffer, +, distributed_comm; root=0)
             end
 
@@ -1855,7 +1857,7 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
                 end
             end
 
-            if sc.shared_rank == 0
+            if sc.shared_rank == 0 && distributed_nproc > 1
                 MPI.Bcast!(global_y, distributed_comm; root=0)
             end
             synchronize_shared()
