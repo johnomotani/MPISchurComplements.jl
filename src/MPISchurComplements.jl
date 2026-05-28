@@ -1071,6 +1071,9 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
 
     # Allocate buffer arrays
     if Ainv_dot_B_buffer === nothing
+        if sparse_Ainv_B
+            error("Ainv_dot_B_buffer is required when sparse_Ainv_B=true")
+        end
         Ainv_dot_B = allocate_shared_float(top_vec_local_size, bottom_vec_global_size)
     else
         Ainv_dot_B = Ainv_dot_B_buffer
