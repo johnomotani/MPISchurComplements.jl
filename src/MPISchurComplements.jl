@@ -43,6 +43,7 @@ struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,TC<:AbstractMatrix{
     C_global_row_range_partial::Trange
     C_local_row_range_partial::Trange
     C_local_row_repeats_partial::Matrix{Int64}
+    C_row_counter::Vector{Int64}
     D_global_column_range_partial::Trange
     D_local_column_range_partial::Trange
     D_local_column_repeats::Matrix{Int64}
@@ -251,26 +252,148 @@ end
 
 """
     update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
-                          new_A::SparseMatrixCSR{Bi,Tf,Ti}) where {Bi,Tf,Ti}
+                          new_A::SparseMatrixCSC{Tf,Ti}, new_rowinds,
+                          row_counter::Vector{Int64}) where {Bi,Tf,Ti}
 
 Update the values of `A` in-place to the values of `new_A`. May not be ideally efficient
 because it requires resizing Vectors.
+
+`new_rowinds` gives the subset of rows in `new_A` that should be copied into `A`.
+
+`row_counter` is an integer buffer used to help keep track of the current row in each
+column of the 'compressed-sparse-column' matrix `new_A`.
 """
 function update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
-                               new_A::SparseMatrixCSR{Bi,Tf,Ti}) where {Bi,Tf,Ti}
+                               new_A::AbstractSparseMatrixCSC{Tf,Ti}, new_rowinds,
+                               row_counter::Vector{Int64}) where {Bi,Tf,Ti}
     rowptr = A.rowptr
     colval = A.colval
     nzval = A.nzval
-    new_rowptr = new_A.rowptr
-    new_colval = new_A.colval
+    new_colptr = new_A.colptr
+    new_rowval = new_A.rowval
     new_nzval = new_A.nzval
-    resize!(rowptr, length(new_rowptr))
-    rowptr .= new_rowptr
-    resize!(colval, length(new_colval))
-    colval .= new_colval
-    resize!(nzval, length(new_nzval))
-    nzval .= new_nzval
+    resize!(rowptr, 1)
+    resize!(colval, 0)
+    resize!(nzval, 0)
+
+    if isempty(new_rowinds)
+        return nothing
+    end
+
+    new_first_row = first(new_rowinds)
+    for col ∈ 1:size(new_A, 2)
+        new_firsti = new_colptr[col]
+        new_lasti = new_colptr[col+1]-1
+        col_rv = @view new_rowval[new_firsti:new_lasti]
+        row_counter[col] = max(searchsortedlast(col_rv, new_first_row) - 1, 1) + new_firsti - 1
+    end
+
+    nrow, ncol = size(A)
+    for row ∈ 1:nrow
+        new_row = new_rowinds[row]
+        for col ∈ 1:ncol
+            newi = row_counter[col]
+            new_lasti = new_colptr[col+1]-1
+            while newi ≤ new_lasti && new_rowval[newi] < new_row
+                newi += 1
+            end
+            if newi > new_lasti
+                row_counter[col] = newi
+                continue
+            end
+            if new_rowval[newi] == new_row
+                val = new_nzval[newi]
+                if val != zero(Tf)
+                    push!(colval, col)
+                    push!(nzval, val)
+                end
+            end
+            row_counter[col] = newi
+        end
+        push!(rowptr, length(colval) + 1)
+    end
+
     return nothing
+end
+
+"""
+    update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
+                          new_A::SparseMatrixCSC{Tf,Ti}, new_rowinds, new_colinds,
+                          row_counter::Vector{Int64}) where {Bi,Tf,Ti}
+
+Update the values of `A` in-place to the values of `new_A`. May not be ideally efficient
+because it requires resizing Vectors.
+
+`new_rowinds` gives the subset of rows in `new_A` that should be copied into `A`.
+
+`new_colinds` gives the subset of columns in `new_A` that should be copied into `A`.
+
+`row_counter` is an integer buffer used to help keep track of the current row in each
+column of the 'compressed-sparse-column' matrix `new_A`.
+"""
+function update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
+                               new_A::AbstractSparseMatrixCSC{Tf,Ti}, new_rowinds, new_colinds,
+                               row_counter::Vector{Int64}) where {Bi,Tf,Ti}
+    rowptr = A.rowptr
+    colval = A.colval
+    nzval = A.nzval
+    new_colptr = new_A.colptr
+    new_rowval = new_A.rowval
+    new_nzval = new_A.nzval
+    resize!(rowptr, 1)
+    resize!(colval, 0)
+    resize!(nzval, 0)
+
+    if isempty(new_rowinds)
+        # No entries to update
+        return nothing
+    end
+
+    new_first_row = first(new_rowinds)
+    for col ∈ 1:length(new_colinds)
+        newcol = new_colinds[col]
+        new_firsti = new_colptr[newcol]
+        new_lasti = new_colptr[newcol+1]-1
+        col_rv = @view new_rowval[new_firsti:new_lasti]
+        row_counter[col] = max(searchsortedlast(col_rv, new_first_row) - 1, 1) + new_firsti - 1
+    end
+
+    nrow, ncol = size(A)
+    for row ∈ 1:nrow
+        new_row = new_rowinds[row]
+        for col ∈ 1:ncol
+            newcol = new_colinds[col]
+            newi = row_counter[col]
+            new_lasti = new_colptr[newcol+1]-1
+            if new_rowval[newi] > new_row
+                continue
+            end
+            while newi ≤ new_lasti && new_rowval[newi] < new_row
+                newi += 1
+            end
+            if newi > new_lasti
+                continue
+            end
+            if new_rowval[newi] == new_row
+                val = new_nzval[newi]
+                if val != zero(Tf)
+                    push!(colval, col)
+                    push!(nzval, val)
+                end
+            end
+            row_counter[col] = newi
+        end
+        push!(rowptr, length(colval) + 1)
+    end
+
+    return nothing
+end
+function update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
+                               new_A::SubArray{Tf,2}, new_rowinds,
+                               row_counter::Vector{Int64}) where {Bi,Tf,Ti}
+    full_rowinds, full_colinds = new_A.indices
+    return update_sparse_matrix!(A, parent(new_A), @view(full_rowinds[new_rowinds]),
+                                 full_colinds, row_counter)
 end
 
 """
@@ -1236,6 +1359,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         D_local_column_repeats_partial = get_partial_repeated_inds(D_local_column_repeats,
                                                                    D_local_column_range_partial)
     end
+    C_row_counter = zeros(Int64, top_vec_local_size)
 
     # Allocate buffer arrays
     if sparse_Ainv_B && !use_sparse
@@ -1351,6 +1475,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                                           C_global_row_range_partial,
                                           C_local_row_range_partial,
                                           C_local_row_repeats_partial,
+                                          C_row_counter,
                                           D_global_column_range_partial,
                                           D_local_column_range_partial,
                                           D_local_column_repeats,
@@ -1538,10 +1663,7 @@ function update_C!(sc, C)
         end
         # When using shared memory, only store the slice of C that this process needs.
         if issparse(sc.C)
-            new_C_view = @view C[sc.C_local_row_range_partial,:]
-            new_C = sparsecsr(new_C_view)
-            #new_C = transpose(sparse(transpose(new_C_view)))
-            update_sparse_matrix!(sc.C, new_C)
+            update_sparse_matrix!(sc.C, C, sc.C_local_row_range_partial, sc.C_row_counter)
         else
             # Make a copy because C_local_row_range_partial might not be a contiguous range of
             # indices, but performance will be better if `C` is a contiguously-allocated
@@ -1550,13 +1672,12 @@ function update_C!(sc, C)
             for j ∈ 1:size(C, 2), (i1, i2) ∈ enumerate(sc.C_local_row_range_partial)
                 sc_C[i1,j] = C[i2,j]
             end
-            new_C = sc_C
         end
     end
-    return new_C
+    return nothing
 end
 
-function update_schur_complement_factorization!(sc, D, new_C)
+function update_schur_complement_factorization!(sc, D)
     timer = sc.timer
     schur_complement = sc.schur_complement
     schur_complement_local_range_partial = sc.schur_complement_local_range_partial
@@ -1584,7 +1705,7 @@ function update_schur_complement_factorization!(sc, D, new_C)
     check_lu = sc.check_lu
 
     @sc_timeit timer "schur_complement" begin
-        # Initialise `schur_complement` to zero, because when `new_C` does not include all rows,
+        # Initialise `schur_complement` to zero, because when `this_C` does not include all rows,
         # the matrix multiplication below would not initialise all elements.
         if issparse(schur_complement)
             schur_colptr = schur_complement.colptr
@@ -1624,10 +1745,11 @@ function update_schur_complement_factorization!(sc, D, new_C)
         # (only local columns). Therefore we can take the matrix product `Ainv_dot_B*C` with
         # the local chunks, then do a sum-reduce to get the final result. The
         # `schur_complement` buffer is full size on every rank.
-        if isa(new_C, SparseMatrixCSR) && isa(Ainv_dot_B, AbstractSparseMatrixCSC)
-            csr_mul!(C_dot_Ainv_dot_B, new_C, Ainv_dot_B, -1.0, 0.0)
+        this_C = sc.C
+        if isa(this_C, SparseMatrixCSR) && isa(Ainv_dot_B, AbstractSparseMatrixCSC)
+            csr_mul!(C_dot_Ainv_dot_B, this_C, Ainv_dot_B, -1.0, 0.0)
         else
-            mul!(C_dot_Ainv_dot_B, new_C, Ainv_dot_B, -1.0, 0.0)
+            mul!(C_dot_Ainv_dot_B, this_C, Ainv_dot_B, -1.0, 0.0)
         end
         if issparse(C_dot_Ainv_dot_B)
             C_dot_Ainv_dot_B_colptr = C_dot_Ainv_dot_B.colptr
@@ -1738,8 +1860,8 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
 
         update_A_factorization!(sc, A)
         update_Ainv_dot_B!(sc, B)
-        new_C = update_C!(sc, C)
-        update_schur_complement_factorization!(sc, D, new_C)
+        update_C!(sc, C)
+        update_schur_complement_factorization!(sc, D)
     end
 
     return nothing
