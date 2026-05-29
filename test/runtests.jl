@@ -5,6 +5,8 @@ using LinearAlgebra
 BLAS.set_num_threads(1)
 
 using MPI
+using SparseArrays
+using SparseArrays: FixedSparseCSC
 using StableRNGs
 using Test
 

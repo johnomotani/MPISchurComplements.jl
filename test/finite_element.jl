@@ -425,13 +425,31 @@ function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
     Alu = @views FakeMPILU(local_A, top_chunk_global_inds, top_chunk_global_inds;
                            comm=distributed_comm, shared_comm=shared_comm)
 
-    sc = mpi_schur_complement(Alu, local_B, local_C, local_D, top_chunk_global_inds,
+    if sparse_Ainv_B
+        nrow = size(local_B, 1)
+        ncol = length(global_y)
+        if periodic
+            ncol -= 1
+        end
+        Ainv_dot_B_buffer = get_full_shared_sparse_matrix(nrow, ncol,
+                                                          allocate_array_float)
+    else
+        Ainv_dot_B_buffer = nothing
+    end
+
+    this_B = get_full_sparse_matrix_copy(local_B, allocate_array_float, shared_rank)
+    this_C = get_full_sparse_matrix_copy(local_C, allocate_array_float, shared_rank)
+    this_D = get_full_sparse_matrix_copy(local_D, allocate_array_float, shared_rank)
+
+    sc = mpi_schur_complement(Alu, this_B, this_C, this_D, top_chunk_global_inds,
                               bottom_chunk_global_inds; comm=comm,
                               shared_comm=shared_comm, distributed_comm=distributed_comm,
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               separate_Ainv_B=separate_Ainv_B,
-                              sparse_Ainv_B=sparse_Ainv_B, parallel_schur=parallel_schur)
+                              sparse_Ainv_B=sparse_Ainv_B,
+                              Ainv_dot_B_buffer=Ainv_dot_B_buffer,
+                              parallel_schur=parallel_schur)
 
     function test_once(M_assembled)
         ldiv!(local_x, local_y, sc, local_u, local_v)
@@ -535,7 +553,12 @@ function finite_element_1D1V_test(n1, n2, tol; periodic=false, n_shared=1,
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         local_A, local_B, local_C, local_D, _, _, _, _ = get_local_slices(M)
         shared_comm !== nothing && MPI.Barrier(shared_comm)
-        update_schur_complement!(sc, local_A, local_B, local_C, local_D)
+
+        this_B = get_full_sparse_matrix_copy(local_B, allocate_array_float, shared_rank)
+        this_C = get_full_sparse_matrix_copy(local_C, allocate_array_float, shared_rank)
+        this_D = get_full_sparse_matrix_copy(local_D, allocate_array_float, shared_rank)
+
+        update_schur_complement!(sc, local_A, this_B, this_C, this_D)
         test_once(M_assembled)
     end
 
@@ -891,13 +914,31 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, periodic=false,
     Alu = @views FakeMPILU(local_A, top_chunk_global_inds, top_chunk_global_inds;
                            comm=distributed_comm, shared_comm=shared_comm)
 
-    sc = mpi_schur_complement(Alu, local_B, local_C, local_D, top_chunk_global_inds,
+    if sparse_Ainv_B
+        nrow = size(local_B, 1)
+        ncol = length(global_y)
+        if periodic
+            ncol -= n_first_dim + n_second_dim - 1
+        end
+        Ainv_dot_B_buffer = get_full_shared_sparse_matrix(nrow, ncol,
+                                                          allocate_array_float)
+    else
+        Ainv_dot_B_buffer = nothing
+    end
+
+    this_B = get_full_sparse_matrix_copy(local_B, allocate_array_float, shared_rank)
+    this_C = get_full_sparse_matrix_copy(local_C, allocate_array_float, shared_rank)
+    this_D = get_full_sparse_matrix_copy(local_D, allocate_array_float, shared_rank)
+
+    sc = mpi_schur_complement(Alu, this_B, this_C, this_D, top_chunk_global_inds,
                               bottom_chunk_global_inds; comm=comm,
                               shared_comm=shared_comm, distributed_comm=distributed_comm,
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               separate_Ainv_B=separate_Ainv_B,
-                              sparse_Ainv_B=sparse_Ainv_B, parallel_schur=parallel_schur)
+                              sparse_Ainv_B=sparse_Ainv_B,
+                              Ainv_dot_B_buffer=Ainv_dot_B_buffer,
+                              parallel_schur=parallel_schur)
 
     function test_once(M_assembled)
         ldiv!(local_x, local_y, sc, local_u, local_v)
@@ -1024,7 +1065,12 @@ function finite_element_2D1V_test(n1, n2, n3, tol; n_shared=1, periodic=false,
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         local_A, local_B, local_C, local_D, _, _, _, _ = get_local_slices(M)
         shared_comm !== nothing && MPI.Barrier(shared_comm)
-        update_schur_complement!(sc, local_A, local_B, local_C, local_D)
+
+        this_B = get_full_sparse_matrix_copy(local_B, allocate_array_float, shared_rank)
+        this_C = get_full_sparse_matrix_copy(local_C, allocate_array_float, shared_rank)
+        this_D = get_full_sparse_matrix_copy(local_D, allocate_array_float, shared_rank)
+
+        update_schur_complement!(sc, local_A, this_B, this_C, this_D)
         test_once(M_assembled)
     end
 
@@ -1343,7 +1389,29 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, periodic=fals
                     periodic_global_inds[top_chunk_slice]; comm=distributed_comm,
                     shared_comm=shared_comm)
 
-    sc = mpi_schur_complement(Alu, local_B, local_C, local_D,
+    if sparse_Ainv_B
+        nrow = size(local_B, 1)
+        ncol = length(global_y)
+        if periodic
+            ncol = (s1 - 1) * (n_second_dim - 1) * (n_third_dim - 1) +
+                   (s2 - 1) * (n_first_dim - 1) * (n_third_dim - 1) +
+                   (s3 - 1) * (n_first_dim - 1) * (n_second_dim - 1) -
+                   (s2 - 1) * (s3 - 1) * (n_first_dim - 1) -
+                   (s1 - 1) * (s3 - 1) * (n_second_dim - 1) -
+                   (s1 - 1) * (s2 - 1) * (n_third_dim - 1) +
+                   (s1 - 1) * (s2 - 1) * (s3 - 1)
+        end
+        Ainv_dot_B_buffer = get_full_shared_sparse_matrix(nrow, ncol,
+                                                          allocate_array_float)
+    else
+        Ainv_dot_B_buffer = nothing
+    end
+
+    this_B = get_full_sparse_matrix_copy(local_B, allocate_array_float, shared_rank)
+    this_C = get_full_sparse_matrix_copy(local_C, allocate_array_float, shared_rank)
+    this_D = get_full_sparse_matrix_copy(local_D, allocate_array_float, shared_rank)
+
+    sc = mpi_schur_complement(Alu, this_B, this_C, this_D,
                               periodic_global_inds[top_chunk_slice],
                               periodic_global_inds[bottom_chunk_slice];
                               comm=comm, shared_comm=shared_comm,
@@ -1351,7 +1419,9 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, periodic=fals
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               separate_Ainv_B=separate_Ainv_B,
-                              sparse_Ainv_B=sparse_Ainv_B, parallel_schur=parallel_schur)
+                              sparse_Ainv_B=sparse_Ainv_B,
+                              Ainv_dot_B_buffer=Ainv_dot_B_buffer,
+                              parallel_schur=parallel_schur)
 
     function test_once(M_assembled)
         ldiv!(local_x, local_y, sc, local_u, local_v)
@@ -1464,7 +1534,12 @@ function finite_element_3D_split_test(s1, s2, s3, tol; n_shared=1, periodic=fals
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         local_A, local_B, local_C, local_D, _, _, _, _ = get_local_slices(M)
         shared_comm !== nothing && MPI.Barrier(shared_comm)
-        update_schur_complement!(sc, local_A, local_B, local_C, local_D)
+
+        this_B = get_full_sparse_matrix_copy(local_B, allocate_array_float, shared_rank)
+        this_C = get_full_sparse_matrix_copy(local_C, allocate_array_float, shared_rank)
+        this_D = get_full_sparse_matrix_copy(local_D, allocate_array_float, shared_rank)
+
+        update_schur_complement!(sc, local_A, this_B, this_C, this_D)
         test_once(M_assembled)
     end
 

@@ -286,9 +286,9 @@ function ldiv!(x::AbstractVector, Alu::FakeMPILU, b::AbstractVector)
         end
     else
         # This drops any repeated entries in `b`.
-        b = Vector(b[local_unique_vector_range])
+        b = Vector(@view b[local_unique_vector_range])
         MPI.Send(b, comm; dest=0)
-        buffer = similar(x, length(local_unique_vector_range))
+        buffer = Vector{eltype(x)}(undef, length(local_unique_vector_range))
         MPI.Recv!(buffer, comm; source=0)
         @views x[local_unique_vector_range] .= buffer
     end
