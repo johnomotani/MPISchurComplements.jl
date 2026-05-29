@@ -24,6 +24,25 @@ macro sc_timeit(timer, name, expr)
     end
 end
 
+"""
+    MPISchurComplementAFactorization{T} <: Factorization{T}
+
+External packages can implement `Factorization` solvers of this type, so that when they
+are used for the \$A^{-1}\\cdot B\$ operation, they are called with the special
+`ldiv_Bmatrix!()` function instead of the generic `ldiv!()`. This allows the
+externally-implemented solver to specialise on any known structure of the `B` block of the
+matrix.
+"""
+abstract type MPISchurComplementAFactorization{T} <: Factorization{T} end
+
+"""
+    ldiv_Bmatrix!(Alu::MPISchurComplementAFactorization, u)
+
+Special version of `ldiv!()` called by `MPISchurComplements` for the operation
+\$A^{-1}\\cdot B\$ that can be implemented by external packages to take advantage of any
+known structure of \$B\$.
+"""
+function ldiv_Bmatrix! end
 
 struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,TC<:AbstractMatrix{Tf},
                           TSC<:AbstractMatrix{Tf},TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,Tltv,
@@ -1644,7 +1663,11 @@ function update_Ainv_dot_B!(sc, B)
             end
             synchronize_shared()
         end
-        ldiv!(A_factorization, Ainv_dot_B)
+        if isa(A_factorization, MPISchurComplementAFactorization)
+            ldiv_Bmatrix!(A_factorization, Ainv_dot_B)
+        else
+            ldiv!(A_factorization, Ainv_dot_B)
+        end
     end
     return nothing
 end
