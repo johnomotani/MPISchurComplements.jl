@@ -1,5 +1,6 @@
 function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=true,
-                           separate_Ainv_B=false, use_unitrange=true, parallel_schur=true)
+                           separate_Ainv_B=false, sparse_Ainv_B=false, use_unitrange=true,
+                           parallel_schur=true)
     comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
         shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
         local_win_store_float, local_win_store_int = get_comms(n_shared, with_comm)
@@ -72,7 +73,24 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=
     bottom_vec_buffer = similar(y)
     global_y = similar(y)
 
-    sc = mpi_schur_complement(Alu, copy(local_B), copy(local_C), copy(local_D),
+    if sparse_Ainv_B
+        Ainv_dot_B_buffer = get_full_shared_sparse_matrix(size(local_B)...,
+                                                          allocate_array_float)
+    else
+        Ainv_dot_B_buffer = nothing
+    end
+
+    if use_sparse
+        this_B = get_full_sparse_matrix_copy(local_B)
+        this_C = get_full_sparse_matrix_copy(local_C)
+        this_D = get_full_sparse_matrix_copy(local_D)
+    else
+        this_B = copy(local_B)
+        this_C = copy(local_C)
+        this_D = copy(local_D)
+    end
+
+    sc = mpi_schur_complement(Alu, this_B, this_C, this_D,
                               convert_range(owned_top_vector_entries),
                               convert_range(owned_bottom_vector_entries);
                               B_global_column_range=convert_range(1:n2),
@@ -83,6 +101,8 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               use_sparse=use_sparse, separate_Ainv_B=separate_Ainv_B,
+                              sparse_Ainv_B=sparse_Ainv_B,
+                              Ainv_dot_B_buffer=Ainv_dot_B_buffer,
                               parallel_schur=parallel_schur)
 
     function test_once()
@@ -140,8 +160,17 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=
             MPI.Bcast!(b, distributed_comm; root=0)
         end
         shared_comm !== nothing && MPI.Barrier(shared_comm)
-        update_schur_complement!(sc, copy(local_A), copy(local_B), copy(local_C),
-                                 copy(local_D))
+
+        if use_sparse
+            this_B = get_full_sparse_matrix_copy(local_B)
+            this_C = get_full_sparse_matrix_copy(local_C)
+            this_D = get_full_sparse_matrix_copy(local_D)
+        else
+            this_B = copy(local_B)
+            this_C = copy(local_C)
+            this_D = copy(local_D)
+        end
+        update_schur_complement!(sc, copy(local_A), this_B, this_C, this_D)
         test_once()
     end
 
@@ -175,8 +204,8 @@ function dense_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=
 end
 
 function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse=true,
-                            separate_Ainv_B=false, use_unitrange=true,
-                            parallel_schur=true)
+                            separate_Ainv_B=false, sparse_Ainv_B=false,
+                            use_unitrange=true, parallel_schur=true)
     comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
         shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
         local_win_store_float, local_win_store_int = get_comms(n_shared, with_comm)
@@ -312,8 +341,24 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse
                            convert_range(local_top_irange); comm=distributed_comm,
                            shared_comm=shared_comm)
 
-    sc = mpi_schur_complement(Alu, local_B[:,local_bottom_irange],
-                              local_C[local_bottom_irange,:], local_D[:,D_local_irange],
+    if sparse_Ainv_B
+        Ainv_dot_B_buffer = get_full_shared_sparse_matrix(size(local_B)...,
+                                                          allocate_array_float)
+    else
+        Ainv_dot_B_buffer = nothing
+    end
+
+    if use_sparse
+        this_B = get_full_sparse_matrix_copy(local_B[:,local_bottom_irange])
+        this_C = get_full_sparse_matrix_copy(local_C[local_bottom_irange,:])
+        this_D = get_full_sparse_matrix_copy(local_D[:,D_local_irange])
+    else
+        this_B = local_B[:,local_bottom_irange]
+        this_C = local_C[local_bottom_irange,:]
+        this_D = local_D[:,D_local_irange]
+    end
+
+    sc = mpi_schur_complement(Alu, this_B, this_C, this_D,
                               convert_range(owned_top_vector_entries),
                               convert_range(owned_bottom_vector_entries);
                               B_global_column_range=convert_range(local_bottom_irange),
@@ -324,6 +369,8 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               use_sparse=use_sparse, separate_Ainv_B=separate_Ainv_B,
+                              sparse_Ainv_B=sparse_Ainv_B,
+                              Ainv_dot_B_buffer=Ainv_dot_B_buffer,
                               parallel_schur=parallel_schur)
 
     function test_once()
@@ -383,10 +430,18 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse
             MPI.Bcast!(b, distributed_comm; root=0)
         end
         shared_comm !== nothing && MPI.Barrier(shared_comm)
+
+        if use_sparse
+            this_B = get_full_sparse_matrix_copy(local_B[:,local_bottom_irange])
+            this_C = get_full_sparse_matrix_copy(local_C[local_bottom_irange,:])
+            this_D = get_full_sparse_matrix_copy(local_D[:,D_local_irange])
+        else
+            this_B = local_B[:,local_bottom_irange]
+            this_C = local_C[local_bottom_irange,:]
+            this_D = local_D[:,D_local_irange]
+        end
         update_schur_complement!(sc, local_A[:,local_top_irange],
-                                 local_B[:,local_bottom_irange],
-                                 local_C[local_bottom_irange,:],
-                                 local_D[:,D_local_irange])
+                                 this_B, this_C, this_D)
         test_once()
     end
 
@@ -420,8 +475,8 @@ function sparse_matrix_test(n1, n2, tol; n_shared=1, with_comm=false, use_sparse
 end
 
 function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=false,
-                             use_sparse=true, separate_Ainv_B=false, use_unitrange=true,
-                             add_index_gap=false, parallel_schur=true)
+                             use_sparse=true, separate_Ainv_B=false, sparse_Ainv_B=false,
+                             use_unitrange=true, add_index_gap=false, parallel_schur=true)
     comm, distributed_comm, distributed_nproc, distributed_rank, shared_comm,
         shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
         local_win_store_float, local_win_store_int = get_comms(n_shared, with_comm)
@@ -555,7 +610,25 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
                            convert_range(nominal_local_top_vec_range); comm=distributed_comm,
                            shared_comm=shared_comm)
 
-    sc = mpi_schur_complement(Alu, local_B, local_C, local_D,
+    if sparse_Ainv_B
+        Ainv_dot_B_buffer = get_full_shared_sparse_matrix(size(local_B, 1),
+                                                          length(global_y),
+                                                          allocate_array_float)
+    else
+        Ainv_dot_B_buffer = nothing
+    end
+
+    if use_sparse
+        this_B = get_full_sparse_matrix_copy(local_B)
+        this_C = get_full_sparse_matrix_copy(local_C)
+        this_D = get_full_sparse_matrix_copy(local_D)
+    else
+        this_B = copy(local_B)
+        this_C = copy(local_C)
+        this_D = copy(local_D)
+    end
+
+    sc = mpi_schur_complement(Alu, this_B, this_C, this_D,
                               convert_range(nominal_local_top_vec_range),
                               convert_range(nominal_local_bottom_vec_range);
                               comm=comm, shared_comm=shared_comm,
@@ -563,6 +636,8 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
                               allocate_shared_float=allocate_array_float,
                               allocate_shared_int=allocate_array_int,
                               use_sparse=use_sparse, separate_Ainv_B=separate_Ainv_B,
+                              sparse_Ainv_B=sparse_Ainv_B,
+                              Ainv_dot_B_buffer=Ainv_dot_B_buffer,
                               parallel_schur=parallel_schur)
 
     function test_once()
@@ -625,7 +700,17 @@ function overlap_matrix_test(local_n1, local_n2, tol; n_shared=1, with_comm=fals
         shared_comm !== nothing && MPI.Barrier(shared_comm)
         local_A, local_B, local_C, local_D = get_local_slices(M)
         shared_comm !== nothing && MPI.Barrier(shared_comm)
-        update_schur_complement!(sc, local_A, local_B, local_C, local_D)
+
+        if use_sparse
+            this_B = get_full_sparse_matrix_copy(local_B)
+            this_C = get_full_sparse_matrix_copy(local_C)
+            this_D = get_full_sparse_matrix_copy(local_D)
+        else
+            this_B = copy(local_B)
+            this_C = copy(local_C)
+            this_D = copy(local_D)
+        end
+        update_schur_complement!(sc, local_A, this_B, this_C, this_D)
         test_once()
     end
 
@@ -663,20 +748,27 @@ function simple_matrix_tests()
         nproc = MPI.Comm_size(MPI.COMM_WORLD)
         if nproc == 1
             # Test prime vector sizes - easier to do in serial.
-            @testset "($n1,$n2), tol=$tol with_comm=$with_comm, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B, use_unitrange=$use_unitrange, parallel_schur=$parallel_schur" for (n1,n2,tol) ∈ (
+            @testset "($n1,$n2), tol=$tol with_comm=$with_comm, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B, sparse_Ainv_B=$sparse_Ainv_B, use_unitrange=$use_unitrange, parallel_schur=$parallel_schur" for (n1,n2,tol) ∈ (
                     (3, 2, 5.0e-14),
                     (100, 32, 2.0e-10),
                     (1000, 17, 1.0e-8),
                     (1000, 129, 1.0e-8),
-                   ), with_comm ∈ (false, true), use_sparse ∈ (true, false), separate_Ainv_B ∈ (true, false), use_unitrange ∈ (true, false), parallel_schur ∈ (true, false)
+                   ), with_comm ∈ (false, true), use_sparse ∈ (true, false), separate_Ainv_B ∈ (true, false), sparse_Ainv_B ∈ (true, false), use_unitrange ∈ (true, false), parallel_schur ∈ (true, false)
                 if !use_sparse && separate_Ainv_B
                     continue
                 end
-                println("simple_matrix ($n1,$n2), tol=$tol with_comm=$with_comm, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B, use_unitrange=$use_unitrange, parallel_schur=$parallel_schur")
+                if !use_sparse && sparse_Ainv_B
+                    continue
+                end
+                if separate_Ainv_B && sparse_Ainv_B
+                    continue
+                end
+                println("simple_matrix ($n1,$n2), tol=$tol with_comm=$with_comm, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B, sparse_Ainv_B=$sparse_Ainv_B, use_unitrange=$use_unitrange, parallel_schur=$parallel_schur")
                 @testset "dense" begin
                     dense_matrix_test(n1, n2, tol; with_comm=with_comm,
                                       use_sparse=use_sparse,
                                       separate_Ainv_B=separate_Ainv_B,
+                                      sparse_Ainv_B=sparse_Ainv_B,
                                       use_unitrange=use_unitrange,
                                       parallel_schur=parallel_schur)
                 end
@@ -684,6 +776,7 @@ function simple_matrix_tests()
                     sparse_matrix_test(n1, n2, tol; with_comm=with_comm,
                                        use_sparse=use_sparse,
                                        separate_Ainv_B=separate_Ainv_B,
+                                       sparse_Ainv_B=sparse_Ainv_B,
                                        use_unitrange=use_unitrange,
                                        parallel_schur=parallel_schur)
                 end
@@ -692,6 +785,7 @@ function simple_matrix_tests()
                     # the test anyway as a sanity-check.
                     overlap_matrix_test(n1 + 1, n2 + 1, tol; use_sparse=use_sparse,
                                         separate_Ainv_B=separate_Ainv_B,
+                                        sparse_Ainv_B=sparse_Ainv_B,
                                         use_unitrange=use_unitrange,
                                         parallel_schur=parallel_schur)
                 end
@@ -700,6 +794,7 @@ function simple_matrix_tests()
                     # the test anyway as a sanity-check.
                     overlap_matrix_test(n1 + 1, n2 + 1, tol; use_sparse=use_sparse,
                                         separate_Ainv_B=separate_Ainv_B,
+                                        sparse_Ainv_B=sparse_Ainv_B,
                                         use_unitrange=use_unitrange,
                                         parallel_schur=parallel_schur, add_index_gap=true)
                 end
@@ -710,19 +805,26 @@ function simple_matrix_tests()
             n_shared = 1
             while n_shared ≤ nproc
                 n_distributed = nproc ÷ n_shared
-                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B, use_unitrange=$use_unitrange, parallel_schur=$parallel_schur" for (n1,n2,tol) ∈ (
+                @testset "n_shared=$n_shared ($n1,$n2), tol=$tol, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B, sparse_Ainv_B=$sparse_Ainv_B, use_unitrange=$use_unitrange, parallel_schur=$parallel_schur" for (n1,n2,tol) ∈ (
                         (128, 32, 4.0e-10),
                         (1024, 32, 1.0e-8),
                         (1024, 128, 3.0e-7),
-                       ), use_sparse ∈ (true, false), separate_Ainv_B ∈ (true, false), use_unitrange ∈ (true, false), parallel_schur ∈ (true, false)
+                       ), use_sparse ∈ (true, false), separate_Ainv_B ∈ (true, false), sparse_Ainv_B ∈ (true, false), use_unitrange ∈ (true, false), parallel_schur ∈ (true, false)
                     if !use_sparse && separate_Ainv_B
                         continue
                     end
-                    println("simple_matrix n_shared=$n_shared ($n1,$n2), tol=$tol, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B, use_unitrange=$use_unitrange, parallel_schur=$parallel_schur")
+                    if !use_sparse && sparse_Ainv_B
+                        continue
+                    end
+                    if separate_Ainv_B && sparse_Ainv_B
+                        continue
+                    end
+                    println("simple_matrix n_shared=$n_shared ($n1,$n2), tol=$tol, use_sparse=$use_sparse, separate_Ainv_B=$separate_Ainv_B, sparse_Ainv_B=$sparse_Ainv_B, use_unitrange=$use_unitrange, parallel_schur=$parallel_schur")
                     @testset "dense" begin
                         dense_matrix_test(n1, n2, tol; n_shared=n_shared,
                                           use_sparse=use_sparse,
                                           separate_Ainv_B=separate_Ainv_B,
+                                          sparse_Ainv_B=sparse_Ainv_B,
                                           use_unitrange=use_unitrange,
                                           parallel_schur=parallel_schur)
                     end
@@ -730,6 +832,7 @@ function simple_matrix_tests()
                         sparse_matrix_test(n1, n2, tol; n_shared=n_shared,
                                            use_sparse=use_sparse,
                                            separate_Ainv_B=separate_Ainv_B,
+                                           sparse_Ainv_B=sparse_Ainv_B,
                                            use_unitrange=use_unitrange,
                                            parallel_schur=parallel_schur)
                     end
@@ -738,6 +841,7 @@ function simple_matrix_tests()
                                             n2 ÷ n_distributed + 1, tol;
                                             n_shared=n_shared, use_sparse=use_sparse,
                                             separate_Ainv_B=separate_Ainv_B,
+                                            sparse_Ainv_B=sparse_Ainv_B,
                                             use_unitrange=use_unitrange,
                                             parallel_schur=parallel_schur)
                     end
@@ -746,6 +850,7 @@ function simple_matrix_tests()
                                             n2 ÷ n_distributed + 1, tol;
                                             n_shared=n_shared, use_sparse=use_sparse,
                                             separate_Ainv_B=separate_Ainv_B,
+                                            sparse_Ainv_B=sparse_Ainv_B,
                                             use_unitrange=use_unitrange,
                                             add_index_gap=true,
                                             parallel_schur=parallel_schur)
