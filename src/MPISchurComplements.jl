@@ -44,9 +44,11 @@ known structure of \$B\$.
 """
 function ldiv_Bmatrix! end
 
-struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,TC<:AbstractMatrix{Tf},
-                          TSC<:AbstractMatrix{Tf},TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,Tltv,
-                          Tbv,Tgy,TBob,Trangeno,Tsync,Ttimer} <: Factorization{Tf}
+struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,
+                          Tdensebuff<:Union{AbstractMatrix{Tf},Nothing},
+                          TC<:AbstractMatrix{Tf},TSC<:AbstractMatrix{Tf},TSCF,TAiu,TCAiB,
+                          TCAiu,TAiBy,Ttv,Tltv,Tbv,Tgy,TBob,Trangeno,Tsync,
+                          Ttimer} <: Factorization{Tf}
     A_factorization::TA
     Ainv_dot_B::TAiB
     Ainv_dot_B_local::TAiBl
@@ -58,15 +60,18 @@ struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,TC<:AbstractMatrix{
     B_local_column_range_partial::Trange
     B_local_column_repeats::Matrix{Int64}
     B_local_column_repeats_partial::Matrix{Int64}
+    B_dense_buffer::Tdensebuff
     C::TC
     C_global_row_range_partial::Trange
     C_local_row_range_partial::Trange
     C_local_row_repeats_partial::Matrix{Int64}
     C_row_counter::Vector{Int64}
+    C_dense_buffer::Tdensebuff
     D_global_column_range_partial::Trange
     D_local_column_range_partial::Trange
     D_local_column_repeats::Matrix{Int64}
     D_local_column_repeats_partial::Matrix{Int64}
+    D_dense_buffer::Tdensebuff
     schur_complement::TSC
     schur_complement_factorization::TSCF
     schur_complement_local_range_partial::Trange
@@ -584,6 +589,60 @@ function update_sparse_matrix_select_columns!(A::FixedSparseCSC{Tf,Ti}, colinds,
 end
 
 """
+    update_from_sparse_matrix_select_columns!(A::Matrix{Tf},
+                                              new_A::AbstractSparseMatrixCSC{Tf,Ti},
+                                              new_colinds, new_rowinds) where {Tf,Ti}
+
+Update the values of `A` in-place to the values of `new_A`.
+
+`new_colinds` gives the subset of columns in `new_A` that should be copied into `A`.
+
+`new_rowinds` gives the subset of rows in `new_A` that should be copied into `A`.
+"""
+function update_from_sparse_matrix_select_columns!(A::Matrix{Tf}, colinds,
+                                                   new_A::AbstractSparseMatrixCSC{Tf,Ti},
+                                                   new_colinds, new_rowinds) where {Tf,Ti}
+    new_colptr = new_A.colptr
+    new_rowval = new_A.rowval
+    new_nzval = new_A.nzval
+    new_nrows = length(new_rowinds)
+    for (col, new_col) ∈ zip(colinds, new_colinds)
+        new_firsti = new_colptr[new_col]
+        new_lasti = new_colptr[new_col+1] - 1
+        new_firstrow = new_rowval[new_firsti]
+        # Expect than usually the sparsity patterns of A and new_A will match, so the
+        # rowval entries for this column will be the same in both. Therefore no need to
+        # use `searchsortedlast()` to speed up finding the first matching entry for `i`.
+        row = max(searchsortedlast(new_rowinds, new_firstrow) - 1, 1)
+        for new_i ∈ new_firsti:new_lasti
+            new_row = new_rowval[new_i]
+            while row ≤ new_nrows && new_rowinds[row] < new_row
+                A[row,col] = 0.0
+                row += 1
+            end
+            if row > new_nrows
+                A[row:end,col] .= 0.0
+                break
+            end
+            if new_rowinds[row] == new_row
+                A[row,col] = new_nzval[new_i]
+                row += 1
+            end
+        end
+    end
+    return nothing
+end
+function update_from_sparse_matrix_select_columns!(A::Matrix{Tf}, colinds,
+                                                   new_A::SubArray{Tf,2},
+                                                   new_colinds) where {Tf}
+    full_new_A = parent(new_A)
+    full_rowinds, full_colinds = new_A.indices
+    return update_from_sparse_matrix_select_columns!(A, colinds, full_new_A,
+                                                     @view(full_colinds[new_colinds]),
+                                                     full_rowinds)
+end
+
+"""
     update_sparse_matrix_select_rows!(A::AbstractSparseMatrixCSC{Tf,Ti},
                                       new_A::FixedSparseCSC{Tf,Ti}, rowinds) where {Tf,Ti}
 
@@ -821,6 +880,7 @@ end
                          parallel_schur::Union{Bool,Factorization}=(distributed_comm!==nothing || shared_comm!==nothing),
                          Ainv_dot_B_buffer::Union{AbstractMatrix,Nothing}=nothing,
                          schur_complement_buffer::Union{AbstractMatrix,Nothing}=nothing,
+                         copy_input_to_dense_buffers::Bool=false,
                          schur_tile_size::Union{Integer,Nothing}=nothing,
                          skip_factorization::Bool=false, check_lu::Bool=true,
                          timer::Union{TimerOutput,Nothing}=nothing)
@@ -938,6 +998,14 @@ To use a non-dense matrix type for `Ainv_dot_B` or `schur_complement`, pass the 
 to use as `Ainv_dot_B_buffer` or `schur_complement_buffer`. If you are using shared-memory
 parallelism, these must be shared-memory buffers.
 
+When the inputs that will be passed to `update_schur_complement!()` are sparse arrays (or
+views of sparse arrays), and there are repeated indices, it might be the case that the
+'copy to' locations of the repeated indices are not part of the non-zero entries in the
+sparse matrix. In that case it is necessary to copy the `B`, `C` and `D` inputs into
+buffers that have non-zero entries in all the required places. One way to do this is to
+use dense-matrix buffers, and this will be done if `copy_input_to_dense_buffers=true` is
+passed.
+
 `skip_factorization=true` can be passed to create an MPISchurComplement instance without
 calculating the factorization corresponding to the input matrices. `ldiv!()` called with
 this instance will give incorrect results unless `update_schur_complement!()` is called
@@ -970,6 +1038,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                               parallel_schur::Union{Bool,Factorization}=(distributed_comm!==nothing || shared_comm!==nothing),
                               Ainv_dot_B_buffer::Union{AbstractMatrix,Nothing}=nothing,
                               schur_complement_buffer::Union{AbstractMatrix,Nothing}=nothing,
+                              copy_input_to_dense_buffers::Bool=false,
                               schur_tile_size::Union{Integer,Nothing}=nothing,
                               skip_factorization::Bool=false, check_lu::Bool=true,
                               timer::Union{TimerOutput,Nothing}=nothing)
@@ -1483,6 +1552,21 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         parallel_schur = true
     end
 
+    if copy_input_to_dense_buffers
+        B_dense_buffer = allocate_shared_float(top_vec_local_size, bottom_vec_local_size)
+        C_dense_buffer = allocate_shared_float(bottom_vec_local_size, top_vec_local_size)
+        D_dense_buffer = allocate_shared_float(bottom_vec_local_size, bottom_vec_local_size)
+        if shared_rank == 0
+            B_dense_buffer .= 0.0
+            C_dense_buffer .= 0.0
+            D_dense_buffer .= 0.0
+        end
+    else
+        B_dense_buffer = nothing
+        C_dense_buffer = nothing
+        D_dense_buffer = nothing
+    end
+
     sc_factorization = MPISchurComplement(A_factorization, Ainv_dot_B, Ainv_dot_B_local,
                                           B_local, B_column_range_partial,
                                           B_global_column_range,
@@ -1490,15 +1574,15 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                                           B_local_column_range,
                                           B_local_column_range_partial,
                                           B_local_column_repeats,
-                                          B_local_column_repeats_partial, fake_C,
-                                          C_global_row_range_partial,
+                                          B_local_column_repeats_partial, B_dense_buffer,
+                                          fake_C, C_global_row_range_partial,
                                           C_local_row_range_partial,
                                           C_local_row_repeats_partial,
-                                          C_row_counter,
+                                          C_row_counter, C_dense_buffer,
                                           D_global_column_range_partial,
                                           D_local_column_range_partial,
                                           D_local_column_repeats,
-                                          D_local_column_repeats_partial,
+                                          D_local_column_repeats_partial, D_dense_buffer,
                                           schur_complement,
                                           schur_complement_factorization,
                                           schur_complement_local_range_partial,
@@ -1920,10 +2004,39 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
         @boundscheck length(sc.owned_bottom_vector_entries) == size(D, 1) || error(BoundsError, " Number of rows in D does not match number of locally owned bottom_vector_entries")
         @boundscheck length(sc.D_local_column_range_partial) == 0 || maximum(sc.D_local_column_range_partial) ≤ size(D, 2) || error(BoundsError, " Number of columns in D is smaller than the largest index in D_local_column_range")
 
+        B_dense_buffer = sc.B_dense_buffer
+        C_dense_buffer = sc.C_dense_buffer
+        D_dense_buffer = sc.D_dense_buffer
+        if B_dense_buffer !== nothing && C_dense_buffer !== nothing && D_dense_buffer !== nothing
+            local_top_vector_range_partial = sc.local_top_vector_range_partial
+            local_bottom_vector_range_partial = sc.local_bottom_vector_range_partial
+            update_from_sparse_matrix_select_columns!(B_dense_buffer,
+                                                      local_bottom_vector_range_partial,
+                                                      B,
+                                                      local_bottom_vector_range_partial)
+            update_from_sparse_matrix_select_columns!(C_dense_buffer,
+                                                      local_top_vector_range_partial, C,
+                                                      local_top_vector_range_partial)
+            update_from_sparse_matrix_select_columns!(D_dense_buffer,
+                                                      local_bottom_vector_range_partial,
+                                                      D,
+                                                      local_bottom_vector_range_partial)
+            this_B = B_dense_buffer
+            this_C = C_dense_buffer
+            this_D = D_dense_buffer
+        else
+            this_B = B
+            this_C = C
+            this_D = D
+        end
+
         update_A_factorization!(sc, A)
-        update_Ainv_dot_B!(sc, B)
-        update_C!(sc, C)
-        update_schur_complement_factorization!(sc, D)
+        if B_dense_buffer !== nothing && C_dense_buffer !== nothing && D_dense_buffer !== nothing
+            sc.synchronize_shared()
+        end
+        update_Ainv_dot_B!(sc, this_B)
+        update_C!(sc, this_C)
+        update_schur_complement_factorization!(sc, this_D)
     end
 
     return nothing
