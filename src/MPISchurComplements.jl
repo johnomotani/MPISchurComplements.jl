@@ -44,11 +44,100 @@ known structure of \$B\$.
 """
 function ldiv_Bmatrix! end
 
+"""
+    MPISchurComplementBlockAinvDotB
+
+Abstract type that can be used to indicate that a struct (defined in some other package)
+is to be used as a buffer storing \$A^{-1}\\cdot B\$, and that it is guaranteed that
+\$A^{-1}\\cdot B\$ has a block structure such that any row has non-zero entries only on a
+single shared-memory block, so there is no need to handle 'overlaps' over distributed-MPI.
+It is also assumed that the block structure corresponds to the block structure of
+`A_factorization`, so that no shared-memory synchronization is needed in between copying
+\$B\$ into an MPISchurComplementBlockAinvDotB and applying `A_factorization` to it (or if
+synchronization is required, it is handled by the external package that defines the
+methods implementing these operations).
+
+The block structure guarantee is useful because it means that instances of
+MPISchurComplementBlockAinvDotB do not have to support `getindex()` or `setindex!()`,
+which would be needed to get/update the overlapping entries.
+
+Methods `copy_B_submatrix!(Ainv_dot_B::MPISchurComplementBlockAinvDotB,
+B::AbstractMatrix)`, `ldiv_Bmatrix!(A_factorization, B::MPISchurComplementBlockAinvDotB)`,
+`Ainv_dot_B_dot_y!(top_vec_buffer::AbstractVector,
+Ainv_dot_B::MPISchurComplementBlockAinvDotB, global_y::AbstractVector)`, and
+`mul_C_Ainv_dot_B!(C_dot_Ainv_dot_B::AbstractMatrix, C::MPISchurComplementBlockC,
+Ainv_dot_B::MPISchurComplementBlockAinvDotB)` must be defined by the package supplying an
+implementation of MPISchurComplementBlockAinvDotB.
+"""
+abstract type MPISchurComplementBlockAinvDotB end
+
+"""
+    copy_B_submatrix!(Ainv_dot_B::MPISchurComplementBlockAinvDotB, B::AbstractMatrix)
+
+Copy entries from `B` into `Ainv_dot_B`. Any entries in `Ainv_dot_B` that are not set to
+values from `B` (e.g. if `B` is a sparse matrix and has some structural zeros) must also
+be set to zero in this function.
+"""
+function copy_B_submatrix! end
+
+"""
+    Ainv_dot_B_dot_y!(top_vec_buffer::AbstractVector,
+                      Ainv_dot_B::MPISchurComplementBlockAinvDotB,
+                      global_y::AbstractVector)
+
+Compute the product `Ainv_dot_B * global_y`, storing the output in `top_vec_buffer`.
+"""
+function Ainv_dot_B_dot_y! end
+
+"""
+    MPISchurComplementBlockC
+
+Abstract type that can be used to indicate that a struct (defined in some other package)
+is to be used as a buffer storing \$C\$, and that it is guaranteed that \$C\$ has a block
+structure such that any column has non-zero entries only on a single shared-memory block,
+so there is no need to handle 'overlaps' over distributed-MPI.
+
+The block structure guarantee is useful because it means that instances of
+MPISchurComplementBlockC do not have to support `getindex()` or `setindex!()`, which would
+be needed to get/update the overlapping entries.
+
+Methods `copy_C_submatrix!(C_buffer::MPISchurComplementBlockC, C::AbstractMatrix)` and
+`mul_C_Ainv_dot_B!(C_dot_Ainv_dot_B::AbstractMatrix, C::MPISchurComplementBlockC,
+Ainv_dot_B::MPISchurComplementBlockAinvDotB)` must be defined by the package supplying an
+implementation of MPISchurComplementBlockC.
+"""
+abstract type MPISchurComplementBlockC end
+
+"""
+    copy_C_submatrix!(C_buffer::MPISchurComplementBlockC, C::AbstractMatrix)
+
+Copy entries from `C` into `C_buffer`. Any entries in `C_buffer` that are not set to
+values from `C` (e.g. if `C` is a sparse matrix and has some structural zeros) must also
+be set to zero in this function.
+"""
+function copy_C_submatrix! end
+
+"""
+    mul_C_dot_Ainv_dot_u!(C_dot_Ainv_dot_u::AbstractVector, C::MPISchurComplementBlockC,
+                          Ainv_dot_u::AbstractVector)
+
+Compute the product `C * Ainv_dot_u`, storing the output in `C_dot_Ainv_dot_u`.
+"""
+function mul_C_dot_Ainv_dot_u! end
+
+"""
+    mul_C_Ainv_dot_B!(C_dot_Ainv_dot_B::AbstractMatrix, C::MPISchurComplementBlockC,
+                      Ainv_dot_B::MPISchurComplementBlockAinvDotB)
+
+Compute `C * Ainv_dot_B`, storing the result in `C_dot_Ainv_dot_B`.
+"""
+function mul_C_Ainv_dot_B! end
+
 struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,
                           Tdensebuff<:Union{AbstractMatrix{Tf},Nothing},
-                          TC<:AbstractMatrix{Tf},TSC<:AbstractMatrix{Tf},TSCF,TAiu,TCAiB,
-                          TCAiu,TAiBy,Ttv,Tltv,Tbv,Tgy,TBob,Trangeno,Tsync,
-                          Ttimer} <: Factorization{Tf}
+                          TC<:Union{AbstractMatrix{Tf},MPISchurComplementBlockC},
+                          TSC<:AbstractMatrix{Tf},TSCF,TAiu,TCAiB,TCAiBs,TCAiu,TAiBy,Ttv,
+                          Tltv,Tbv,Tgy,TBob,Trangeno,Tsync,Ttimer} <: Factorization{Tf}
     A_factorization::TA
     Ainv_dot_B::TAiB
     Ainv_dot_B_local::TAiBl
@@ -77,6 +166,7 @@ struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,
     schur_complement_local_range_partial::Trange
     Ainv_dot_u::TAiu
     C_dot_Ainv_dot_B::TCAiB
+    C_dot_Ainv_dot_B_storage::TCAiBs
     C_dot_Ainv_dot_u::TCAiu
     Ainv_dot_B_dot_y::TAiBy
     top_vec_buffer::Ttv
@@ -412,9 +502,9 @@ function update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
 
     return nothing
 end
-function update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
-                               new_A::SubArray{Tf,2}, new_rowinds,
-                               row_counter::Vector{Int64}) where {Bi,Tf,Ti}
+@inline function update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
+                                       new_A::SubArray{Tf,2}, new_rowinds,
+                                       row_counter::Vector{Int64}) where {Bi,Tf,Ti}
     full_rowinds, full_colinds = new_A.indices
     return update_sparse_matrix!(A, parent(new_A), @view(full_rowinds[new_rowinds]),
                                  full_colinds, row_counter)
@@ -578,9 +668,9 @@ function update_sparse_matrix_select_columns!(A::FixedSparseCSC{Tf,Ti}, colinds,
     end
     return nothing
 end
-function update_sparse_matrix_select_columns!(A::FixedSparseCSC{Tf,Ti}, colinds,
-                                              new_A::SubArray{Tf,2},
-                                              new_colinds) where {Tf,Ti}
+@inline function update_sparse_matrix_select_columns!(A::FixedSparseCSC{Tf,Ti}, colinds,
+                                                      new_A::SubArray{Tf,2},
+                                                      new_colinds) where {Tf,Ti}
     full_new_A = parent(new_A)
     full_rowinds, full_colinds = new_A.indices
     return update_sparse_matrix_select_columns!(A, colinds, full_new_A,
@@ -632,9 +722,9 @@ function update_from_sparse_matrix_select_columns!(A::Matrix{Tf}, colinds,
     end
     return nothing
 end
-function update_from_sparse_matrix_select_columns!(A::Matrix{Tf}, colinds,
-                                                   new_A::SubArray{Tf,2},
-                                                   new_colinds) where {Tf}
+@inline function update_from_sparse_matrix_select_columns!(A::Matrix{Tf}, colinds,
+                                                           new_A::SubArray{Tf,2},
+                                                           new_colinds) where {Tf}
     full_new_A = parent(new_A)
     full_rowinds, full_colinds = new_A.indices
     return update_from_sparse_matrix_select_columns!(A, colinds, full_new_A,
@@ -878,7 +968,9 @@ end
                          use_sparse::Bool=true, separate_Ainv_B::Bool=false,
                          sparse_Ainv_B::Bool=false,
                          parallel_schur::Union{Bool,Factorization}=(distributed_comm!==nothing || shared_comm!==nothing),
-                         Ainv_dot_B_buffer::Union{AbstractMatrix,Nothing}=nothing,
+                         Ainv_dot_B_buffer::Union{AbstractMatrix,MPISchurComplementBlockAinvDotB,Nothing}=nothing,
+                         C_buffer::Union{MPISchurComplementBlockC,Nothing}=nothing,
+                         C_dot_Ainv_dot_B_buffer_ncopies::Union{Integer,Nothing}=nothing,
                          schur_complement_buffer::Union{AbstractMatrix,Nothing}=nothing,
                          copy_input_to_dense_buffers::Bool=false,
                          schur_tile_size::Union{Integer,Nothing}=nothing,
@@ -998,6 +1090,14 @@ To use a non-dense matrix type for `Ainv_dot_B` or `schur_complement`, pass the 
 to use as `Ainv_dot_B_buffer` or `schur_complement_buffer`. If you are using shared-memory
 parallelism, these must be shared-memory buffers.
 
+To use some custom operations (presumably with more optimized implementations that exploit
+some known block structure of the sub-matrices) for the application of \$A^{-1}\$ to \$B\$
+and multiplication \$C\\cdot(A^{-1}\\cdotB)\$ buffers of type
+`MPISchurComplementBlockAinvDotB` and `MPISchurComplementBlockC` can be passed to
+`Ainv_dot_B_buffer` and `C_buffer`. If either is passed, both must be.
+`C_dot_Ainv_dot_B_buffer_ncopies` gives the number of duplicate buffers that are needed in
+the shared-memory array (`C_dot_Ainv_dot_B`) that mul_C_Ainv_dot_B!() writes output to.
+
 When the inputs that will be passed to `update_schur_complement!()` are sparse arrays (or
 views of sparse arrays), and there are repeated indices, it might be the case that the
 'copy to' locations of the repeated indices are not part of the non-zero entries in the
@@ -1036,7 +1136,9 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                               use_sparse::Bool=true, separate_Ainv_B::Bool=false,
                               sparse_Ainv_B::Bool=false,
                               parallel_schur::Union{Bool,Factorization}=(distributed_comm!==nothing || shared_comm!==nothing),
-                              Ainv_dot_B_buffer::Union{AbstractMatrix,Nothing}=nothing,
+                              Ainv_dot_B_buffer::Union{AbstractMatrix,MPISchurComplementBlockAinvDotB,Nothing}=nothing,
+                              C_buffer::Union{MPISchurComplementBlockC,Nothing}=nothing,
+                              C_dot_Ainv_dot_B_buffer_ncopies::Union{Integer,Nothing}=nothing,
                               schur_complement_buffer::Union{AbstractMatrix,Nothing}=nothing,
                               copy_input_to_dense_buffers::Bool=false,
                               schur_tile_size::Union{Integer,Nothing}=nothing,
@@ -1453,6 +1555,18 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     if sparse_Ainv_B && !use_sparse
         error("`use_sparse` must be true when `sparse_Ainv_B=true`.")
     end
+    if isa(Ainv_dot_B_buffer, MPISchurComplementBlockAinvDotB) && !isa(C_buffer, MPISchurComplementBlockC)
+        error("When an MPISchurComplementBlockAinvDotB is passed for Ainv_dot_B_buffer, "
+              * "a MPISchurComplementBlockC must be passed for C_buffer.")
+    end
+    if !isa(Ainv_dot_B_buffer, MPISchurComplementBlockAinvDotB) && isa(C_buffer, MPISchurComplementBlockC)
+        error("When an MPISchurComplementBlockC is passed for C_buffer, "
+              * "a MPISchurComplementBlockAinvDotB must be passed for Ainv_dot_B_buffer.")
+    end
+    if isa(Ainv_dot_B_buffer, MPISchurComplementBlockAinvDotB) && separate_Ainv_B
+        error("When an MPISchurComplementBlockAinvDotB is passed for Ainv_dot_B_buffer, "
+              * "separate_Ainv_B must be false.")
+    end
     if Ainv_dot_B_buffer === nothing
         if sparse_Ainv_B
             error("Ainv_dot_B_buffer is required when sparse_Ainv_B=true")
@@ -1469,6 +1583,11 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         Ainv_dot_B_local = nothing
         B_local = sparse(zeros(data_type, length(local_top_vector_unique_entries_partial),
                                bottom_vec_global_size))
+    elseif isa(Ainv_dot_B_buffer, MPISchurComplementBlockAinvDotB)
+        # Parallelisation of Ainv_dot_B*y is handled by the externally implemented
+        # Ainv_dot_B_dot_y!(), so Ainv_dot_B_local is not needed.
+        Ainv_dot_B_local = nothing
+        B_local = nothing
     elseif sparse_Ainv_B
         # Store the chunk of Ainv_dot_B needed by this shared-memory process as a sparse
         # array.
@@ -1489,8 +1608,50 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     Ainv_dot_u = allocate_shared_float(top_vec_local_size)
     # C_dot_Ainv_dot_u and C_dot_Ainv_dot_B are purely local buffers.
     C_dot_Ainv_dot_u = Vector{data_type}(undef, length(C_global_row_range_partial))
+    C_dot_Ainv_dot_B_storage = nothing
     if sparse_Ainv_B
-        if isa(schur_complement_buffer, FixedSparseCSC)
+        if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB) && isa(C_buffer, MPISchurComplementBlockC)
+            if !isa(schur_complement_buffer, FixedSparseCSC)
+                error("Currently using MPISchurComplementBlockAinvDotB and "
+                      * "MPISchurComplementBlockC is only supported when "
+                      * "schur_complement_buffer is a FixedSparseCSC.")
+            else
+                # Need to collect contributions to C_dot_Ainv_dot_B from different processes,
+                # then combine them into schur_complement. We do this by having a copy of
+                # C_dot_Ainv_dot_B for each shared-memory process stored in shared memory,
+                # then once each process calculates its contribution, the contributions from
+                # different processes can be summed.
+                if C_dot_Ainv_dot_B_buffer_ncopies === nothing
+                    C_dot_Ainv_dot_B_buffer_ncopies = shared_nproc
+                end
+                schur_nnz = nnz(schur_complement_buffer)
+                C_dot_Ainv_dot_B_storage =
+                    allocate_shared_float(C_dot_Ainv_dot_B_buffer_ncopies, schur_nnz)
+                function get_C_dot_Ainv_dot_B_storage_column(i)
+                    local_column_view = @view(C_dot_Ainv_dot_B_storage[i,:])
+                    local_column_view .= 0.0
+                    # It is hacky to use unsafe_wrap, but FixedSparseCSC requires a Vector
+                    # argument. This should be OK because both C_dot_Ainv_dot_B and
+                    # C_dot_Ainv_dot_B_storage are stored in the same struct, so the memory
+                    # underlying both will be preserved until the struct is deleted.
+                    local_column = unsafe_wrap(Array, pointer(local_column_view),
+                                               length(local_column_view))
+                    return FixedSparseCSC(bottom_vec_global_size, bottom_vec_global_size,
+                                          schur_complement_buffer.colptr,
+                                          schur_complement_buffer.rowval, local_column)
+                end
+                C_dot_Ainv_dot_B = [get_C_dot_Ainv_dot_B_storage_column(i)
+                                    for i ∈ 1:C_dot_Ainv_dot_B_buffer_ncopies]
+
+                # B_column_range_partial is not otherwise used in this case (Ainv_dot_B is
+                # a MPISchurComplementBlockAinvDotB and C_buffer is a
+                # MPISchurComplementBlockC), but it is a UnitRange, so we can abuse it to
+                # hold the range of flattened indices that this process should handle when
+                # updating schur_complement_matrix with C_dot_Ainv_dot_B.
+                n_flat_per_proc = (schur_nnz + shared_nproc - 1) ÷ shared_nproc
+                B_column_range_partial = shared_rank*n_flat_per_proc+1:min((shared_rank+1)*n_flat_per_proc,schur_nnz)
+            end
+        elseif isa(schur_complement_buffer, FixedSparseCSC)
             C_dot_Ainv_dot_B =
                 get_partial_FixedSparseCSC_buffer(C_global_row_range_partial,
                                                   schur_complement_buffer, data_type)
@@ -1521,11 +1682,16 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
     bottom_vec_buffer = allocate_shared_float(bottom_vec_global_size)
     global_y = allocate_shared_float(bottom_vec_global_size)
 
-    if use_sparse
-        fake_C = sparsecsr(Int64[], Int64[], data_type[],
-                           length(C_local_row_range_partial), top_vec_local_size)
-    else
-        fake_C = zeros(data_type, length(C_local_row_range_partial), top_vec_local_size)
+    if C_buffer === nothing
+        if use_sparse
+            C_buffer = sparsecsr(Int64[], Int64[], data_type[],
+                                 length(C_local_row_range_partial), top_vec_local_size)
+            #C_buffer = transpose(sparse(Int64[], Int64[], data_type[], top_vec_local_size,
+            #                            length(C_local_row_range_partial)))
+        else
+            C_buffer = zeros(data_type, length(C_local_row_range_partial),
+                             top_vec_local_size)
+        end
     end
 
     if isa(parallel_schur, Bool) && parallel_schur
@@ -1561,6 +1727,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
             C_dense_buffer .= 0.0
             D_dense_buffer .= 0.0
         end
+        synchronize_shared()
     else
         B_dense_buffer = nothing
         C_dense_buffer = nothing
@@ -1575,7 +1742,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                                           B_local_column_range_partial,
                                           B_local_column_repeats,
                                           B_local_column_repeats_partial, B_dense_buffer,
-                                          fake_C, C_global_row_range_partial,
+                                          C_buffer, C_global_row_range_partial,
                                           C_local_row_range_partial,
                                           C_local_row_repeats_partial,
                                           C_row_counter, C_dense_buffer,
@@ -1586,7 +1753,8 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                                           schur_complement,
                                           schur_complement_factorization,
                                           schur_complement_local_range_partial,
-                                          Ainv_dot_u, C_dot_Ainv_dot_B, C_dot_Ainv_dot_u,
+                                          Ainv_dot_u, C_dot_Ainv_dot_B,
+                                          C_dot_Ainv_dot_B_storage, C_dot_Ainv_dot_u,
                                           Ainv_dot_B_dot_y, top_vec_buffer,
                                           local_top_vec_buffer, top_vec_local_size,
                                           bottom_vec_buffer, bottom_vec_local_size,
@@ -1667,7 +1835,10 @@ function update_Ainv_dot_B!(sc, B)
         # then copy this entry into all the repeated positions. This converts the columns of
         # `B` into 'vectors' (with the same structure as `u`) that can be passed to
         # `A_factorization` to find `Ainv_dot_B`.
-        if isa(Ainv_dot_B, AbstractSparseMatrix)
+        if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB)
+            # When using MPISchurComplementBlockAinvDotB, any zeroing of Ainv_dot_B is
+            # taken care of within copy_B_submatrix!().
+        elseif isa(Ainv_dot_B, AbstractSparseMatrix)
             Ainv_dot_B_colptr = Ainv_dot_B.colptr
             Ainv_dot_B_nzval = Ainv_dot_B.nzval
             Ainv_dot_B_first_i = Ainv_dot_B_colptr[first(B_column_range_partial)]
@@ -1685,52 +1856,74 @@ function update_Ainv_dot_B!(sc, B)
             for (to, from) ∈ eachcol(B_local_column_repeats_partial)
                 @views B[:,to] .+= B[:,from]
             end
+            if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB)
+                # B_local_column_repeats_partial will not necessarily correspond to the
+                # indices of the locally-owned blocks in a MPISchurComplementBlockAinvDotB
+                # (as they do to entries in B_local_column_range_partial), so need to
+                # synchronize here. Currently expect that when
+                # MPISchurComplementBlockAinvDotB is being used, there are no overlaps to
+                # handle, so this block will not be entered - if it is used could consider
+                # trying to adjust index ranges to avoid this synchronization?
+                synchronize_shared()
+            end
         else
+            # When using MPISchurComplementBlockAinvDotB, any zeroing of Ainv_dot_B is
+            # taken care of within copy_B_submatrix!(), so that there is no need for
+            # synchronization here.
             synchronize_shared()
         end
-        if isa(Ainv_dot_B, AbstractSparseMatrix)
+        if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB)
+            copy_B_submatrix!(Ainv_dot_B, B)
+        elseif isa(Ainv_dot_B, AbstractSparseMatrix)
             update_sparse_matrix_select_columns!(Ainv_dot_B, B_global_column_range_partial,
                                                  B, B_local_column_range_partial)
+            synchronize_shared()
         else
             for (j1, j2) ∈ zip(B_global_column_range_partial, B_local_column_range_partial), i ∈ 1:size(Ainv_dot_B, 1)
                 Ainv_dot_B[i,j1] = B[i,j2]
             end
+            synchronize_shared()
         end
-        synchronize_shared()
 
         # Add up the rows of B that overlap between different subdomains (temporarily stored
         # in `Ainv_dot_B`).  Note only non-repeated points in the overlaps are communicated,
         # to reduce the amount of communication.
-        if shared_rank == 0 && distributed_nproc > 1
-            reqs = MPI.Request[]
-            for (overlap_range, buffer_send, buffer_recv, overlap_rank) ∈
-                    zip(local_top_vector_overlaps, B_overlap_buffers_send,
-                        B_overlap_buffers_recv, overlap_ranks)
-                for j ∈ 1:size(Ainv_dot_B, 2), (i1, i2) ∈ enumerate(overlap_range)
-                    buffer_send[i1,j] = Ainv_dot_B[i2,j]
+        if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB)
+            # When using MPISchurComplementBlockAinvDotB, it is guaranteed that there are
+            # no overlaps that need to be handled using distributed MPI, so can skip the
+            # next step.
+        else
+            if length(overlap_ranks) > 0 && shared_rank == 0
+                reqs = MPI.Request[]
+                for (overlap_range, buffer_send, buffer_recv, overlap_rank) ∈
+                        zip(local_top_vector_overlaps, B_overlap_buffers_send,
+                            B_overlap_buffers_recv, overlap_ranks)
+                    for j ∈ 1:size(Ainv_dot_B, 2), (i1, i2) ∈ enumerate(overlap_range)
+                        buffer_send[i1,j] = Ainv_dot_B[i2,j]
+                    end
+                    # Iallreduce seems not to be included in the nice Julia API, so have to use
+                    # lower level call here.
+                    push!(reqs, MPI.Isend(buffer_send, distributed_comm; dest=overlap_rank))
+                    push!(reqs, MPI.Irecv!(buffer_recv, distributed_comm; source=overlap_rank))
                 end
-                # Iallreduce seems not to be included in the nice Julia API, so have to use
-                # lower level call here.
-                push!(reqs, MPI.Isend(buffer_send, distributed_comm; dest=overlap_rank))
-                push!(reqs, MPI.Irecv!(buffer_recv, distributed_comm; source=overlap_rank))
-            end
-            MPI.Waitall(reqs)
-            for (overlap_range, buffer) ∈ zip(local_top_vector_overlaps, B_overlap_buffers_recv)
-                for j ∈ 1:size(Ainv_dot_B, 2), (i2, i1) ∈ enumerate(overlap_range)
-                    Ainv_dot_B[i1,j] += buffer[i2,j]
+                MPI.Waitall(reqs)
+                for (overlap_range, buffer) ∈ zip(local_top_vector_overlaps, B_overlap_buffers_recv)
+                    for j ∈ 1:size(Ainv_dot_B, 2), (i2, i1) ∈ enumerate(overlap_range)
+                        Ainv_dot_B[i1,j] += buffer[i2,j]
+                    end
                 end
             end
-        end
-        synchronize_shared()
-        if length(local_top_vector_repeats) > 0
-            # Now that overlaps have been comunicated, all contributions have been added the
-            # 'to' places, so we can now copy back these periodic entries to the 'from'
-            # places.
-            for j ∈ 1:size(Ainv_dot_B, 2), (to, from) ∈ eachcol(local_top_vector_repeats_partial)
-                Ainv_dot_B[from,j] = Ainv_dot_B[to,j]
-            end
-            if !separate_Ainv_B
-                synchronize_shared()
+            synchronize_shared()
+            if length(local_top_vector_repeats) > 0
+                # Now that overlaps have been comunicated, all contributions have been added the
+                # 'to' places, so we can now copy back these periodic entries to the 'from'
+                # places.
+                for j ∈ 1:size(Ainv_dot_B, 2), (to, from) ∈ eachcol(local_top_vector_repeats_partial)
+                    Ainv_dot_B[from,j] = Ainv_dot_B[to,j]
+                end
+                if !separate_Ainv_B
+                    synchronize_shared()
+                end
             end
         end
 
@@ -1747,7 +1940,7 @@ function update_Ainv_dot_B!(sc, B)
             end
             synchronize_shared()
         end
-        if isa(A_factorization, MPISchurComplementAFactorization)
+        if isa(A_factorization, MPISchurComplementAFactorization) || isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB)
             ldiv_Bmatrix!(A_factorization, Ainv_dot_B)
         else
             ldiv!(A_factorization, Ainv_dot_B)
@@ -1759,25 +1952,30 @@ end
 function update_C!(sc, C)
     timer = sc.timer
     C_local_row_repeats_partial = sc.C_local_row_repeats_partial
+    sc_C = sc.C
 
     @sc_timeit timer "C" begin
-        # A representation of C is stored where no rows are repeated, so need to add up all
-        # contributions from repeated row indices into a single row (that will then be
-        # included in the stored `sc.C`, i.e. the 'to' rows are included in
-        # `sc.C_local_row_range_partial` while the 'from' rows are not).
-        for j ∈ 1:size(C, 2), (to, from) ∈ eachcol(C_local_row_repeats_partial)
-            C[to,j] += C[from,j]
-        end
-        # When using shared memory, only store the slice of C that this process needs.
-        if issparse(sc.C)
-            update_sparse_matrix!(sc.C, C, sc.C_local_row_range_partial, sc.C_row_counter)
+        if isa(sc_C, MPISchurComplementBlockC)
+            copy_C_submatrix!(sc_C, C)
         else
-            # Make a copy because C_local_row_range_partial might not be a contiguous range of
-            # indices, but performance will be better if `C` is a contiguously-allocated
-            # array.
-            sc_C = sc.C
-            for j ∈ 1:size(C, 2), (i1, i2) ∈ enumerate(sc.C_local_row_range_partial)
-                sc_C[i1,j] = C[i2,j]
+            # A representation of C is stored where no rows are repeated, so need to add
+            # up all contributions from repeated row indices into a single row (that will
+            # then be included in the stored `sc.C`, i.e. the 'to' rows are included in
+            # `sc.C_local_row_range_partial` while the 'from' rows are not).
+            for j ∈ 1:size(C, 2), (to, from) ∈ eachcol(C_local_row_repeats_partial)
+                C[to,j] += C[from,j]
+            end
+            # When using shared memory, only store the slice of C that this process needs.
+            if issparse(sc_C)
+                update_sparse_matrix!(sc_C, C, sc.C_local_row_range_partial,
+                                      sc.C_row_counter)
+            else
+                # Make a copy because C_local_row_range_partial might not be a contiguous
+                # range of indices, but performance will be better if `C` is a
+                # contiguously-allocated array.
+                for j ∈ 1:size(C, 2), (i1, i2) ∈ enumerate(sc.C_local_row_range_partial)
+                    sc_C[i1,j] = C[i2,j]
+                end
             end
         end
     end
@@ -1792,6 +1990,7 @@ function update_schur_complement_factorization!(sc, D)
     Ainv_dot_B = sc.Ainv_dot_B
     Ainv_dot_B_local = sc.Ainv_dot_B_local
     local_top_vector_unique_entries_partial = sc.local_top_vector_unique_entries_partial
+    this_C = sc.C
     C_dot_Ainv_dot_B = sc.C_dot_Ainv_dot_B
     C_global_row_range_partial = sc.C_global_row_range_partial
     schur_complement = sc.schur_complement
@@ -1814,7 +2013,9 @@ function update_schur_complement_factorization!(sc, D)
     @sc_timeit timer "schur_complement" begin
         # Initialise `schur_complement` to zero, because when `this_C` does not include all rows,
         # the matrix multiplication below would not initialise all elements.
-        if issparse(schur_complement)
+        if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB) && isa(this_C, MPISchurComplementBlockC)
+            # Don't need to initialize schur_complement in this case.
+        elseif issparse(schur_complement)
             schur_colptr = schur_complement.colptr
             schur_nzval = schur_complement.nzval
             for j ∈ schur_complement_local_range_partial
@@ -1832,7 +2033,7 @@ function update_schur_complement_factorization!(sc, D)
 
         # Read out the local entries of `Ainv_dot_B` here, rather than just after `Ainv_dot_B`
         # is calculated, in order to avoid adding another `synchronize_shared()` call.
-        if !separate_Ainv_B
+        if !isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB) && !separate_Ainv_B
             if isa(Ainv_dot_B_local, SparseMatrixCSC)
                 # Convert Ainv_dot_B to SparseMatrixCSC in this call to resolve possible
                 # type instability.
@@ -1852,13 +2053,25 @@ function update_schur_complement_factorization!(sc, D)
         # (only local columns). Therefore we can take the matrix product `Ainv_dot_B*C` with
         # the local chunks, then do a sum-reduce to get the final result. The
         # `schur_complement` buffer is full size on every rank.
-        this_C = sc.C
-        if isa(this_C, SparseMatrixCSR) && isa(Ainv_dot_B, AbstractSparseMatrixCSC)
+        if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB) && isa(this_C, MPISchurComplementBlockC)
+            mul_C_Ainv_dot_B!(C_dot_Ainv_dot_B, this_C, Ainv_dot_B)
+            synchronize_shared()
+        elseif isa(this_C, SparseMatrixCSR) && isa(Ainv_dot_B, AbstractSparseMatrixCSC)
             csr_mul!(C_dot_Ainv_dot_B, this_C, Ainv_dot_B, -1.0, 0.0)
         else
             mul!(C_dot_Ainv_dot_B, this_C, Ainv_dot_B, -1.0, 0.0)
         end
-        if issparse(C_dot_Ainv_dot_B)
+        if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB) && isa(this_C, MPISchurComplementBlockC)
+            # Contributions from each process have now been calculated, and are available
+            # in C_dot_Ainv_dot_B_storage. Need to add up all contributions into
+            # schur_complement.
+            # B_column_range_partial is abused to store the index range that we need for
+            # this update, as it is not used otherwise.
+            flat_range = sc.B_column_range_partial
+            if !isempty(flat_range)
+                @views sum!(schur_complement.nzval[flat_range]', sc.C_dot_Ainv_dot_B_storage[:,flat_range])
+            end
+        elseif issparse(C_dot_Ainv_dot_B)
             C_dot_Ainv_dot_B_colptr = C_dot_Ainv_dot_B.colptr
             C_dot_Ainv_dot_B_rowval = C_dot_Ainv_dot_B.rowval
             C_dot_Ainv_dot_B_nzval = C_dot_Ainv_dot_B.nzval
@@ -1996,7 +2209,7 @@ function update_schur_complement!(sc::MPISchurComplement, A, B::AbstractMatrix,
                                   C::AbstractMatrix, D::AbstractMatrix)
     timer = sc.timer
     @sc_timeit timer "update_schur_complement" begin
-        @boundscheck size(sc.Ainv_dot_B, 1) == size(B, 1) || error(BoundsError, " Number of rows in B does not match number of rows in original Ainv_dot_B")
+        @boundscheck isa(sc.Ainv_dot_B, MPISchurComplementBlockAinvDotB) || size(sc.Ainv_dot_B, 1) == size(B, 1) || error(BoundsError, " Number of rows in B does not match number of rows in original Ainv_dot_B")
         @boundscheck length(sc.B_local_column_range) + size(sc.B_local_column_repeats, 2) == size(B, 2) || error(BoundsError, " Number of columns in B does not match number of columns in original B")
         # Don't check size(C, 1) because we don't store the full row range. There will be an
         # out of bounds error from indexing by sc.C_local_row_range_partial if C is too small.
@@ -2087,6 +2300,7 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
         distributed_nproc = sc.distributed_nproc
         parallel_schur = sc.parallel_schur
         A_factorization = sc.A_factorization
+        Ainv_dot_B = sc.Ainv_dot_B
         Ainv_dot_B_local = sc.Ainv_dot_B_local
         schur_complement_factorization = sc.schur_complement_factorization
         Ainv_dot_u = sc.Ainv_dot_u
@@ -2116,10 +2330,15 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
             # multiplication below would not initialise all elements.
             bottom_vec_buffer[schur_complement_local_range_partial] .= 0.0
             synchronize_shared()
-            # Need all rows of C, but only the local columns - this is all that is stored in sc.C.
-            mul!(C_dot_Ainv_dot_u, sc.C, Ainv_dot_u, -1.0, 0.0)
-            for (i2, i1) ∈ enumerate(sc.C_global_row_range_partial)
-                bottom_vec_buffer[i1] = C_dot_Ainv_dot_u[i2]
+            if isa(sc.C, MPISchurComplementBlockC)
+                mul_C_dot_Ainv_dot_u!(bottom_vec_buffer, sc.C, Ainv_dot_u)
+            else
+                # Need all rows of C, but only the local columns - this is all that is
+                # stored in sc.C.
+                mul!(C_dot_Ainv_dot_u, sc.C, Ainv_dot_u, -1.0, 0.0)
+                for (i2, i1) ∈ enumerate(sc.C_global_row_range_partial)
+                    bottom_vec_buffer[i1] = C_dot_Ainv_dot_u[i2]
+                end
             end
             synchronize_shared()
 
@@ -2162,7 +2381,9 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
 
         @sc_timeit timer "Ainv.u-Ainv.B.y" begin
             # Need all columns of Ainv_dot_B_local, but only the local rows.
-            if sc.separate_Ainv_B
+            if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB)
+                Ainv_dot_B_dot_y!(top_vec_buffer, Ainv_dot_B, global_y)
+            elseif sc.separate_Ainv_B
                 # B_local is a sparse matrix, so this might sometimes be numerically cheaper than
                 # multiplying by a dense, precomputed Ainv_dot_B_local`.
                 mul!(Ainv_dot_B_dot_y, sc.B, global_y)
@@ -2222,6 +2443,15 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
                     end
                 end
             end
+            # Could possibly remove this synchronization when using
+            # MPISchurComplementBlockAinvDotB for Ainv_dot_B, if
+            # `local_top_vector_range_partial` was compatible with the parallelisation
+            # used in Ainv_dot_B_dot_y!(top_vec_buffer, Ainv_dot_B, global_y)? On the
+            # other hand, local_top_vector_range_partial is a UnitRange, while the
+            # parallelisation in Ainv_dot_B_dot_y!() will usually imply some more
+            # complicated indexing by a Vector{Int64}, so it is not clear that doing this
+            # operation with that parallelisation would be more efficient, even though it
+            # would remove a synchronization.
             synchronize_shared()
             for i ∈ local_top_vector_range_partial
                 x[i] = Ainv_dot_u[i] - top_vec_buffer[i]
