@@ -66,3 +66,28 @@ function get_comms(shared_nproc, with_comm=false)
            shared_nproc, shared_rank, allocate_array_float, allocate_array_int,
            local_win_store_float, local_win_store_int
 end
+
+# This is a fairly stupid thing to do, but having no structural zeros in the sparse matrix
+# buffers ensures that they all have a compatible set of entries.
+function get_full_sparse_matrix_copy(M, allocate_shared_float=nothing, shared_rank=-1)
+    m, n = size(M)
+    rowinds = vcat((1:m for _ ∈ 1:n)...)
+    colinds = vcat(([j for _ ∈ 1:m] for j ∈ 1:n)...)
+    if allocate_shared_float === nothing
+        return sparse(rowinds, colinds, copy(vec(M)), m, n)
+    else
+        temp = sparse(rowinds, colinds, zeros(length(rowinds)), m, n)
+        nzvals = allocate_shared_float(length(rowinds))
+        if shared_rank == 0
+            nzvals .= vec(M)
+        end
+        return FixedSparseCSC(m, n, temp.colptr, temp.rowval, nzvals)
+    end
+end
+
+function get_full_shared_sparse_matrix(m, n, allocate_shared_float)
+    rowinds = vcat((1:m for _ ∈ 1:n)...)
+    colinds = vcat(([j for _ ∈ 1:m] for j ∈ 1:n)...)
+    temp = sparse(rowinds, colinds, zeros(length(rowinds)), m, n)
+    return FixedSparseCSC(m, n, temp.colptr, temp.rowval, allocate_shared_float(length(rowinds)))
+end
