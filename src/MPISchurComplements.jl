@@ -136,8 +136,8 @@ function mul_C_Ainv_dot_B! end
 struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,
                           Tdensebuff<:Union{AbstractMatrix{Tf},Nothing},
                           TC<:Union{AbstractMatrix{Tf},MPISchurComplementBlockC},
-                          TSC<:AbstractMatrix{Tf},TSCF,TAiu,TCAiB,TCAiBs,TCAiu,TAiBy,Ttv,
-                          Tltv,Tbv,Tgy,TBob,Trangeno,Tsync,Ttimer} <: Factorization{Tf}
+                          TSC<:AbstractMatrix{Tf},TSCF,TAiu,TCAiB,TCAiu,TAiBy,Ttv,Tltv,
+                          Tbv,Tgy,TBob,Trangeno,Tsync,Ttimer} <: Factorization{Tf}
     A_factorization::TA
     Ainv_dot_B::TAiB
     Ainv_dot_B_local::TAiBl
@@ -166,7 +166,6 @@ struct MPISchurComplement{Tf<:AbstractFloat,TA,TAiB,TAiBl,TB,
     schur_complement_local_range_partial::Trange
     Ainv_dot_u::TAiu
     C_dot_Ainv_dot_B::TCAiB
-    C_dot_Ainv_dot_B_storage::TCAiBs
     C_dot_Ainv_dot_u::TCAiu
     Ainv_dot_B_dot_y::TAiBy
     top_vec_buffer::Ttv
@@ -1627,21 +1626,12 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                 schur_nnz = nnz(schur_complement_buffer)
                 C_dot_Ainv_dot_B_storage =
                     allocate_shared_float(C_dot_Ainv_dot_B_buffer_ncopies, schur_nnz)
-                function get_C_dot_Ainv_dot_B_storage_column(i)
-                    local_column_view = @view(C_dot_Ainv_dot_B_storage[i,:])
-                    local_column_view .= 0.0
-                    # It is hacky to use unsafe_wrap, but FixedSparseCSC requires a Vector
-                    # argument. This should be OK because both C_dot_Ainv_dot_B and
-                    # C_dot_Ainv_dot_B_storage are stored in the same struct, so the memory
-                    # underlying both will be preserved until the struct is deleted.
-                    local_column = unsafe_wrap(Array, pointer(local_column_view),
-                                               length(local_column_view))
-                    return FixedSparseCSC(bottom_vec_global_size, bottom_vec_global_size,
-                                          schur_complement_buffer.colptr,
-                                          schur_complement_buffer.rowval, local_column)
+                if shared_rank == 0
+                    C_dot_Ainv_dot_B_storage .= 0.0
                 end
-                C_dot_Ainv_dot_B = [get_C_dot_Ainv_dot_B_storage_column(i)
-                                    for i ∈ 1:C_dot_Ainv_dot_B_buffer_ncopies]
+                C_dot_Ainv_dot_B = (colptr=schur_complement_buffer.colptr,
+                                    rowval=schur_complement_buffer.rowval,
+                                    storage=C_dot_Ainv_dot_B_storage)
 
                 # B_column_range_partial is not otherwise used in this case (Ainv_dot_B is
                 # a MPISchurComplementBlockAinvDotB and C_buffer is a
@@ -1753,8 +1743,7 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                                           schur_complement,
                                           schur_complement_factorization,
                                           schur_complement_local_range_partial,
-                                          Ainv_dot_u, C_dot_Ainv_dot_B,
-                                          C_dot_Ainv_dot_B_storage, C_dot_Ainv_dot_u,
+                                          Ainv_dot_u, C_dot_Ainv_dot_B, C_dot_Ainv_dot_u,
                                           Ainv_dot_B_dot_y, top_vec_buffer,
                                           local_top_vec_buffer, top_vec_local_size,
                                           bottom_vec_buffer, bottom_vec_local_size,
@@ -2063,13 +2052,13 @@ function update_schur_complement_factorization!(sc, D)
         end
         if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB) && isa(this_C, MPISchurComplementBlockC)
             # Contributions from each process have now been calculated, and are available
-            # in C_dot_Ainv_dot_B_storage. Need to add up all contributions into
+            # in C_dot_Ainv_dot_B.storage. Need to add up all contributions into
             # schur_complement.
             # B_column_range_partial is abused to store the index range that we need for
             # this update, as it is not used otherwise.
             flat_range = sc.B_column_range_partial
             if !isempty(flat_range)
-                @views sum!(schur_complement.nzval[flat_range]', sc.C_dot_Ainv_dot_B_storage[:,flat_range])
+                @views sum!(schur_complement.nzval[flat_range]', sc.C_dot_Ainv_dot_B.storage[:,flat_range])
             end
         elseif issparse(C_dot_Ainv_dot_B)
             C_dot_Ainv_dot_B_colptr = C_dot_Ainv_dot_B.colptr
