@@ -703,6 +703,7 @@ function update_from_sparse_matrix_select_columns!(A::Matrix{Tf}, colinds,
         # rowval entries for this column will be the same in both. Therefore no need to
         # use `searchsortedlast()` to speed up finding the first matching entry for `i`.
         row = max(searchsortedlast(new_rowinds, new_firstrow) - 1, 1)
+        A[1:row-1,col] .= 0.0
         for new_i ∈ new_firsti:new_lasti
             new_row = new_rowval[new_i]
             while row ≤ new_nrows && new_rowinds[row] < new_row
@@ -718,6 +719,7 @@ function update_from_sparse_matrix_select_columns!(A::Matrix{Tf}, colinds,
                 row += 1
             end
         end
+        A[row:end,col] .= 0.0
     end
     return nothing
 end
