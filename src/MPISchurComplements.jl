@@ -1691,7 +1691,10 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
         end
     end
 
-    if isa(parallel_schur, Bool) && parallel_schur
+    if bottom_vec_global_size == 0
+        # The schur_complement is empty.
+        schur_complement_factorization = nothing
+    elseif isa(parallel_schur, Bool) && parallel_schur
         if schur_tile_size === nothing
             power_of_2 = floor(Int64, log2(bottom_vec_global_size / 2))
             schur_tile_size = min(128, 2^power_of_2)
@@ -2372,7 +2375,7 @@ function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
                     synchronize_shared()
                 end
             else
-                if shared_rank == 0 && distributed_rank == 0
+                if schur_complement_factorization !== nothing
                     ldiv!(global_y, schur_complement_factorization, bottom_vec_buffer)
                 end
             end
