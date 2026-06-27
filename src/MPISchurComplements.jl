@@ -101,6 +101,12 @@ The block structure guarantee is useful because it means that instances of
 MPISchurComplementBlockC do not have to support `getindex()` or `setindex!()`, which would
 be needed to get/update the overlapping entries.
 
+Instances of MPISchurComplementBlockC must have a field `output_buffer_ncopies` that
+specifies the number of entries in the output buffer needed to support parallelisation.
+When `output_buffer_ncopies > 1`, the entries from the buffer will be summed into the
+final output, while when `output_buffer_ncopies == 1` the output array will be passed
+directly.
+
 Methods `copy_C_submatrix!(C_buffer::MPISchurComplementBlockC, C::AbstractMatrix)` and
 `mul_C_Ainv_dot_B!(C_dot_Ainv_dot_B::AbstractMatrix, C::MPISchurComplementBlockC,
 Ainv_dot_B::MPISchurComplementBlockAinvDotB)` must be defined by the package supplying an
@@ -970,7 +976,6 @@ end
                          parallel_schur::Union{Bool,Factorization}=(distributed_comm!==nothing || shared_comm!==nothing),
                          Ainv_dot_B_buffer::Union{AbstractMatrix,MPISchurComplementBlockAinvDotB,Nothing}=nothing,
                          C_buffer::Union{MPISchurComplementBlockC,Nothing}=nothing,
-                         C_dot_Ainv_dot_B_buffer_ncopies::Union{Integer,Nothing}=nothing,
                          schur_complement_buffer::Union{AbstractMatrix,Nothing}=nothing,
                          copy_input_to_dense_buffers::Bool=false,
                          schur_tile_size::Union{Integer,Nothing}=nothing,
@@ -1095,8 +1100,6 @@ some known block structure of the sub-matrices) for the application of \$A^{-1}\
 and multiplication \$C\\cdot(A^{-1}\\cdotB)\$ buffers of type
 `MPISchurComplementBlockAinvDotB` and `MPISchurComplementBlockC` can be passed to
 `Ainv_dot_B_buffer` and `C_buffer`. If either is passed, both must be.
-`C_dot_Ainv_dot_B_buffer_ncopies` gives the number of duplicate buffers that are needed in
-the shared-memory array (`C_dot_Ainv_dot_B`) that mul_C_Ainv_dot_B!() writes output to.
 
 When the inputs that will be passed to `update_schur_complement!()` are sparse arrays (or
 views of sparse arrays), and there are repeated indices, it might be the case that the
@@ -1138,7 +1141,6 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                               parallel_schur::Union{Bool,Factorization}=(distributed_comm!==nothing || shared_comm!==nothing),
                               Ainv_dot_B_buffer::Union{AbstractMatrix,MPISchurComplementBlockAinvDotB,Nothing}=nothing,
                               C_buffer::Union{MPISchurComplementBlockC,Nothing}=nothing,
-                              C_dot_Ainv_dot_B_buffer_ncopies::Union{Integer,Nothing}=nothing,
                               schur_complement_buffer::Union{AbstractMatrix,Nothing}=nothing,
                               copy_input_to_dense_buffers::Bool=false,
                               schur_tile_size::Union{Integer,Nothing}=nothing,
@@ -1621,26 +1623,30 @@ function mpi_schur_complement(A_factorization, B::Union{AbstractMatrix,Nothing,T
                 # C_dot_Ainv_dot_B for each shared-memory process stored in shared memory,
                 # then once each process calculates its contribution, the contributions from
                 # different processes can be summed.
-                if C_dot_Ainv_dot_B_buffer_ncopies === nothing
-                    C_dot_Ainv_dot_B_buffer_ncopies = shared_nproc
-                end
-                schur_nnz = nnz(schur_complement_buffer)
-                C_dot_Ainv_dot_B_storage =
-                    allocate_shared_float(C_dot_Ainv_dot_B_buffer_ncopies, schur_nnz)
-                if shared_rank == 0
-                    C_dot_Ainv_dot_B_storage .= 0.0
-                end
-                C_dot_Ainv_dot_B = (colptr=schur_complement_buffer.colptr,
-                                    rowval=schur_complement_buffer.rowval,
-                                    storage=C_dot_Ainv_dot_B_storage)
+                if C_buffer.output_buffer_ncopies > 1
+                    # When C_buffer.output_buffer_ncopies=1, we can write the output
+                    # directly into the schur_complement buffer, as no addition of
+                    # intermediate results is needed.
+                    schur_nnz = nnz(schur_complement_buffer)
+                    C_dot_Ainv_dot_B_storage =
+                        allocate_shared_float(C_buffer.output_buffer_ncopies, schur_nnz)
+                    if shared_rank == 0
+                        C_dot_Ainv_dot_B_storage .= 0.0
+                    end
+                    C_dot_Ainv_dot_B = (colptr=schur_complement_buffer.colptr,
+                                        rowval=schur_complement_buffer.rowval,
+                                        storage=C_dot_Ainv_dot_B_storage)
 
-                # B_column_range_partial is not otherwise used in this case (Ainv_dot_B is
-                # a MPISchurComplementBlockAinvDotB and C_buffer is a
-                # MPISchurComplementBlockC), but it is a UnitRange, so we can abuse it to
-                # hold the range of flattened indices that this process should handle when
-                # updating schur_complement_matrix with C_dot_Ainv_dot_B.
-                n_flat_per_proc = (schur_nnz + shared_nproc - 1) ÷ shared_nproc
-                B_column_range_partial = shared_rank*n_flat_per_proc+1:min((shared_rank+1)*n_flat_per_proc,schur_nnz)
+                    # B_column_range_partial is not otherwise used in this case (Ainv_dot_B is
+                    # a MPISchurComplementBlockAinvDotB and C_buffer is a
+                    # MPISchurComplementBlockC), but it is a UnitRange, so we can abuse it to
+                    # hold the range of flattened indices that this process should handle when
+                    # updating schur_complement_matrix with C_dot_Ainv_dot_B.
+                    n_flat_per_proc = (schur_nnz + shared_nproc - 1) ÷ shared_nproc
+                    B_column_range_partial = shared_rank*n_flat_per_proc+1:min((shared_rank+1)*n_flat_per_proc,schur_nnz)
+                else
+                    B_column_range_partial = 1:0
+                end
             end
         elseif isa(schur_complement_buffer, FixedSparseCSC)
             C_dot_Ainv_dot_B =
@@ -2003,7 +2009,7 @@ function update_schur_complement_factorization!(sc, D)
     @sc_timeit timer "schur_complement" begin
         # Initialise `schur_complement` to zero, because when `this_C` does not include all rows,
         # the matrix multiplication below would not initialise all elements.
-        if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB) && isa(this_C, MPISchurComplementBlockC)
+        if C_dot_Ainv_dot_B !== nothing && isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB) && isa(this_C, MPISchurComplementBlockC)
             # Don't need to initialize schur_complement in this case.
         elseif issparse(schur_complement)
             schur_colptr = schur_complement.colptr
@@ -2044,7 +2050,12 @@ function update_schur_complement_factorization!(sc, D)
         # the local chunks, then do a sum-reduce to get the final result. The
         # `schur_complement` buffer is full size on every rank.
         if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB) && isa(this_C, MPISchurComplementBlockC)
-            mul_C_Ainv_dot_B!(C_dot_Ainv_dot_B, this_C, Ainv_dot_B)
+            if C_dot_Ainv_dot_B === nothing
+                output_buffer = schur_complement
+            else
+                output_buffer = C_dot_Ainv_dot_B
+            end
+            mul_C_Ainv_dot_B!(output_buffer, this_C, Ainv_dot_B)
             synchronize_shared()
         elseif isa(this_C, SparseMatrixCSR) && isa(Ainv_dot_B, AbstractSparseMatrixCSC)
             csr_mul!(C_dot_Ainv_dot_B, this_C, Ainv_dot_B, -1.0, 0.0)
@@ -2057,9 +2068,12 @@ function update_schur_complement_factorization!(sc, D)
             # schur_complement.
             # B_column_range_partial is abused to store the index range that we need for
             # this update, as it is not used otherwise.
-            flat_range = sc.B_column_range_partial
-            if !isempty(flat_range)
-                @views sum!(schur_complement.nzval[flat_range]', sc.C_dot_Ainv_dot_B.storage[:,flat_range])
+            if sc.C_dot_Ainv_dot_B !== nothing
+                flat_range = sc.B_column_range_partial
+                if !isempty(flat_range)
+                    @views sum!(schur_complement.nzval[flat_range]',
+                                sc.C_dot_Ainv_dot_B.storage[:,flat_range])
+                end
             end
         elseif issparse(C_dot_Ainv_dot_B)
             C_dot_Ainv_dot_B_colptr = C_dot_Ainv_dot_B.colptr
