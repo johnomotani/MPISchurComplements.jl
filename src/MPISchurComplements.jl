@@ -678,7 +678,7 @@ end
 end
 
 """
-    update_from_sparse_matrix_select_columns!(A::Matrix{Tf},
+    update_from_sparse_matrix_select_columns!(A::Matrix{Tf}, colinds,
                                               new_A::AbstractSparseMatrixCSC{Tf,Ti},
                                               new_colinds, new_rowinds) where {Tf,Ti}
 
@@ -711,7 +711,6 @@ function update_from_sparse_matrix_select_columns!(A::Matrix{Tf}, colinds,
                 row += 1
             end
             if row > new_nrows
-                A[row:end,col] .= 0.0
                 break
             end
             if new_rowinds[row] == new_row
