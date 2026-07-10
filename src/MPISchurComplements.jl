@@ -262,54 +262,56 @@ than the largest index in `distributed_ranges` which are not present in any elem
 `distributed_ranges`) from the index ranges.
 """
 function remove_gaps_in_ranges!(distributed_ranges::Vector{Vector{Int64}})
-    # This may be a bit inefficient when the state vector size gets large. In that
-    # case, it is suggested to use UnitRange{Int64}-based ranges.
-    all_indices = vcat(distributed_ranges...)
-    sort!(all_indices)
-    gaps = UnitRange{Int64}[]
-    prev_ind = 0
-    for i ∈ all_indices
-        if i > prev_ind + 1
-            push!(gaps, prev_ind+1:i-1)
+    @inbounds begin
+        # This may be a bit inefficient when the state vector size gets large. In that
+        # case, it is suggested to use UnitRange{Int64}-based ranges.
+        all_indices = vcat(distributed_ranges...)
+        sort!(all_indices)
+        gaps = UnitRange{Int64}[]
+        prev_ind = 0
+        for i ∈ all_indices
+            if i > prev_ind + 1
+                push!(gaps, prev_ind+1:i-1)
+            end
+            prev_ind = i
         end
-        prev_ind = i
-    end
 
-    if length(gaps) > 0
-        # Remove `gaps` from distributed_ranges
-        for this_range ∈ distributed_ranges
-            igap = 1
-            n_gaps = length(gaps)
-            this_gap = gaps[igap]
-            # Allow for the possibility that this_range is not sorted, but assume that it
-            # is mostly sorted (i.e. there are a small number of times when
-            # this_ind < ind_previous) - otherwise the following would be inefficient.
-            ind_previous = 0
-            # Start here so that if the first index is >1 (i.e. there is an
-            # 'initial gap') we also remove that.
-            gaps_offset = 0
-            for i ∈ 1:length(this_range)
-                this_ind = this_range[i]
-                if this_ind ≤ ind_previous
-                    # Restart the gap search because the range is not sorted.
-                    igap = 1
-                    this_gap = gaps[igap]
-                    gaps_offset = 0
-                end
-                ind_previous = this_ind
-                if this_ind > this_gap.start
-                    while igap ≤ n_gaps && gaps[igap].stop < this_ind
-                        gaps_offset += length(gaps[igap])
-                        igap += 1
+        if length(gaps) > 0
+            # Remove `gaps` from distributed_ranges
+            for this_range ∈ distributed_ranges
+                igap = 1
+                n_gaps = length(gaps)
+                this_gap = gaps[igap]
+                # Allow for the possibility that this_range is not sorted, but assume that
+                # it is mostly sorted (i.e. there are a small number of times when
+                # this_ind < ind_previous) - otherwise the following would be inefficient.
+                ind_previous = 0
+                # Start here so that if the first index is >1 (i.e. there is an 'initial
+                # gap') we also remove that.
+                gaps_offset = 0
+                for i ∈ 1:length(this_range)
+                    this_ind = this_range[i]
+                    if this_ind ≤ ind_previous
+                        # Restart the gap search because the range is not sorted.
+                        igap = 1
+                        this_gap = gaps[igap]
+                        gaps_offset = 0
                     end
-                    this_gap = gaps[min(igap, n_gaps)]
+                    ind_previous = this_ind
+                    if this_ind > this_gap.start
+                        while igap ≤ n_gaps && gaps[igap].stop < this_ind
+                            gaps_offset += length(gaps[igap])
+                            igap += 1
+                        end
+                        this_gap = gaps[min(igap, n_gaps)]
+                    end
+                    this_range[i] -= gaps_offset
                 end
-                this_range[i] -= gaps_offset
             end
         end
-    end
 
-    return nothing
+        return nothing
+    end
 end
 
 """
@@ -323,49 +325,54 @@ and any subsequent occurences are 'repeats. Returns:
    'real' index and a corresponding 'repeat'
 """
 function separate_repeated_indices(inds)
-    indices_with_repeats = eltype(inds)[]
-    unique_inds = eltype(inds)[]
-    for i ∈ inds
-        if i ∈ unique_inds
-            push!(indices_with_repeats, i)
-        else
-            push!(unique_inds, i)
+    @inbounds begin
+        indices_with_repeats = eltype(inds)[]
+        unique_inds = eltype(inds)[]
+        for i ∈ inds
+            if i ∈ unique_inds
+                push!(indices_with_repeats, i)
+            else
+                push!(unique_inds, i)
+            end
         end
-    end
-    n_repeats = length(indices_with_repeats)
-    # Get rid of any repeated repeats from indices_with_repeats.
-    unique!(indices_with_repeats)
+        n_repeats = length(indices_with_repeats)
+        # Get rid of any repeated repeats from indices_with_repeats.
+        unique!(indices_with_repeats)
 
-    repeats = zeros(Int64, 2, n_repeats)
-    counter = 0
-    for repeated ∈ indices_with_repeats
-        all_repeats = findall(i -> i==repeated, inds)
-        first_occurence = all_repeats[1]
-        # Skip the first entry in all_repeats which is the position of the 'real' entry.
-        for position ∈ all_repeats[2:end]
-            counter += 1
-            repeats[1,counter] = first_occurence
-            repeats[2,counter] = position
+        repeats = zeros(Int64, 2, n_repeats)
+        counter = 0
+        for repeated ∈ indices_with_repeats
+            all_repeats = findall(i -> i==repeated, inds)
+            first_occurence = all_repeats[1]
+            # Skip the first entry in all_repeats which is the position of the 'real'
+            # entry.
+            for position ∈ all_repeats[2:end]
+                counter += 1
+                repeats[1,counter] = first_occurence
+                repeats[2,counter] = position
+            end
         end
-    end
-    if counter != n_repeats
-        error("Filled $counter columns of `repeats`, but expected $n_repeats repeats.")
-    end
+        if counter != n_repeats
+            error("Filled $counter columns of `repeats`, but expected $n_repeats repeats.")
+        end
 
-    local_unique_inds = find_local_vector_inds(unique_inds, inds)
+        local_unique_inds = find_local_vector_inds(unique_inds, inds)
 
-    return unique_inds, local_unique_inds, repeats
+        return unique_inds, local_unique_inds, repeats
+    end
 end
 
 function get_partial_repeated_inds(repeats, partial_range)
-    if repeats === nothing
-        return nothing
+    @inbounds begin
+        if repeats === nothing
+            return nothing
+        end
+        # Filter all repeats to those where the first_occurrence i in partial_range, so
+        # that the repeats can be handled using shared-memory parallelism.
+        local_repeat_columns = findall(x->(x ∈ partial_range), repeats[1,:])
+        partial_repeats = repeats[:,local_repeat_columns]
+        return partial_repeats
     end
-    # Filter all repeats to those where the first_occurrence i in partial_range, so that
-    # the repeats can be handled using shared-memory parallelism.
-    local_repeat_columns = findall(x->(x ∈ partial_range), repeats[1,:])
-    partial_repeats = repeats[:,local_repeat_columns]
-    return partial_repeats
 end
 
 """
@@ -375,13 +382,15 @@ Find indices of `global_inds` within `owned_global_inds`. This gives the 'local 
 corresponding to `global_inds`.
 """
 function find_local_vector_inds(global_inds::AbstractArray, owned_global_inds)
-    local_inds = similar(global_inds)
-    for (i, gind) ∈ enumerate(global_inds)
-        # `owned_global_inds` is not necessarily sorted, so no obvious way to optimise
-        # this.
-        local_inds[i] = findfirst(i->i==gind, owned_global_inds)
+    @inbounds begin
+        local_inds = similar(global_inds)
+        for (i, gind) ∈ enumerate(global_inds)
+            # `owned_global_inds` is not necessarily sorted, so no obvious way to optimise
+            # this.
+            local_inds[i] = findfirst(i->i==gind, owned_global_inds)
+        end
+        return local_inds
     end
-    return local_inds
 end
 
 """
@@ -424,54 +433,56 @@ column of the 'compressed-sparse-column' matrix `new_A`.
 function update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
                                new_A::AbstractSparseMatrixCSC{Tf,Ti}, new_rowinds,
                                row_counter::Vector{Int64}) where {Bi,Tf,Ti}
-    rowptr = A.rowptr
-    colval = A.colval
-    nzval = A.nzval
-    new_colptr = new_A.colptr
-    new_rowval = new_A.rowval
-    new_nzval = new_A.nzval
-    resize!(rowptr, 1)
-    resize!(colval, 0)
-    resize!(nzval, 0)
+    @inbounds begin
+        rowptr = A.rowptr
+        colval = A.colval
+        nzval = A.nzval
+        new_colptr = new_A.colptr
+        new_rowval = new_A.rowval
+        new_nzval = new_A.nzval
+        resize!(rowptr, 1)
+        resize!(colval, 0)
+        resize!(nzval, 0)
 
-    if isempty(new_rowinds)
+        if isempty(new_rowinds)
+            return nothing
+        end
+
+        new_first_row = first(new_rowinds)
+        for col ∈ 1:size(new_A, 2)
+            new_firsti = new_colptr[col]
+            new_lasti = new_colptr[col+1]-1
+            col_rv = @view new_rowval[new_firsti:new_lasti]
+            row_counter[col] = max(searchsortedlast(col_rv, new_first_row) - 1, 1) + new_firsti - 1
+        end
+
+        nrow, ncol = size(A)
+        for row ∈ 1:nrow
+            new_row = new_rowinds[row]
+            for col ∈ 1:ncol
+                newi = row_counter[col]
+                new_lasti = new_colptr[col+1]-1
+                while newi ≤ new_lasti && new_rowval[newi] < new_row
+                    newi += 1
+                end
+                if newi > new_lasti
+                    row_counter[col] = newi
+                    continue
+                end
+                if new_rowval[newi] == new_row
+                    val = new_nzval[newi]
+                    if val != zero(Tf)
+                        push!(colval, col)
+                        push!(nzval, val)
+                    end
+                end
+                row_counter[col] = newi
+            end
+            push!(rowptr, length(colval) + 1)
+        end
+
         return nothing
     end
-
-    new_first_row = first(new_rowinds)
-    for col ∈ 1:size(new_A, 2)
-        new_firsti = new_colptr[col]
-        new_lasti = new_colptr[col+1]-1
-        col_rv = @view new_rowval[new_firsti:new_lasti]
-        row_counter[col] = max(searchsortedlast(col_rv, new_first_row) - 1, 1) + new_firsti - 1
-    end
-
-    nrow, ncol = size(A)
-    for row ∈ 1:nrow
-        new_row = new_rowinds[row]
-        for col ∈ 1:ncol
-            newi = row_counter[col]
-            new_lasti = new_colptr[col+1]-1
-            while newi ≤ new_lasti && new_rowval[newi] < new_row
-                newi += 1
-            end
-            if newi > new_lasti
-                row_counter[col] = newi
-                continue
-            end
-            if new_rowval[newi] == new_row
-                val = new_nzval[newi]
-                if val != zero(Tf)
-                    push!(colval, col)
-                    push!(nzval, val)
-                end
-            end
-            row_counter[col] = newi
-        end
-        push!(rowptr, length(colval) + 1)
-    end
-
-    return nothing
 end
 
 """
@@ -492,66 +503,70 @@ column of the 'compressed-sparse-column' matrix `new_A`.
 function update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
                                new_A::AbstractSparseMatrixCSC{Tf,Ti}, new_rowinds, new_colinds,
                                row_counter::Vector{Int64}) where {Bi,Tf,Ti}
-    rowptr = A.rowptr
-    colval = A.colval
-    nzval = A.nzval
-    new_colptr = new_A.colptr
-    new_rowval = new_A.rowval
-    new_nzval = new_A.nzval
-    resize!(rowptr, 1)
-    resize!(colval, 0)
-    resize!(nzval, 0)
+    @inbounds begin
+        rowptr = A.rowptr
+        colval = A.colval
+        nzval = A.nzval
+        new_colptr = new_A.colptr
+        new_rowval = new_A.rowval
+        new_nzval = new_A.nzval
+        resize!(rowptr, 1)
+        resize!(colval, 0)
+        resize!(nzval, 0)
 
-    if isempty(new_rowinds)
-        # No entries to update
+        if isempty(new_rowinds)
+            # No entries to update
+            return nothing
+        end
+
+        new_first_row = first(new_rowinds)
+        for col ∈ 1:length(new_colinds)
+            newcol = new_colinds[col]
+            new_firsti = new_colptr[newcol]
+            new_lasti = new_colptr[newcol+1]-1
+            col_rv = @view new_rowval[new_firsti:new_lasti]
+            row_counter[col] = max(searchsortedlast(col_rv, new_first_row) - 1, 1) + new_firsti - 1
+        end
+
+        nrow, ncol = size(A)
+        for row ∈ 1:nrow
+            new_row = new_rowinds[row]
+            for col ∈ 1:ncol
+                newcol = new_colinds[col]
+                newi = row_counter[col]
+                new_lasti = new_colptr[newcol+1]-1
+                if new_rowval[newi] > new_row
+                    continue
+                end
+                while newi ≤ new_lasti && new_rowval[newi] < new_row
+                    newi += 1
+                end
+                if newi > new_lasti
+                    continue
+                end
+                if new_rowval[newi] == new_row
+                    val = new_nzval[newi]
+                    if val != zero(Tf)
+                        push!(colval, col)
+                        push!(nzval, val)
+                    end
+                end
+                row_counter[col] = newi
+            end
+            push!(rowptr, length(colval) + 1)
+        end
+
         return nothing
     end
-
-    new_first_row = first(new_rowinds)
-    for col ∈ 1:length(new_colinds)
-        newcol = new_colinds[col]
-        new_firsti = new_colptr[newcol]
-        new_lasti = new_colptr[newcol+1]-1
-        col_rv = @view new_rowval[new_firsti:new_lasti]
-        row_counter[col] = max(searchsortedlast(col_rv, new_first_row) - 1, 1) + new_firsti - 1
-    end
-
-    nrow, ncol = size(A)
-    for row ∈ 1:nrow
-        new_row = new_rowinds[row]
-        for col ∈ 1:ncol
-            newcol = new_colinds[col]
-            newi = row_counter[col]
-            new_lasti = new_colptr[newcol+1]-1
-            if new_rowval[newi] > new_row
-                continue
-            end
-            while newi ≤ new_lasti && new_rowval[newi] < new_row
-                newi += 1
-            end
-            if newi > new_lasti
-                continue
-            end
-            if new_rowval[newi] == new_row
-                val = new_nzval[newi]
-                if val != zero(Tf)
-                    push!(colval, col)
-                    push!(nzval, val)
-                end
-            end
-            row_counter[col] = newi
-        end
-        push!(rowptr, length(colval) + 1)
-    end
-
-    return nothing
 end
 @inline function update_sparse_matrix!(A::SparseMatrixCSR{Bi,Tf,Ti},
                                        new_A::SubArray{Tf,2}, new_rowinds,
                                        row_counter::Vector{Int64}) where {Bi,Tf,Ti}
-    full_rowinds, full_colinds = new_A.indices
-    return update_sparse_matrix!(A, parent(new_A), @view(full_rowinds[new_rowinds]),
-                                 full_colinds, row_counter)
+    @inbounds begin
+        full_rowinds, full_colinds = new_A.indices
+        return update_sparse_matrix!(A, parent(new_A), @view(full_rowinds[new_rowinds]),
+                                     full_colinds, row_counter)
+    end
 end
 
 """
@@ -565,30 +580,32 @@ contain extra zeros.
 """
 function update_sparse_matrix!(A::AbstractSparseMatrixCSC{Tf,Ti},
                                new_A::FixedSparseCSC{Tf,Ti}) where {Tf,Ti}
-    colptr = A.colptr
-    rowval = A.rowval
-    nzval = A.nzval
-    new_colptr = new_A.colptr
-    new_rowval = new_A.rowval
-    new_nzval = new_A.nzval
-    resize!(colptr, 0)
-    resize!(rowval, 0)
-    resize!(nzval, 0)
-    count = 1
-    for col ∈ 1:new_A.n
-        push!(colptr, count)
-        colstart = new_colptr[col]
-        colend = new_colptr[col+1] - 1
-        for new_i ∈ colstart:colend
-            if !iszero(new_nzval[new_i])
-                push!(rowval, new_rowval[new_i])
-                push!(nzval, new_nzval[new_i])
-                count += 1
+    @inbounds begin
+        colptr = A.colptr
+        rowval = A.rowval
+        nzval = A.nzval
+        new_colptr = new_A.colptr
+        new_rowval = new_A.rowval
+        new_nzval = new_A.nzval
+        resize!(colptr, 0)
+        resize!(rowval, 0)
+        resize!(nzval, 0)
+        count = 1
+        for col ∈ 1:new_A.n
+            push!(colptr, count)
+            colstart = new_colptr[col]
+            colend = new_colptr[col+1] - 1
+            for new_i ∈ colstart:colend
+                if !iszero(new_nzval[new_i])
+                    push!(rowval, new_rowval[new_i])
+                    push!(nzval, new_nzval[new_i])
+                    count += 1
+                end
             end
         end
+        push!(colptr, count)
+        return nothing
     end
-    push!(colptr, count)
-    return nothing
 end
 
 """
@@ -607,33 +624,35 @@ of columns given by `colinds` in `A`.
 function update_sparse_matrix_select_columns!(A::FixedSparseCSC{Tf,Ti}, colinds,
                                               new_A::AbstractSparseMatrixCSC{Tf,Ti},
                                               new_colinds) where {Tf,Ti}
-    colptr = A.colptr
-    rowval = A.rowval
-    nzval = A.nzval
-    new_colptr = new_A.colptr
-    new_rowval = new_A.rowval
-    new_nzval = new_A.nzval
-    for (col, new_col) ∈ zip(colinds, new_colinds)
-        firsti = colptr[col]
-        lasti = colptr[col+1] - 1
-        new_firsti = new_colptr[new_col]
-        new_lasti = new_colptr[new_col+1] - 1
-        # Expect than usually the sparsity patterns of A and new_A will match, so the
-        # rowval entries for this column will be the same in both. Therefore no need to
-        # use `searchsortedlast()` to speed up finding the first matching entry.
-        i = firsti
-        for new_i ∈ new_firsti:new_lasti
-            new_row = new_rowval[new_i]
-            while i ≤ lasti && rowval[i] < new_row
-                i += 1
-            end
-            if i ≤ lasti && rowval[i] == new_row
-                nzval[i] = new_nzval[new_i]
-                i += 1
+    @inbounds begin
+        colptr = A.colptr
+        rowval = A.rowval
+        nzval = A.nzval
+        new_colptr = new_A.colptr
+        new_rowval = new_A.rowval
+        new_nzval = new_A.nzval
+        for (col, new_col) ∈ zip(colinds, new_colinds)
+            firsti = colptr[col]
+            lasti = colptr[col+1] - 1
+            new_firsti = new_colptr[new_col]
+            new_lasti = new_colptr[new_col+1] - 1
+            # Expect than usually the sparsity patterns of A and new_A will match, so the
+            # rowval entries for this column will be the same in both. Therefore no need to
+            # use `searchsortedlast()` to speed up finding the first matching entry.
+            i = firsti
+            for new_i ∈ new_firsti:new_lasti
+                new_row = new_rowval[new_i]
+                while i ≤ lasti && rowval[i] < new_row
+                    i += 1
+                end
+                if i ≤ lasti && rowval[i] == new_row
+                    nzval[i] = new_nzval[new_i]
+                    i += 1
+                end
             end
         end
+        return nothing
     end
-    return nothing
 end
 
 """
@@ -654,72 +673,78 @@ of columns given by `colinds` in `A`.
 function update_sparse_matrix_select_columns!(A::FixedSparseCSC{Tf,Ti}, colinds,
                                               new_A::AbstractSparseMatrixCSC{Tf,Ti},
                                               new_colinds, new_rowinds) where {Tf,Ti}
-    colptr = A.colptr
-    rowval = A.rowval
-    nzval = A.nzval
-    new_colptr = new_A.colptr
-    new_rowval = new_A.rowval
-    new_nzval = new_A.nzval
-    new_nrows = length(new_rowinds)
-    for (col, new_col) ∈ zip(colinds, new_colinds)
-        firsti = colptr[col]
-        lasti = colptr[col+1] - 1
-        new_firsti = new_colptr[new_col]
-        new_lasti = new_colptr[new_col+1] - 1
-        new_firstrow = new_rowval[new_firsti]
-        # Expect than usually the sparsity patterns of A and new_A will match, so the
-        # rowval entries for this column will be the same in both. Therefore no need to
-        # use `searchsortedlast()` to speed up finding the first matching entry for `i`.
-        i = firsti
-        row = max(searchsortedlast(new_rowinds, new_firstrow) - 1, 1)
-        for new_i ∈ new_firsti:new_lasti
-            new_row = new_rowval[new_i]
-            while row ≤ new_nrows && new_rowinds[row] < new_row
-                row += 1
-            end
-            if row > new_nrows
-                break
-            end
-            if new_rowinds[row] == new_row
-                while i ≤ lasti && rowval[i] < row
-                    i += 1
-                end
-                if i ≤ lasti && rowval[i] == row
-                    nzval[i] = new_nzval[new_i]
-                    i += 1
+    @inbounds begin
+        colptr = A.colptr
+        rowval = A.rowval
+        nzval = A.nzval
+        new_colptr = new_A.colptr
+        new_rowval = new_A.rowval
+        new_nzval = new_A.nzval
+        new_nrows = length(new_rowinds)
+        for (col, new_col) ∈ zip(colinds, new_colinds)
+            firsti = colptr[col]
+            lasti = colptr[col+1] - 1
+            new_firsti = new_colptr[new_col]
+            new_lasti = new_colptr[new_col+1] - 1
+            new_firstrow = new_rowval[new_firsti]
+            # Expect than usually the sparsity patterns of A and new_A will match, so the
+            # rowval entries for this column will be the same in both. Therefore no need to
+            # use `searchsortedlast()` to speed up finding the first matching entry for `i`.
+            i = firsti
+            row = max(searchsortedlast(new_rowinds, new_firstrow) - 1, 1)
+            for new_i ∈ new_firsti:new_lasti
+                new_row = new_rowval[new_i]
+                while row ≤ new_nrows && new_rowinds[row] < new_row
                     row += 1
+                end
+                if row > new_nrows
+                    break
+                end
+                if new_rowinds[row] == new_row
+                    while i ≤ lasti && rowval[i] < row
+                        i += 1
+                    end
+                    if i ≤ lasti && rowval[i] == row
+                        nzval[i] = new_nzval[new_i]
+                        i += 1
+                        row += 1
+                    end
                 end
             end
         end
+        return nothing
     end
-    return nothing
 end
 function update_sparse_matrix_select_columns!(A::FixedSparseCSC{Tf,Ti}, colinds,
                                               new_A::AbstractMatrix{Tf}, new_colinds,
                                               new_rowinds) where {Tf,Ti}
-    colptr = A.colptr
-    rowval = A.rowval
-    nzval = A.nzval
-    new_nrows = length(new_rowinds)
-    for (col, new_col) ∈ zip(colinds, new_colinds)
-        firsti = colptr[col]
-        lasti = colptr[col+1] - 1
-        for i ∈ firsti:lasti
-            row = rowval[i]
-            new_row = new_rowinds[row]
-            nzval[i] = new_A[new_row,new_col]
+    @inbounds begin
+        colptr = A.colptr
+        rowval = A.rowval
+        nzval = A.nzval
+        new_nrows = length(new_rowinds)
+        for (col, new_col) ∈ zip(colinds, new_colinds)
+            firsti = colptr[col]
+            lasti = colptr[col+1] - 1
+            for i ∈ firsti:lasti
+                row = rowval[i]
+                new_row = new_rowinds[row]
+                nzval[i] = new_A[new_row,new_col]
+            end
         end
+        return nothing
     end
-    return nothing
 end
 @inline function update_sparse_matrix_select_columns!(A::FixedSparseCSC{Tf,Ti}, colinds,
                                                       new_A::SubArray{Tf,2},
                                                       new_colinds) where {Tf,Ti}
-    full_new_A = parent(new_A)
-    full_rowinds, full_colinds = new_A.indices
-    return update_sparse_matrix_select_columns!(A, colinds, full_new_A,
-                                                @view(full_colinds[new_colinds]),
-                                                full_rowinds)
+    @inbounds begin
+        full_new_A = parent(new_A)
+        full_rowinds, full_colinds = new_A.indices
+        return update_sparse_matrix_select_columns!(A, colinds, full_new_A,
+                                                    @view(full_colinds[new_colinds]),
+                                                    full_rowinds)
+    end
 end
 
 """
@@ -736,45 +761,50 @@ Update the values of `A` in-place to the values of `new_A`.
 function update_from_sparse_matrix_select_columns!(A::Matrix{Tf}, colinds,
                                                    new_A::AbstractSparseMatrixCSC{Tf,Ti},
                                                    new_colinds, new_rowinds) where {Tf,Ti}
-    new_colptr = new_A.colptr
-    new_rowval = new_A.rowval
-    new_nzval = new_A.nzval
-    new_nrows = length(new_rowinds)
-    for (col, new_col) ∈ zip(colinds, new_colinds)
-        new_firsti = new_colptr[new_col]
-        new_lasti = new_colptr[new_col+1] - 1
-        new_firstrow = new_rowval[new_firsti]
-        # Expect than usually the sparsity patterns of A and new_A will match, so the
-        # rowval entries for this column will be the same in both. Therefore no need to
-        # use `searchsortedlast()` to speed up finding the first matching entry for `i`.
-        row = max(searchsortedlast(new_rowinds, new_firstrow) - 1, 1)
-        A[1:row-1,col] .= 0.0
-        for new_i ∈ new_firsti:new_lasti
-            new_row = new_rowval[new_i]
-            while row ≤ new_nrows && new_rowinds[row] < new_row
-                A[row,col] = 0.0
-                row += 1
+    @inbounds begin
+        new_colptr = new_A.colptr
+        new_rowval = new_A.rowval
+        new_nzval = new_A.nzval
+        new_nrows = length(new_rowinds)
+        for (col, new_col) ∈ zip(colinds, new_colinds)
+            new_firsti = new_colptr[new_col]
+            new_lasti = new_colptr[new_col+1] - 1
+            new_firstrow = new_rowval[new_firsti]
+            # Expect than usually the sparsity patterns of A and new_A will match, so the
+            # rowval entries for this column will be the same in both. Therefore no need
+            # to use `searchsortedlast()` to speed up finding the first matching entry for
+            # `i`.
+            row = max(searchsortedlast(new_rowinds, new_firstrow) - 1, 1)
+            A[1:row-1,col] .= 0.0
+            for new_i ∈ new_firsti:new_lasti
+                new_row = new_rowval[new_i]
+                while row ≤ new_nrows && new_rowinds[row] < new_row
+                    A[row,col] = 0.0
+                    row += 1
+                end
+                if row > new_nrows
+                    break
+                end
+                if new_rowinds[row] == new_row
+                    A[row,col] = new_nzval[new_i]
+                    row += 1
+                end
             end
-            if row > new_nrows
-                break
-            end
-            if new_rowinds[row] == new_row
-                A[row,col] = new_nzval[new_i]
-                row += 1
-            end
+            A[row:end,col] .= 0.0
         end
-        A[row:end,col] .= 0.0
+        return nothing
     end
-    return nothing
 end
 @inline function update_from_sparse_matrix_select_columns!(A::Matrix{Tf}, colinds,
                                                            new_A::SubArray{Tf,2},
                                                            new_colinds) where {Tf}
-    full_new_A = parent(new_A)
-    full_rowinds, full_colinds = new_A.indices
-    return update_from_sparse_matrix_select_columns!(A, colinds, full_new_A,
-                                                     @view(full_colinds[new_colinds]),
-                                                     full_rowinds)
+    @inbounds begin
+        full_new_A = parent(new_A)
+        full_rowinds, full_colinds = new_A.indices
+        return update_from_sparse_matrix_select_columns!(A, colinds, full_new_A,
+                                                         @view(full_colinds[new_colinds]),
+                                                         full_rowinds)
+    end
 end
 
 """
@@ -790,88 +820,92 @@ contain extra zeros.
 """
 function update_sparse_matrix_select_rows!(A::AbstractSparseMatrixCSC{Tf,Ti},
                                            new_A::FixedSparseCSC{Tf,Ti}, rowinds) where {Tf,Ti}
-    colptr = A.colptr
-    rowval = A.rowval
-    nzval = A.nzval
-    new_colptr = new_A.colptr
-    new_rowval = new_A.rowval
-    new_nzval = new_A.nzval
-    resize!(colptr, 0)
-    resize!(rowval, 0)
-    resize!(nzval, 0)
-    count = 1
-    n_rowinds = length(rowinds)
-    for col ∈ 1:new_A.n
-        push!(colptr, count)
-        colstart = new_colptr[col]
-        colend = new_colptr[col+1] - 1
-        if colend < colstart
-            continue
-        end
-        row_count = max(searchsortedlast(rowinds, new_rowval[colstart]) - 1, 1)
-        for new_i ∈ colstart:colend
-            rv = new_rowval[new_i]
-            while row_count ≤ n_rowinds && rowinds[row_count] < rv
-                row_count += 1
+    @inbounds begin
+        colptr = A.colptr
+        rowval = A.rowval
+        nzval = A.nzval
+        new_colptr = new_A.colptr
+        new_rowval = new_A.rowval
+        new_nzval = new_A.nzval
+        resize!(colptr, 0)
+        resize!(rowval, 0)
+        resize!(nzval, 0)
+        count = 1
+        n_rowinds = length(rowinds)
+        for col ∈ 1:new_A.n
+            push!(colptr, count)
+            colstart = new_colptr[col]
+            colend = new_colptr[col+1] - 1
+            if colend < colstart
+                continue
             end
-            if row_count > n_rowinds
-                break
-            end
-            if rowinds[row_count] == rv
-                newval = new_nzval[new_i]
-                if !iszero(newval)
-                    push!(rowval, row_count)
-                    push!(nzval, newval)
-                    count += 1
+            row_count = max(searchsortedlast(rowinds, new_rowval[colstart]) - 1, 1)
+            for new_i ∈ colstart:colend
+                rv = new_rowval[new_i]
+                while row_count ≤ n_rowinds && rowinds[row_count] < rv
                     row_count += 1
+                end
+                if row_count > n_rowinds
+                    break
+                end
+                if rowinds[row_count] == rv
+                    newval = new_nzval[new_i]
+                    if !iszero(newval)
+                        push!(rowval, row_count)
+                        push!(nzval, newval)
+                        count += 1
+                        row_count += 1
+                    end
                 end
             end
         end
+        push!(colptr, count)
+        return nothing
     end
-    push!(colptr, count)
-    return nothing
 end
 
 function get_partial_FixedSparseCSC_buffer(row_range, existing_buffer, data_type)
-    # Initialize buffer with the same non-zero pattern as existing_buffer, but only for a
-    # subset of rows given by row_range.
-    ncol = size(existing_buffer, 2)
-    if isempty(row_range)
-        return FixedSparseCSC(0, ncol, ones(Int64, ncol + 1), Int64[], zeros(data_type, 0))
-    end
-    colptr = Int64[1]
-    rowval = Int64[]
-    firstrow = first(row_range)
-    lastrow = last(row_range)
-    existing_colptr = existing_buffer.colptr
-    existing_rowval = existing_buffer.rowval
-    for j ∈ 1:ncol
-        existing_col_start = existing_colptr[j]
-        existing_col_end = existing_colptr[j+1]-1
-        existing_col_rowval = @view existing_rowval[existing_col_start:existing_col_end]
-        n_existing = existing_col_end - existing_col_start + 1
-        if n_existing == 0 || first(existing_col_rowval) > lastrow || last(existing_col_rowval) < firstrow
-            # Definitely no overlapping entries in this column, so skip.
+    @inbounds begin
+        # Initialize buffer with the same non-zero pattern as existing_buffer, but only
+        # for a subset of rows given by row_range.
+        ncol = size(existing_buffer, 2)
+        if isempty(row_range)
+            return FixedSparseCSC(0, ncol, ones(Int64, ncol + 1), Int64[], zeros(data_type, 0))
+        end
+        colptr = Int64[1]
+        rowval = Int64[]
+        firstrow = first(row_range)
+        lastrow = last(row_range)
+        existing_colptr = existing_buffer.colptr
+        existing_rowval = existing_buffer.rowval
+        for j ∈ 1:ncol
+            existing_col_start = existing_colptr[j]
+            existing_col_end = existing_colptr[j+1]-1
+            existing_col_rowval = @view existing_rowval[existing_col_start:existing_col_end]
+            n_existing = existing_col_end - existing_col_start + 1
+            if n_existing == 0 || first(existing_col_rowval) > lastrow || last(existing_col_rowval) < firstrow
+                # Definitely no overlapping entries in this column, so skip.
+                push!(colptr, length(rowval) + 1)
+                continue
+            end
+            count = max(searchsortedlast(existing_col_rowval, firstrow) - 1, 1)
+            for (i, i_global) ∈ enumerate(row_range)
+                while count ≤ n_existing && existing_col_rowval[count] < i_global
+                    count += 1
+                end
+                if count > n_existing
+                    break
+                end
+                if existing_col_rowval[count] == i_global
+                    push!(rowval, i)
+                end
+            end
             push!(colptr, length(rowval) + 1)
-            continue
         end
-        count = max(searchsortedlast(existing_col_rowval, firstrow) - 1, 1)
-        for (i, i_global) ∈ enumerate(row_range)
-            while count ≤ n_existing && existing_col_rowval[count] < i_global
-                count += 1
-            end
-            if count > n_existing
-                break
-            end
-            if existing_col_rowval[count] == i_global
-                push!(rowval, i)
-            end
-        end
-        push!(colptr, length(rowval) + 1)
+        nzval = zeros(data_type, length(rowval))
+        buffer = FixedSparseCSC(length(row_range), ncol, colptr, rowval, nzval)
+        return buffer
     end
-    nzval = zeros(data_type, length(rowval))
-    buffer = FixedSparseCSC(length(row_range), ncol, colptr, rowval, nzval)
-    return buffer
 end
 
 # SparseMatrixCSR multiplying SparseMatrixCSC currently (26/5/2026) uses the generic
@@ -1861,416 +1895,427 @@ function update_A_factorization!(sc::MPISchurComplement, A)
 end
 
 function update_Ainv_dot_B!(sc, B)
-    timer = sc.timer
-    A_factorization = sc.A_factorization
-    Ainv_dot_B = sc.Ainv_dot_B
-    local_top_vector_repeats = sc.local_top_vector_repeats
-    local_bottom_vector_repeats = sc.local_bottom_vector_repeats
-    B_column_range_partial = sc.B_column_range_partial
-    B_local_column_repeats_partial = sc.B_local_column_repeats_partial
-    B_local_column_range_partial = sc.B_local_column_range_partial
-    B_global_column_range_partial = sc.B_global_column_range_partial
-    overlap_ranks = sc.overlap_ranks
-    local_top_vector_repeats_partial = sc.local_top_vector_repeats_partial
-    local_top_vector_unique_entries_partial = sc.local_top_vector_unique_entries_partial
-    local_top_vector_overlaps = sc.local_top_vector_overlaps
-    B_overlap_buffers_send = sc.B_overlap_buffers_send
-    B_overlap_buffers_recv = sc.B_overlap_buffers_recv
-    separate_Ainv_B = sc.separate_Ainv_B
-    shared_rank = sc.shared_rank
-    distributed_nproc = sc.distributed_nproc
-    distributed_comm = sc.distributed_comm
-    synchronize_shared = sc.synchronize_shared
+    @inbounds begin
+        timer = sc.timer
+        A_factorization = sc.A_factorization
+        Ainv_dot_B = sc.Ainv_dot_B
+        local_top_vector_repeats = sc.local_top_vector_repeats
+        local_bottom_vector_repeats = sc.local_bottom_vector_repeats
+        B_column_range_partial = sc.B_column_range_partial
+        B_local_column_repeats_partial = sc.B_local_column_repeats_partial
+        B_local_column_range_partial = sc.B_local_column_range_partial
+        B_global_column_range_partial = sc.B_global_column_range_partial
+        overlap_ranks = sc.overlap_ranks
+        local_top_vector_repeats_partial = sc.local_top_vector_repeats_partial
+        local_top_vector_unique_entries_partial = sc.local_top_vector_unique_entries_partial
+        local_top_vector_overlaps = sc.local_top_vector_overlaps
+        B_overlap_buffers_send = sc.B_overlap_buffers_send
+        B_overlap_buffers_recv = sc.B_overlap_buffers_recv
+        separate_Ainv_B = sc.separate_Ainv_B
+        shared_rank = sc.shared_rank
+        distributed_nproc = sc.distributed_nproc
+        distributed_comm = sc.distributed_comm
+        synchronize_shared = sc.synchronize_shared
 
-    @sc_timeit timer "Ainv_dot_B" begin
-        # Use `Ainv_dot_B` as a local-rows/global-columns sized buffer to collect `B` into.
-        # This is slightly inefficient, as there will be chunks that are all-zero that we do
-        # not need to collect, but this way seems the simplest to implement, as we need the
-        # not-locally-owned columns of B in all locally owned rows, to pass to `ldiv!()`
-        # below.
-        # When there are repeated entries in `B`, need to add them up into a single entry, and
-        # then copy this entry into all the repeated positions. This converts the columns of
-        # `B` into 'vectors' (with the same structure as `u`) that can be passed to
-        # `A_factorization` to find `Ainv_dot_B`.
-        if isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB})
-            # When using MPISchurComplementBlockAinvDotB or MPISchurComplementBlockB, any
-            # zeroing of Ainv_dot_B is taken care of within copy_B_submatrix!().
-        elseif isa(Ainv_dot_B, AbstractSparseMatrix)
-            Ainv_dot_B_colptr = Ainv_dot_B.colptr
-            Ainv_dot_B_nzval = Ainv_dot_B.nzval
-            Ainv_dot_B_first_i = Ainv_dot_B_colptr[first(B_column_range_partial)]
-            Ainv_dot_B_last_i = Ainv_dot_B_colptr[last(B_column_range_partial)+1] - 1
-            Ainv_dot_B_nzval[Ainv_dot_B_first_i:Ainv_dot_B_last_i] .= 0.0
-        else
-            Ainv_dot_B[:,B_column_range_partial] .= 0
-        end
-        if length(local_top_vector_repeats) > 0 || length(local_bottom_vector_repeats) > 0
-            # Add up entries that are repeated on this subdomain.
-            for j ∈ 1:size(B, 2), (to, from) ∈ eachcol(local_top_vector_repeats_partial)
-                B[to,j] += B[from,j]
-            end
-            synchronize_shared()
-            for (to, from) ∈ eachcol(B_local_column_repeats_partial)
-                @views B[:,to] .+= B[:,from]
-            end
+        @sc_timeit timer "Ainv_dot_B" begin
+            # Use `Ainv_dot_B` as a local-rows/global-columns sized buffer to collect `B`
+            # into.  This is slightly inefficient, as there will be chunks that are
+            # all-zero that we do not need to collect, but this way seems the simplest to
+            # implement, as we need the not-locally-owned columns of B in all locally
+            # owned rows, to pass to `ldiv!()` below.
+            # When there are repeated entries in `B`, need to add them up into a single
+            # entry, and then copy this entry into all the repeated positions. This
+            # converts the columns of `B` into 'vectors' (with the same structure as `u`)
+            # that can be passed to `A_factorization` to find `Ainv_dot_B`.
             if isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB})
-                # B_local_column_repeats_partial will not necessarily correspond to the
-                # indices of the locally-owned blocks in a MPISchurComplementBlockAinvDotB
-                # or MPISchurComplementBlockB (as they do to entries in
-                # B_local_column_range_partial), so need to synchronize here. Currently
-                # expect that when MPISchurComplementBlockAinvDotB or
-                # MPISchurComplementBlockB are being used, there are no overlaps to
-                # handle, so this block will not be entered - if it is used could consider
-                # trying to adjust index ranges to avoid this synchronization?
+                # When using MPISchurComplementBlockAinvDotB or MPISchurComplementBlockB,
+                # any zeroing of Ainv_dot_B is taken care of within copy_B_submatrix!().
+            elseif isa(Ainv_dot_B, AbstractSparseMatrix)
+                Ainv_dot_B_colptr = Ainv_dot_B.colptr
+                Ainv_dot_B_nzval = Ainv_dot_B.nzval
+                Ainv_dot_B_first_i = Ainv_dot_B_colptr[first(B_column_range_partial)]
+                Ainv_dot_B_last_i = Ainv_dot_B_colptr[last(B_column_range_partial)+1] - 1
+                Ainv_dot_B_nzval[Ainv_dot_B_first_i:Ainv_dot_B_last_i] .= 0.0
+            else
+                Ainv_dot_B[:,B_column_range_partial] .= 0
+            end
+            if length(local_top_vector_repeats) > 0 || length(local_bottom_vector_repeats) > 0
+                # Add up entries that are repeated on this subdomain.
+                for j ∈ 1:size(B, 2), (to, from) ∈ eachcol(local_top_vector_repeats_partial)
+                    B[to,j] += B[from,j]
+                end
                 synchronize_shared()
-            end
-        else
-            synchronize_shared()
-        end
-        if isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB})
-            copy_B_submatrix!(Ainv_dot_B, B)
-        elseif isa(Ainv_dot_B, AbstractSparseMatrix)
-            update_sparse_matrix_select_columns!(Ainv_dot_B, B_global_column_range_partial,
-                                                 B, B_local_column_range_partial)
-            synchronize_shared()
-        else
-            for (j1, j2) ∈ zip(B_global_column_range_partial, B_local_column_range_partial), i ∈ 1:size(Ainv_dot_B, 1)
-                Ainv_dot_B[i,j1] = B[i,j2]
-            end
-            synchronize_shared()
-        end
-
-        # Add up the rows of B that overlap between different subdomains (temporarily stored
-        # in `Ainv_dot_B`).  Note only non-repeated points in the overlaps are communicated,
-        # to reduce the amount of communication.
-        if isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB})
-            # When using MPISchurComplementBlockAinvDotB or MPISchurComplementBlockB, it
-            # is guaranteed that there are no overlaps that need to be handled using
-            # distributed MPI, so can skip the next step.
-        else
-            if length(overlap_ranks) > 0 && shared_rank == 0
-                reqs = MPI.Request[]
-                for (overlap_range, buffer_send, buffer_recv, overlap_rank) ∈
-                        zip(local_top_vector_overlaps, B_overlap_buffers_send,
-                            B_overlap_buffers_recv, overlap_ranks)
-                    for j ∈ 1:size(Ainv_dot_B, 2), (i1, i2) ∈ enumerate(overlap_range)
-                        buffer_send[i1,j] = Ainv_dot_B[i2,j]
-                    end
-                    # Iallreduce seems not to be included in the nice Julia API, so have to use
-                    # lower level call here.
-                    push!(reqs, MPI.Isend(buffer_send, distributed_comm; dest=overlap_rank))
-                    push!(reqs, MPI.Irecv!(buffer_recv, distributed_comm; source=overlap_rank))
+                for (to, from) ∈ eachcol(B_local_column_repeats_partial)
+                    @views B[:,to] .+= B[:,from]
                 end
-                MPI.Waitall(reqs)
-                for (overlap_range, buffer) ∈ zip(local_top_vector_overlaps, B_overlap_buffers_recv)
-                    for j ∈ 1:size(Ainv_dot_B, 2), (i2, i1) ∈ enumerate(overlap_range)
-                        Ainv_dot_B[i1,j] += buffer[i2,j]
-                    end
-                end
-            end
-            synchronize_shared()
-            if length(local_top_vector_repeats) > 0
-                # Now that overlaps have been comunicated, all contributions have been added the
-                # 'to' places, so we can now copy back these periodic entries to the 'from'
-                # places.
-                for j ∈ 1:size(Ainv_dot_B, 2), (to, from) ∈ eachcol(local_top_vector_repeats_partial)
-                    Ainv_dot_B[from,j] = Ainv_dot_B[to,j]
-                end
-                if !separate_Ainv_B
+                if isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB})
+                    # B_local_column_repeats_partial will not necessarily correspond to
+                    # the indices of the locally-owned blocks in a
+                    # MPISchurComplementBlockAinvDotB or MPISchurComplementBlockB (as they
+                    # do to entries in B_local_column_range_partial), so need to
+                    # synchronize here. Currently expect that when
+                    # MPISchurComplementBlockAinvDotB or MPISchurComplementBlockB are
+                    # being used, there are no overlaps to handle, so this block will not
+                    # be entered - if it is used could consider trying to adjust index
+                    # ranges to avoid this synchronization?
                     synchronize_shared()
                 end
-            end
-        end
-
-        # At this point `Ainv_dot_B` contains the dense array of `B`.
-        if separate_Ainv_B
-            if issparse(Ainv_dot_B)
-                update_sparse_matrix_select_rows!(sc.B, Ainv_dot_B,
-                                                  local_top_vector_unique_entries_partial)
             else
-                sc_B = sc.B
-                for j ∈ 1:size(Ainv_dot_B, 2), (i1, i2) ∈ enumerate(local_top_vector_unique_entries_partial)
-                    sc_B[i1,j] = Ainv_dot_B[i2,j]
+                synchronize_shared()
+            end
+            if isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB})
+                copy_B_submatrix!(Ainv_dot_B, B)
+            elseif isa(Ainv_dot_B, AbstractSparseMatrix)
+                update_sparse_matrix_select_columns!(Ainv_dot_B, B_global_column_range_partial,
+                                                     B, B_local_column_range_partial)
+                synchronize_shared()
+            else
+                for (j1, j2) ∈ zip(B_global_column_range_partial, B_local_column_range_partial), i ∈ 1:size(Ainv_dot_B, 1)
+                    Ainv_dot_B[i,j1] = B[i,j2]
+                end
+                synchronize_shared()
+            end
+
+            # Add up the rows of B that overlap between different subdomains (temporarily
+            # stored in `Ainv_dot_B`).  Note only non-repeated points in the overlaps are
+            # communicated, to reduce the amount of communication.
+            if isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB})
+                # When using MPISchurComplementBlockAinvDotB or MPISchurComplementBlockB,
+                # it is guaranteed that there are no overlaps that need to be handled
+                # using distributed MPI, so can skip the next step.
+            else
+                if length(overlap_ranks) > 0 && shared_rank == 0
+                    reqs = MPI.Request[]
+                    for (overlap_range, buffer_send, buffer_recv, overlap_rank) ∈
+                            zip(local_top_vector_overlaps, B_overlap_buffers_send,
+                                B_overlap_buffers_recv, overlap_ranks)
+                        for j ∈ 1:size(Ainv_dot_B, 2), (i1, i2) ∈ enumerate(overlap_range)
+                            buffer_send[i1,j] = Ainv_dot_B[i2,j]
+                        end
+                        # Iallreduce seems not to be included in the nice Julia API, so
+                        # have to use lower level call here.
+                        push!(reqs, MPI.Isend(buffer_send, distributed_comm; dest=overlap_rank))
+                        push!(reqs, MPI.Irecv!(buffer_recv, distributed_comm; source=overlap_rank))
+                    end
+                    MPI.Waitall(reqs)
+                    for (overlap_range, buffer) ∈ zip(local_top_vector_overlaps, B_overlap_buffers_recv)
+                        for j ∈ 1:size(Ainv_dot_B, 2), (i2, i1) ∈ enumerate(overlap_range)
+                            Ainv_dot_B[i1,j] += buffer[i2,j]
+                        end
+                    end
+                end
+                synchronize_shared()
+                if length(local_top_vector_repeats) > 0
+                    # Now that overlaps have been comunicated, all contributions have been
+                    # added the 'to' places, so we can now copy back these periodic
+                    # entries to the 'from' places.
+                    for j ∈ 1:size(Ainv_dot_B, 2), (to, from) ∈ eachcol(local_top_vector_repeats_partial)
+                        Ainv_dot_B[from,j] = Ainv_dot_B[to,j]
+                    end
+                    if !separate_Ainv_B
+                        synchronize_shared()
+                    end
                 end
             end
-            synchronize_shared()
+
+            # At this point `Ainv_dot_B` contains the dense array of `B`.
+            if separate_Ainv_B
+                if issparse(Ainv_dot_B)
+                    update_sparse_matrix_select_rows!(sc.B, Ainv_dot_B,
+                                                      local_top_vector_unique_entries_partial)
+                else
+                    sc_B = sc.B
+                    for j ∈ 1:size(Ainv_dot_B, 2), (i1, i2) ∈ enumerate(local_top_vector_unique_entries_partial)
+                        sc_B[i1,j] = Ainv_dot_B[i2,j]
+                    end
+                end
+                synchronize_shared()
+            end
+            if isa(Ainv_dot_B, MPISchurComplementBlockB)
+                # Don't apply A_factorization. When using a MPISchurComplementBlockB-type
+                # buffer, we only store `B`, not the (potentially dense) `(A\B)`.
+            elseif isa(A_factorization, MPISchurComplementAFactorization) || isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB)
+                ldiv_Bmatrix!(A_factorization, Ainv_dot_B)
+            else
+                ldiv!(A_factorization, Ainv_dot_B)
+            end
         end
-        if isa(Ainv_dot_B, MPISchurComplementBlockB)
-            # Don't apply A_factorization. When using a MPISchurComplementBlockB-type
-            # buffer, we only store `B`, not the (potentially dense) `(A\B)`.
-        elseif isa(A_factorization, MPISchurComplementAFactorization) || isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB)
-            ldiv_Bmatrix!(A_factorization, Ainv_dot_B)
-        else
-            ldiv!(A_factorization, Ainv_dot_B)
-        end
+        return nothing
     end
-    return nothing
 end
 
 function update_C!(sc, C)
-    timer = sc.timer
-    C_local_row_repeats_partial = sc.C_local_row_repeats_partial
-    sc_C = sc.C
+    @inbounds begin
+        timer = sc.timer
+        C_local_row_repeats_partial = sc.C_local_row_repeats_partial
+        sc_C = sc.C
 
-    @sc_timeit timer "C" begin
-        if isa(sc_C, MPISchurComplementBlockC)
-            copy_C_submatrix!(sc_C, C)
-        else
-            # A representation of C is stored where no rows are repeated, so need to add
-            # up all contributions from repeated row indices into a single row (that will
-            # then be included in the stored `sc.C`, i.e. the 'to' rows are included in
-            # `sc.C_local_row_range_partial` while the 'from' rows are not).
-            for j ∈ 1:size(C, 2), (to, from) ∈ eachcol(C_local_row_repeats_partial)
-                C[to,j] += C[from,j]
-            end
-            # When using shared memory, only store the slice of C that this process needs.
-            if issparse(sc_C)
-                update_sparse_matrix!(sc_C, C, sc.C_local_row_range_partial,
-                                      sc.C_row_counter)
+        @sc_timeit timer "C" begin
+            if isa(sc_C, MPISchurComplementBlockC)
+                copy_C_submatrix!(sc_C, C)
             else
-                # Make a copy because C_local_row_range_partial might not be a contiguous
-                # range of indices, but performance will be better if `C` is a
-                # contiguously-allocated array.
-                for j ∈ 1:size(C, 2), (i1, i2) ∈ enumerate(sc.C_local_row_range_partial)
-                    sc_C[i1,j] = C[i2,j]
+                # A representation of C is stored where no rows are repeated, so need to
+                # add up all contributions from repeated row indices into a single row
+                # (that will then be included in the stored `sc.C`, i.e. the 'to' rows are
+                # included in `sc.C_local_row_range_partial` while the 'from' rows are
+                # not).
+                for j ∈ 1:size(C, 2), (to, from) ∈ eachcol(C_local_row_repeats_partial)
+                    C[to,j] += C[from,j]
+                end
+                # When using shared memory, only store the slice of C that this process
+                # needs.
+                if issparse(sc_C)
+                    update_sparse_matrix!(sc_C, C, sc.C_local_row_range_partial,
+                                          sc.C_row_counter)
+                else
+                    # Make a copy because C_local_row_range_partial might not be a
+                    # contiguous range of indices, but performance will be better if `C`
+                    # is a contiguously-allocated array.
+                    for j ∈ 1:size(C, 2), (i1, i2) ∈ enumerate(sc.C_local_row_range_partial)
+                        sc_C[i1,j] = C[i2,j]
+                    end
                 end
             end
         end
+        return nothing
     end
-    return nothing
 end
 
 function update_schur_complement_factorization!(sc, D)
-    timer = sc.timer
-    schur_complement = sc.schur_complement
-    schur_complement_local_range_partial = sc.schur_complement_local_range_partial
-    separate_Ainv_B = sc.separate_Ainv_B
-    Ainv_dot_B = sc.Ainv_dot_B
-    Ainv_dot_B_local = sc.Ainv_dot_B_local
-    local_top_vector_unique_entries_partial = sc.local_top_vector_unique_entries_partial
-    this_C = sc.C
-    C_dot_Ainv_dot_B = sc.C_dot_Ainv_dot_B
-    C_global_row_range_partial = sc.C_global_row_range_partial
-    schur_complement = sc.schur_complement
-    schur_complement_factorization = sc.schur_complement_factorization
-    local_bottom_vector_repeats = sc.local_bottom_vector_repeats
-    local_bottom_vector_repeats_partial = sc.local_bottom_vector_repeats_partial
-    D_local_column_repeats = sc.D_local_column_repeats
-    D_local_column_repeats_partial = sc.D_local_column_repeats_partial
-    D_global_column_range_partial = sc.D_global_column_range_partial
-    D_local_column_range_partial = sc.D_local_column_range_partial
-    unique_bottom_vector_entries = sc.unique_bottom_vector_entries
-    local_bottom_vector_unique_entries = sc.local_bottom_vector_unique_entries
-    distributed_comm = sc.distributed_comm
-    shared_rank = sc.shared_rank
-    distributed_nproc = sc.distributed_nproc
-    distributed_comm = sc.distributed_comm
-    synchronize_shared = sc.synchronize_shared
-    check_lu = sc.check_lu
+    @inbounds begin
+        timer = sc.timer
+        schur_complement = sc.schur_complement
+        schur_complement_local_range_partial = sc.schur_complement_local_range_partial
+        separate_Ainv_B = sc.separate_Ainv_B
+        Ainv_dot_B = sc.Ainv_dot_B
+        Ainv_dot_B_local = sc.Ainv_dot_B_local
+        local_top_vector_unique_entries_partial = sc.local_top_vector_unique_entries_partial
+        this_C = sc.C
+        C_dot_Ainv_dot_B = sc.C_dot_Ainv_dot_B
+        C_global_row_range_partial = sc.C_global_row_range_partial
+        schur_complement = sc.schur_complement
+        schur_complement_factorization = sc.schur_complement_factorization
+        local_bottom_vector_repeats = sc.local_bottom_vector_repeats
+        local_bottom_vector_repeats_partial = sc.local_bottom_vector_repeats_partial
+        D_local_column_repeats = sc.D_local_column_repeats
+        D_local_column_repeats_partial = sc.D_local_column_repeats_partial
+        D_global_column_range_partial = sc.D_global_column_range_partial
+        D_local_column_range_partial = sc.D_local_column_range_partial
+        unique_bottom_vector_entries = sc.unique_bottom_vector_entries
+        local_bottom_vector_unique_entries = sc.local_bottom_vector_unique_entries
+        distributed_comm = sc.distributed_comm
+        shared_rank = sc.shared_rank
+        distributed_nproc = sc.distributed_nproc
+        distributed_comm = sc.distributed_comm
+        synchronize_shared = sc.synchronize_shared
+        check_lu = sc.check_lu
 
-    @sc_timeit timer "schur_complement" begin
-        # Initialise `schur_complement` to zero, because when `this_C` does not include all rows,
-        # the matrix multiplication below would not initialise all elements.
-        if C_dot_Ainv_dot_B !== nothing && isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB}) && isa(this_C, MPISchurComplementBlockC)
-            # Don't need to initialize schur_complement in this case.
-        elseif issparse(schur_complement)
-            schur_colptr = schur_complement.colptr
-            schur_nzval = schur_complement.nzval
-            for j ∈ schur_complement_local_range_partial
-                for flat_i ∈ schur_colptr[j]:schur_colptr[j+1]-1
-                    schur_nzval[j] = 0.0
+        @sc_timeit timer "schur_complement" begin
+            # Initialise `schur_complement` to zero, because when `this_C` does not
+            # include all rows, the matrix multiplication below would not initialise all
+            # elements.
+            if C_dot_Ainv_dot_B !== nothing && isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB}) && isa(this_C, MPISchurComplementBlockC)
+                # Don't need to initialize schur_complement in this case.
+            elseif issparse(schur_complement)
+                schur_colptr = schur_complement.colptr
+                schur_nzval = schur_complement.nzval
+                for j ∈ schur_complement_local_range_partial
+                    for flat_i ∈ schur_colptr[j]:schur_colptr[j+1]-1
+                        schur_nzval[j] = 0.0
+                    end
                 end
-            end
-        else
-            nrows = size(schur_complement, 2)
-            for j ∈ schur_complement_local_range_partial, i ∈ 1:nrows
-                schur_complement[i,j] = 0.0
-            end
-        end
-        synchronize_shared()
-
-        # Read out the local entries of `Ainv_dot_B` here, rather than just after `Ainv_dot_B`
-        # is calculated, in order to avoid adding another `synchronize_shared()` call.
-        if !isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB}) && !separate_Ainv_B
-            if isa(Ainv_dot_B_local, SparseMatrixCSC)
-                # Convert Ainv_dot_B to SparseMatrixCSC in this call to resolve possible
-                # type instability.
-                update_sparse_matrix_select_rows!(Ainv_dot_B_local, Ainv_dot_B,
-                                                  local_top_vector_unique_entries_partial)
             else
-                # Note that we need to transpose Ainv_dot_B_local for the slightly
-                # hacked matrix-vector multiply implementation used in `ldiv!()` to
-                # ensure consistency of results.
-                for i ∈ 1:size(Ainv_dot_B_local, 1), (j1, j2) ∈ enumerate(local_top_vector_unique_entries_partial)
-                    Ainv_dot_B_local[i,j1] = Ainv_dot_B[j2,i]
+                nrows = size(schur_complement, 2)
+                for j ∈ schur_complement_local_range_partial, i ∈ 1:nrows
+                    schur_complement[i,j] = 0.0
                 end
-            end
-        end
-
-        # We store locally all columns in `Ainv_dot_B` (only local rows) and all rows of `C`
-        # (only local columns). Therefore we can take the matrix product `Ainv_dot_B*C` with
-        # the local chunks, then do a sum-reduce to get the final result. The
-        # `schur_complement` buffer is full size on every rank.
-        if isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB}) && isa(this_C, MPISchurComplementBlockC)
-            if C_dot_Ainv_dot_B === nothing
-                output_buffer = schur_complement
-            else
-                output_buffer = C_dot_Ainv_dot_B
-            end
-            if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB)
-                mul_C_Ainv_dot_B!(output_buffer, this_C, Ainv_dot_B)
-            elseif isa(Ainv_dot_B, MPISchurComplementBlockB)
-                mul_C_Ainv_dot_B!(output_buffer, this_C, sc.A_factorization, Ainv_dot_B)
-            else
-                error("Unexpected type '$(typeof(Ainv_dot_B))' for Ainv_dot_B.")
             end
             synchronize_shared()
-        elseif isa(this_C, SparseMatrixCSR) && isa(Ainv_dot_B, AbstractSparseMatrixCSC)
-            csr_mul!(C_dot_Ainv_dot_B, this_C, Ainv_dot_B, -1.0, 0.0)
-        else
-            mul!(C_dot_Ainv_dot_B, this_C, Ainv_dot_B, -1.0, 0.0)
-        end
-        if isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB}) && isa(this_C, MPISchurComplementBlockC)
-            # Contributions from each process have now been calculated, and are available
-            # in C_dot_Ainv_dot_B.storage. Need to add up all contributions into
-            # schur_complement.
-            # B_column_range_partial is abused to store the index range that we need for
-            # this update, as it is not used otherwise.
-            if sc.C_dot_Ainv_dot_B !== nothing
-                if isa(schur_complement, FixedSparseCSC)
-                    flat_range = sc.B_column_range_partial
-                    if !isempty(flat_range)
-                        @views sum!(schur_complement.nzval[flat_range]',
-                                    sc.C_dot_Ainv_dot_B.storage[:,flat_range])
-                    end
+
+            # Read out the local entries of `Ainv_dot_B` here, rather than just after
+            # `Ainv_dot_B` is calculated, in order to avoid adding another
+            # `synchronize_shared()` call.
+            if !isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB}) && !separate_Ainv_B
+                if isa(Ainv_dot_B_local, SparseMatrixCSC)
+                    # Convert Ainv_dot_B to SparseMatrixCSC in this call to resolve
+                    # possible type instability.
+                    update_sparse_matrix_select_rows!(Ainv_dot_B_local, Ainv_dot_B,
+                                                      local_top_vector_unique_entries_partial)
                 else
-                    column_range = sc.B_column_range_partial
-                    if !isempty(column_range)
-                        sc_output = @view schur_complement[:,column_range]
-                        @views sum!(reshape(sc_output, 1, size(sc_output)...),
-                                    sc.C_dot_Ainv_dot_B.storage[:,:,column_range])
+                    # Note that we need to transpose Ainv_dot_B_local for the slightly
+                    # hacked matrix-vector multiply implementation used in `ldiv!()` to
+                    # ensure consistency of results.
+                    for i ∈ 1:size(Ainv_dot_B_local, 1), (j1, j2) ∈ enumerate(local_top_vector_unique_entries_partial)
+                        Ainv_dot_B_local[i,j1] = Ainv_dot_B[j2,i]
                     end
                 end
             end
-        elseif issparse(C_dot_Ainv_dot_B)
-            C_dot_Ainv_dot_B_colptr = C_dot_Ainv_dot_B.colptr
-            C_dot_Ainv_dot_B_rowval = C_dot_Ainv_dot_B.rowval
-            C_dot_Ainv_dot_B_nzval = C_dot_Ainv_dot_B.nzval
-            for j ∈ 1:size(schur_complement, 2)
-                for flat_i ∈ C_dot_Ainv_dot_B_colptr[j]:C_dot_Ainv_dot_B_colptr[j+1]-1
-                    i = C_dot_Ainv_dot_B_rowval[flat_i]
-                    global_i = C_global_row_range_partial[i]
-                    schur_complement[global_i,j] = C_dot_Ainv_dot_B_nzval[flat_i]
+
+            # We store locally all columns in `Ainv_dot_B` (only local rows) and all rows
+            # of `C` (only local columns). Therefore we can take the matrix product
+            # `Ainv_dot_B*C` with the local chunks, then do a sum-reduce to get the final
+            # result. The `schur_complement` buffer is full size on every rank.
+            if isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB}) && isa(this_C, MPISchurComplementBlockC)
+                if C_dot_Ainv_dot_B === nothing
+                    output_buffer = schur_complement
+                else
+                    output_buffer = C_dot_Ainv_dot_B
                 end
+                if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB)
+                    mul_C_Ainv_dot_B!(output_buffer, this_C, Ainv_dot_B)
+                elseif isa(Ainv_dot_B, MPISchurComplementBlockB)
+                    mul_C_Ainv_dot_B!(output_buffer, this_C, sc.A_factorization, Ainv_dot_B)
+                else
+                    error("Unexpected type '$(typeof(Ainv_dot_B))' for Ainv_dot_B.")
+                end
+                synchronize_shared()
+            elseif isa(this_C, SparseMatrixCSR) && isa(Ainv_dot_B, AbstractSparseMatrixCSC)
+                csr_mul!(C_dot_Ainv_dot_B, this_C, Ainv_dot_B, -1.0, 0.0)
+            else
+                mul!(C_dot_Ainv_dot_B, this_C, Ainv_dot_B, -1.0, 0.0)
             end
-        else
-            for j ∈ 1:size(schur_complement, 2), (i2, i1) ∈ enumerate(C_global_row_range_partial)
-                schur_complement[i1,j] = C_dot_Ainv_dot_B[i2,j]
-            end
-        end
-        synchronize_shared()
-        # Only get the local rows for D, so just add these to the local rows of
-        # `schur_complement`.
-        # As `schur_Complement` does not have any repeated entries, need to add up any locally
-        # repeated entries of D (columns then rows) so that we can then select the 'assembled'
-        # version of `D` to add to `schur_complement`. Any entries that are repeated on
-        # different subdomains will be taken care of when the local contributions to
-        # `schur_complement` are added together in the `MPI.Reduce!()` below, as there may be
-        # non-zero contributions to some entries from multiple subdomains.
-        if length(local_bottom_vector_repeats) > 0
-            for j ∈ 1:size(D, 2), (to, from) ∈ eachcol(local_bottom_vector_repeats_partial)
-                D[to,j] += D[from,j]
+            if isa(Ainv_dot_B, Union{MPISchurComplementBlockAinvDotB,MPISchurComplementBlockB}) && isa(this_C, MPISchurComplementBlockC)
+                # Contributions from each process have now been calculated, and are available
+                # in C_dot_Ainv_dot_B.storage. Need to add up all contributions into
+                # schur_complement.
+                # B_column_range_partial is abused to store the index range that we need for
+                # this update, as it is not used otherwise.
+                if sc.C_dot_Ainv_dot_B !== nothing
+                    if isa(schur_complement, FixedSparseCSC)
+                        flat_range = sc.B_column_range_partial
+                        if !isempty(flat_range)
+                            @views sum!(schur_complement.nzval[flat_range]',
+                                        sc.C_dot_Ainv_dot_B.storage[:,flat_range])
+                        end
+                    else
+                        column_range = sc.B_column_range_partial
+                        if !isempty(column_range)
+                            sc_output = @view schur_complement[:,column_range]
+                            @views sum!(reshape(sc_output, 1, size(sc_output)...),
+                                        sc.C_dot_Ainv_dot_B.storage[:,:,column_range])
+                        end
+                    end
+                end
+            elseif issparse(C_dot_Ainv_dot_B)
+                C_dot_Ainv_dot_B_colptr = C_dot_Ainv_dot_B.colptr
+                C_dot_Ainv_dot_B_rowval = C_dot_Ainv_dot_B.rowval
+                C_dot_Ainv_dot_B_nzval = C_dot_Ainv_dot_B.nzval
+                for j ∈ 1:size(schur_complement, 2)
+                    for flat_i ∈ C_dot_Ainv_dot_B_colptr[j]:C_dot_Ainv_dot_B_colptr[j+1]-1
+                        i = C_dot_Ainv_dot_B_rowval[flat_i]
+                        global_i = C_global_row_range_partial[i]
+                        schur_complement[global_i,j] = C_dot_Ainv_dot_B_nzval[flat_i]
+                    end
+                end
+            else
+                for j ∈ 1:size(schur_complement, 2), (i2, i1) ∈ enumerate(C_global_row_range_partial)
+                    schur_complement[i1,j] = C_dot_Ainv_dot_B[i2,j]
+                end
             end
             synchronize_shared()
-        end
-        if length(D_local_column_repeats) > 0
-            for (to, from) ∈ eachcol(D_local_column_repeats_partial)
-                @views D[:,to] .+= D[:,from]
+            # Only get the local rows for D, so just add these to the local rows of
+            # `schur_complement`.  As `schur_Complement` does not have any repeated
+            # entries, need to add up any locally repeated entries of D (columns then
+            # rows) so that we can then select the 'assembled' version of `D` to add to
+            # `schur_complement`. Any entries that are repeated on different subdomains
+            # will be taken care of when the local contributions to `schur_complement` are
+            # added together in the `MPI.Reduce!()` below, as there may be non-zero
+            # contributions to some entries from multiple subdomains.
+            if length(local_bottom_vector_repeats) > 0
+                for j ∈ 1:size(D, 2), (to, from) ∈ eachcol(local_bottom_vector_repeats_partial)
+                    D[to,j] += D[from,j]
+                end
+                synchronize_shared()
             end
-        end
-        if issparse(D) && issparse(schur_complement)
-            D_full = parent(D)
-            full_rowinds, full_colinds = D.indices
-            D_colptr = D_full.colptr
-            D_rowval = D_full.rowval
-            D_nzval = D_full.nzval
-            sc_colptr = schur_complement.colptr
-            sc_rowval = schur_complement.rowval
-            sc_nzval = schur_complement.nzval
-            nrow = length(unique_bottom_vector_entries)
-            for (j1, j2) ∈ zip(D_global_column_range_partial, D_local_column_range_partial)
-                full_j2 = full_colinds[j2]
-                first_i = sc_colptr[j1]
-                last_i = sc_colptr[j1+1] - 1
-                if last_i < first_i
-                    continue
+            if length(D_local_column_repeats) > 0
+                for (to, from) ∈ eachcol(D_local_column_repeats_partial)
+                    @views D[:,to] .+= D[:,from]
                 end
-                # Assume D and schur_complement have same pattern of non-zeros, so no need
-                # to use searchsortedlast() to find the first flat_i that will be within
-                # the non-zeros of D.
-                flat_i = first_i
-
-                full_first_i = D_colptr[full_j2]
-                full_last_i = D_colptr[full_j2+1]-1
-                if full_last_i < full_first_i
-                    continue
-                end
-
-                first_row = sc_rowval[first_i]
-                row_counter = max(searchsortedlast(unique_bottom_vector_entries, first_row) - 1, 1)
-                for full_flat_i ∈ full_first_i:full_last_i
-                    full_row = D_rowval[full_flat_i]
-                    while row_counter ≤ nrow && full_rowinds[local_bottom_vector_unique_entries[row_counter]] < full_row
-                        row_counter += 1
-                    end
-                    if row_counter > nrow
-                        break
-                    end
-                    sc_row = unique_bottom_vector_entries[row_counter]
-                    while flat_i ≤ last_i && sc_rowval[flat_i] < sc_row
-                        flat_i += 1
-                    end
-                    if flat_i > last_i
+            end
+            if issparse(D) && issparse(schur_complement)
+                D_full = parent(D)
+                full_rowinds, full_colinds = D.indices
+                D_colptr = D_full.colptr
+                D_rowval = D_full.rowval
+                D_nzval = D_full.nzval
+                sc_colptr = schur_complement.colptr
+                sc_rowval = schur_complement.rowval
+                sc_nzval = schur_complement.nzval
+                nrow = length(unique_bottom_vector_entries)
+                for (j1, j2) ∈ zip(D_global_column_range_partial, D_local_column_range_partial)
+                    full_j2 = full_colinds[j2]
+                    first_i = sc_colptr[j1]
+                    last_i = sc_colptr[j1+1] - 1
+                    if last_i < first_i
                         continue
                     end
-                    if full_rowinds[sc_rowval[flat_i]] == full_row
-                        sc_nzval[flat_i] += D_nzval[full_flat_i]
+                    # Assume D and schur_complement have same pattern of non-zeros, so no
+                    # need to use searchsortedlast() to find the first flat_i that will be
+                    # within the non-zeros of D.
+                    flat_i = first_i
+
+                    full_first_i = D_colptr[full_j2]
+                    full_last_i = D_colptr[full_j2+1]-1
+                    if full_last_i < full_first_i
+                        continue
+                    end
+
+                    first_row = sc_rowval[first_i]
+                    row_counter = max(searchsortedlast(unique_bottom_vector_entries, first_row) - 1, 1)
+                    for full_flat_i ∈ full_first_i:full_last_i
+                        full_row = D_rowval[full_flat_i]
+                        while row_counter ≤ nrow && full_rowinds[local_bottom_vector_unique_entries[row_counter]] < full_row
+                            row_counter += 1
+                        end
+                        if row_counter > nrow
+                            break
+                        end
+                        sc_row = unique_bottom_vector_entries[row_counter]
+                        while flat_i ≤ last_i && sc_rowval[flat_i] < sc_row
+                            flat_i += 1
+                        end
+                        if flat_i > last_i
+                            continue
+                        end
+                        if full_rowinds[sc_rowval[flat_i]] == full_row
+                            sc_nzval[flat_i] += D_nzval[full_flat_i]
+                        end
                     end
                 end
+            else
+                for (j1, j2) ∈ zip(D_global_column_range_partial, D_local_column_range_partial), (i1, i2) ∈ zip(unique_bottom_vector_entries, local_bottom_vector_unique_entries)
+                    schur_complement[i1,j1] += D[i2,j2]
+                end
             end
-        else
-            for (j1, j2) ∈ zip(D_global_column_range_partial, D_local_column_range_partial), (i1, i2) ∈ zip(unique_bottom_vector_entries, local_bottom_vector_unique_entries)
-                schur_complement[i1,j1] += D[i2,j2]
-            end
-        end
-        synchronize_shared()
-        if shared_rank == 0 && distributed_nproc > 1
-            MPI.Reduce!(schur_complement, +, distributed_comm; root=0)
-        end
-
-        if isa(schur_complement_factorization, LU)
-            # `schur_complement` has been gathered/assembled onto the global rank-0
-            # process, and is now LU-factorized in serial.
-            # Unless the original matrices were all block-diagonal in some consistent
-            # way (in which case the solve could probably be done more efficiently by
-            # splitting the full matrix into the disconnected pieces),
-            # `schur_complement` will generally be a dense matrix, so not worth having
-            # an option for a sparse LU factorization here. Possibly this LU
-            # factorization (and the corresponding `ldiv!()` using
-            # `schur_complement_factorization`) could be parallelised with shared
-            # memory and/or distributed MPI, but we expect this step not to be a
-            # bottleneck, so it is done in serial (at least for now).
-            factors = schur_complement_factorization.factors
-            factors .= schur_complement
-            ipiv = schur_complement_factorization.ipiv
-            LAPACK.getrf!(factors, ipiv; check=check_lu)
-        elseif !isa(schur_complement_factorization, Nothing)
             synchronize_shared()
-            lu!(schur_complement_factorization, schur_complement)
-        end
-    end
+            if shared_rank == 0 && distributed_nproc > 1
+                MPI.Reduce!(schur_complement, +, distributed_comm; root=0)
+            end
 
-    return nothing
+            if isa(schur_complement_factorization, LU)
+                # `schur_complement` has been gathered/assembled onto the global rank-0
+                # process, and is now LU-factorized in serial.
+                # Unless the original matrices were all block-diagonal in some consistent
+                # way (in which case the solve could probably be done more efficiently by
+                # splitting the full matrix into the disconnected pieces),
+                # `schur_complement` will generally be a dense matrix, so not worth having
+                # an option for a sparse LU factorization here. Possibly this LU
+                # factorization (and the corresponding `ldiv!()` using
+                # `schur_complement_factorization`) could be parallelised with shared
+                # memory and/or distributed MPI, but we expect this step not to be a
+                # bottleneck, so it is done in serial (at least for now).
+                factors = schur_complement_factorization.factors
+                factors .= schur_complement
+                ipiv = schur_complement_factorization.ipiv
+                LAPACK.getrf!(factors, ipiv; check=check_lu)
+            elseif !isa(schur_complement_factorization, Nothing)
+                synchronize_shared()
+                lu!(schur_complement_factorization, schur_complement)
+            end
+        end
+
+        return nothing
+    end
 end
 
 """
@@ -2369,185 +2414,190 @@ identical copies would also work).
 """
 function ldiv!(x::AbstractVector, y::AbstractVector, sc::MPISchurComplement,
                u::AbstractVector, v::AbstractVector)
-    @boundscheck size(sc.top_vec_buffer) == size(u) || error(BoundsError, " Size of u does not match size of top_vec_buffer")
-    @boundscheck size(sc.top_vec_buffer) == size(x) || error(BoundsError, " Size of x does not match size of top_vec_buffer")
-    @boundscheck (length(sc.owned_bottom_vector_entries),) == size(v) || error(BoundsError, " Size of v does not match size of bottom_vector_buffer")
-    @boundscheck (length(sc.owned_bottom_vector_entries),) == size(y) || error(BoundsError, " Size of y does not match size of bottom_vector_buffer")
+    @inbounds begin
+        @boundscheck size(sc.top_vec_buffer) == size(u) || error(BoundsError, " Size of u does not match size of top_vec_buffer")
+        @boundscheck size(sc.top_vec_buffer) == size(x) || error(BoundsError, " Size of x does not match size of top_vec_buffer")
+        @boundscheck (length(sc.owned_bottom_vector_entries),) == size(v) || error(BoundsError, " Size of v does not match size of bottom_vector_buffer")
+        @boundscheck (length(sc.owned_bottom_vector_entries),) == size(y) || error(BoundsError, " Size of y does not match size of bottom_vector_buffer")
 
-    timer = sc.timer
-    @sc_timeit timer "ldiv!" begin
-        distributed_comm = sc.distributed_comm
-        distributed_rank = sc.distributed_rank
-        distributed_nproc = sc.distributed_nproc
-        parallel_schur = sc.parallel_schur
-        A_factorization = sc.A_factorization
-        Ainv_dot_B = sc.Ainv_dot_B
-        Ainv_dot_B_local = sc.Ainv_dot_B_local
-        schur_complement_factorization = sc.schur_complement_factorization
-        Ainv_dot_u = sc.Ainv_dot_u
-        C_dot_Ainv_dot_u = sc.C_dot_Ainv_dot_u
-        Ainv_dot_B_dot_y = sc.Ainv_dot_B_dot_y
-        top_vec_buffer = sc.top_vec_buffer
-        local_top_vector_range_partial = sc.local_top_vector_range_partial
-        local_top_vector_unique_entries_partial = sc.local_top_vector_unique_entries_partial
-        local_top_vector_repeats = sc.local_top_vector_repeats
-        local_top_vector_repeats_partial = sc.local_top_vector_repeats_partial
-        bottom_vec_buffer = sc.bottom_vec_buffer
-        global_bottom_vector_range_partial = sc.global_bottom_vector_range_partial
-        global_bottom_vector_entries_no_overlap_partial = sc.global_bottom_vector_entries_no_overlap_partial
-        local_bottom_vector_range_partial = sc.local_bottom_vector_range_partial
-        local_bottom_vector_entries_no_overlap_partial = sc.local_bottom_vector_entries_no_overlap_partial
-        schur_complement_local_range_partial = sc.schur_complement_local_range_partial
-        shared_rank = sc.shared_rank
-        distributed_nproc = sc.distributed_nproc
-        synchronize_shared = sc.synchronize_shared
+        timer = sc.timer
+        @sc_timeit timer "ldiv!" begin
+            distributed_comm = sc.distributed_comm
+            distributed_rank = sc.distributed_rank
+            distributed_nproc = sc.distributed_nproc
+            parallel_schur = sc.parallel_schur
+            A_factorization = sc.A_factorization
+            Ainv_dot_B = sc.Ainv_dot_B
+            Ainv_dot_B_local = sc.Ainv_dot_B_local
+            schur_complement_factorization = sc.schur_complement_factorization
+            Ainv_dot_u = sc.Ainv_dot_u
+            C_dot_Ainv_dot_u = sc.C_dot_Ainv_dot_u
+            Ainv_dot_B_dot_y = sc.Ainv_dot_B_dot_y
+            top_vec_buffer = sc.top_vec_buffer
+            local_top_vector_range_partial = sc.local_top_vector_range_partial
+            local_top_vector_unique_entries_partial = sc.local_top_vector_unique_entries_partial
+            local_top_vector_repeats = sc.local_top_vector_repeats
+            local_top_vector_repeats_partial = sc.local_top_vector_repeats_partial
+            bottom_vec_buffer = sc.bottom_vec_buffer
+            global_bottom_vector_range_partial = sc.global_bottom_vector_range_partial
+            global_bottom_vector_entries_no_overlap_partial = sc.global_bottom_vector_entries_no_overlap_partial
+            local_bottom_vector_range_partial = sc.local_bottom_vector_range_partial
+            local_bottom_vector_entries_no_overlap_partial = sc.local_bottom_vector_entries_no_overlap_partial
+            schur_complement_local_range_partial = sc.schur_complement_local_range_partial
+            shared_rank = sc.shared_rank
+            distributed_nproc = sc.distributed_nproc
+            synchronize_shared = sc.synchronize_shared
 
-        @sc_timeit timer "Ainv.u" begin
-            ldiv!(Ainv_dot_u, A_factorization, u)
-        end
-
-        @sc_timeit timer "v-C.Ainv.u" begin
-            # Initialise to zero, because when C does not include all rows, the matrix
-            # multiplication below would not initialise all elements.
-            bottom_vec_buffer[schur_complement_local_range_partial] .= 0.0
-            synchronize_shared()
-            if isa(sc.C, MPISchurComplementBlockC)
-                mul_C_dot_Ainv_dot_u!(bottom_vec_buffer, sc.C, Ainv_dot_u)
-            else
-                # Need all rows of C, but only the local columns - this is all that is
-                # stored in sc.C.
-                mul!(C_dot_Ainv_dot_u, sc.C, Ainv_dot_u, -1.0, 0.0)
-                for (i2, i1) ∈ enumerate(sc.C_global_row_range_partial)
-                    bottom_vec_buffer[i1] = C_dot_Ainv_dot_u[i2]
-                end
-            end
-            synchronize_shared()
-
-            # Only have the local entries of v, so add those to the local entries in
-            # bottom_vec_buffer before reducing.
-            # Need to avoid double counting of any overlapping entries in `v`.
-            for (i1, i2) ∈ zip(global_bottom_vector_entries_no_overlap_partial, local_bottom_vector_entries_no_overlap_partial)
-                bottom_vec_buffer[i1] += v[i2]
-            end
-            synchronize_shared()
-        end
-
-        @sc_timeit timer "global_y" begin
-            # `global_y` is solved in serial on the global rank-0 process, and then communicated
-            # back to all other processes.
-            global_y = sc.global_y
-            if sc.shared_rank == 0 && distributed_nproc > 1
-                MPI.Reduce!(bottom_vec_buffer, +, distributed_comm; root=0)
+            @sc_timeit timer "Ainv.u" begin
+                ldiv!(Ainv_dot_u, A_factorization, u)
             end
 
-            if parallel_schur
-                if distributed_nproc > 1
-                    synchronize_shared()
-                end
-                ldiv!(global_y, schur_complement_factorization, bottom_vec_buffer)
-                if distributed_nproc > 1
-                    synchronize_shared()
-                end
-            else
-                if schur_complement_factorization !== nothing
-                    ldiv!(global_y, schur_complement_factorization, bottom_vec_buffer)
-                end
-            end
-
-            if sc.shared_rank == 0 && distributed_nproc > 1
-                MPI.Bcast!(global_y, distributed_comm; root=0)
-            end
-            synchronize_shared()
-        end
-
-        @sc_timeit timer "Ainv.u-Ainv.B.y" begin
-            # Need all columns of Ainv_dot_B_local, but only the local rows.
-            if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB)
-                Ainv_dot_B_dot_y!(top_vec_buffer, Ainv_dot_B, global_y)
-            elseif isa(Ainv_dot_B, MPISchurComplementBlockB)
-                Ainv_dot_B_dot_y!(top_vec_buffer, A_factorization, Ainv_dot_B, global_y)
-            elseif sc.separate_Ainv_B
-                # B_local is a sparse matrix, so this might sometimes be numerically cheaper than
-                # multiplying by a dense, precomputed Ainv_dot_B_local`.
-                mul!(Ainv_dot_B_dot_y, sc.B, global_y)
-                top_vec_buffer[local_top_vector_unique_entries_partial] .= Ainv_dot_B_dot_y
-
-                # Fill in any repeated entries in `top_vec_buffer`. 'to' and 'from' are kinda
-                # back-to-front here because most of the time `vector_repeats` (and similar) are
-                # used to gather the repeats from the 'from' entries into the 'to' entries, but
-                # here we scatter them back in the other direction.
-                if length(local_top_vector_repeats) > 0
-                    for (to, from) ∈ eachcol(local_top_vector_repeats_partial)
-                        top_vec_buffer[from] = top_vec_buffer[to]
+            @sc_timeit timer "v-C.Ainv.u" begin
+                # Initialise to zero, because when C does not include all rows, the matrix
+                # multiplication below would not initialise all elements.
+                bottom_vec_buffer[schur_complement_local_range_partial] .= 0.0
+                synchronize_shared()
+                if isa(sc.C, MPISchurComplementBlockC)
+                    mul_C_dot_Ainv_dot_u!(bottom_vec_buffer, sc.C, Ainv_dot_u)
+                else
+                    # Need all rows of C, but only the local columns - this is all that is
+                    # stored in sc.C.
+                    mul!(C_dot_Ainv_dot_u, sc.C, Ainv_dot_u, -1.0, 0.0)
+                    for (i2, i1) ∈ enumerate(sc.C_global_row_range_partial)
+                        bottom_vec_buffer[i1] = C_dot_Ainv_dot_u[i2]
                     end
                 end
-
                 synchronize_shared()
 
-                ldiv!(A_factorization, top_vec_buffer)
-            else
-                if isa(Ainv_dot_B_local, SparseMatrixCSC)
-                    local_top_vec_buffer = sc.local_top_vec_buffer
-                    @views mul!(local_top_vec_buffer, Ainv_dot_B_local, global_y)
-                    for (i2, i1) ∈ enumerate(local_top_vector_unique_entries_partial)
-                        top_vec_buffer[i1] = local_top_vec_buffer[i2]
+                # Only have the local entries of v, so add those to the local entries in
+                # bottom_vec_buffer before reducing.
+                # Need to avoid double counting of any overlapping entries in `v`.
+                for (i1, i2) ∈ zip(global_bottom_vector_entries_no_overlap_partial, local_bottom_vector_entries_no_overlap_partial)
+                    bottom_vec_buffer[i1] += v[i2]
+                end
+                synchronize_shared()
+            end
+
+            @sc_timeit timer "global_y" begin
+                # `global_y` is solved in serial on the global rank-0 process, and then
+                # communicated back to all other processes.
+                global_y = sc.global_y
+                if sc.shared_rank == 0 && distributed_nproc > 1
+                    MPI.Reduce!(bottom_vec_buffer, +, distributed_comm; root=0)
+                end
+
+                if parallel_schur
+                    if distributed_nproc > 1
+                        synchronize_shared()
+                    end
+                    ldiv!(global_y, schur_complement_factorization, bottom_vec_buffer)
+                    if distributed_nproc > 1
+                        synchronize_shared()
                     end
                 else
-                    # This commented-out implementation should probably be the most
-                    # performant, but may result in inconsistent floating-point errors in
-                    # results that should be identical (i.e. identical rows and RHS, but
-                    # the rows are in a different place in the matrix). This would mean
-                    # that downstream code might have to communicate to ensure exact
-                    # consistency of the results.
-                    #mul!(Ainv_dot_B_dot_y, Ainv_dot_B_local, global_y)
-                    #for (i2, i1) ∈ enumerate(local_top_vector_unique_entries_partial)
-                    #    top_vec_buffer[i1] = Ainv_dot_B_dot_y
-                    #end
-                    # The following implementation might be slightly less performant
-                    # (although on a quick check in serial the difference is negligible -
-                    # note that we have transposed Ainv_dot_B_local for this version for
-                    # efficiency, so that the slice Ainv_dot_B_local[:,i] that we need is
-                    # contiguous in memory), but should produce exactly consistent results
-                    # for identical row/RHS inputs. The results then do not need to be
-                    # communicated, which should more than compensate for any loss in
-                    # performance of this step.
-                    for (count, i) ∈ enumerate(local_top_vector_unique_entries_partial)
-                        top_vec_buffer[i] = @views dot(Ainv_dot_B_local[:,count], global_y)
+                    if schur_complement_factorization !== nothing
+                        ldiv!(global_y, schur_complement_factorization, bottom_vec_buffer)
                     end
                 end
 
-                # Fill in any repeated entries in `top_vec_buffer`. 'to' and 'from' are kinda
-                # back-to-front here because most of the time `vector_repeats` (and similar) are
-                # used to gather the repeats from the 'from' entries into the 'to' entries, but
-                # here we scatter them back in the other direction.
-                if length(local_top_vector_repeats) > 0
-                    for (to, from) ∈ eachcol(local_top_vector_repeats_partial)
-                        top_vec_buffer[from] = top_vec_buffer[to]
-                    end
+                if sc.shared_rank == 0 && distributed_nproc > 1
+                    MPI.Bcast!(global_y, distributed_comm; root=0)
                 end
-            end
-            # Could possibly remove this synchronization when using
-            # MPISchurComplementBlockAinvDotB or MPISchurComplementBlockB for Ainv_dot_B,
-            # if `local_top_vector_range_partial` was compatible with the parallelisation
-            # used in Ainv_dot_B_dot_y!(top_vec_buffer, Ainv_dot_B, global_y)? On the
-            # other hand, local_top_vector_range_partial is a UnitRange, while the
-            # parallelisation in Ainv_dot_B_dot_y!() will usually imply some more
-            # complicated indexing by a Vector{Int64}, so it is not clear that doing this
-            # operation with that parallelisation would be more efficient, even though it
-            # would remove a synchronization.
-            synchronize_shared()
-            for i ∈ local_top_vector_range_partial
-                x[i] = Ainv_dot_u[i] - top_vec_buffer[i]
+                synchronize_shared()
             end
 
-            for (i1, i2) ∈ zip(local_bottom_vector_range_partial, global_bottom_vector_range_partial)
-                y[i1] = global_y[i2]
+            @sc_timeit timer "Ainv.u-Ainv.B.y" begin
+                # Need all columns of Ainv_dot_B_local, but only the local rows.
+                if isa(Ainv_dot_B, MPISchurComplementBlockAinvDotB)
+                    Ainv_dot_B_dot_y!(top_vec_buffer, Ainv_dot_B, global_y)
+                elseif isa(Ainv_dot_B, MPISchurComplementBlockB)
+                    Ainv_dot_B_dot_y!(top_vec_buffer, A_factorization, Ainv_dot_B, global_y)
+                elseif sc.separate_Ainv_B
+                    # B_local is a sparse matrix, so this might sometimes be numerically
+                    # cheaper than multiplying by a dense, precomputed Ainv_dot_B_local`.
+                    mul!(Ainv_dot_B_dot_y, sc.B, global_y)
+                    top_vec_buffer[local_top_vector_unique_entries_partial] .= Ainv_dot_B_dot_y
+
+                    # Fill in any repeated entries in `top_vec_buffer`. 'to' and 'from'
+                    # are kinda back-to-front here because most of the time
+                    # `vector_repeats` (and similar) are used to gather the repeats from
+                    # the 'from' entries into the 'to' entries, but here we scatter them
+                    # back in the other direction.
+                    if length(local_top_vector_repeats) > 0
+                        for (to, from) ∈ eachcol(local_top_vector_repeats_partial)
+                            top_vec_buffer[from] = top_vec_buffer[to]
+                        end
+                    end
+
+                    synchronize_shared()
+
+                    ldiv!(A_factorization, top_vec_buffer)
+                else
+                    if isa(Ainv_dot_B_local, SparseMatrixCSC)
+                        local_top_vec_buffer = sc.local_top_vec_buffer
+                        @views mul!(local_top_vec_buffer, Ainv_dot_B_local, global_y)
+                        for (i2, i1) ∈ enumerate(local_top_vector_unique_entries_partial)
+                            top_vec_buffer[i1] = local_top_vec_buffer[i2]
+                        end
+                    else
+                        # This commented-out implementation should probably be the most
+                        # performant, but may result in inconsistent floating-point errors
+                        # in results that should be identical (i.e. identical rows and
+                        # RHS, but the rows are in a different place in the matrix). This
+                        # would mean that downstream code might have to communicate to
+                        # ensure exact consistency of the results.
+                        #mul!(Ainv_dot_B_dot_y, Ainv_dot_B_local, global_y)
+                        #for (i2, i1) ∈ enumerate(local_top_vector_unique_entries_partial)
+                        #    top_vec_buffer[i1] = Ainv_dot_B_dot_y
+                        #end
+                        # The following implementation might be slightly less performant
+                        # (although on a quick check in serial the difference is
+                        # negligible - note that we have transposed Ainv_dot_B_local for
+                        # this version for efficiency, so that the slice
+                        # Ainv_dot_B_local[:,i] that we need is contiguous in memory), but
+                        # should produce exactly consistent results for identical row/RHS
+                        # inputs. The results then do not need to be communicated, which
+                        # should more than compensate for any loss in performance of this
+                        # step.
+                        for (count, i) ∈ enumerate(local_top_vector_unique_entries_partial)
+                            top_vec_buffer[i] = @views dot(Ainv_dot_B_local[:,count], global_y)
+                        end
+                    end
+
+                    # Fill in any repeated entries in `top_vec_buffer`. 'to' and 'from'
+                    # are kinda back-to-front here because most of the time
+                    # `vector_repeats` (and similar) are used to gather the repeats from
+                    # the 'from' entries into the 'to' entries, but here we scatter them
+                    # back in the other direction.
+                    if length(local_top_vector_repeats) > 0
+                        for (to, from) ∈ eachcol(local_top_vector_repeats_partial)
+                            top_vec_buffer[from] = top_vec_buffer[to]
+                        end
+                    end
+                end
+                # Could possibly remove this synchronization when using
+                # MPISchurComplementBlockAinvDotB or MPISchurComplementBlockB for
+                # Ainv_dot_B, if `local_top_vector_range_partial` was compatible with the
+                # parallelisation used in Ainv_dot_B_dot_y!(top_vec_buffer, Ainv_dot_B,
+                # global_y)? On the other hand, local_top_vector_range_partial is a
+                # UnitRange, while the parallelisation in Ainv_dot_B_dot_y!() will usually
+                # imply some more complicated indexing by a Vector{Int64}, so it is not
+                # clear that doing this operation with that parallelisation would be more
+                # efficient, even though it would remove a synchronization.
+                synchronize_shared()
+                for i ∈ local_top_vector_range_partial
+                    x[i] = Ainv_dot_u[i] - top_vec_buffer[i]
+                end
+
+                for (i1, i2) ∈ zip(local_bottom_vector_range_partial, global_bottom_vector_range_partial)
+                    y[i1] = global_y[i2]
+                end
+                synchronize_shared()
             end
-            synchronize_shared()
         end
-    end
 
-    return nothing
+        return nothing
+    end
 end
 # Due to the use of intermediate buffer arrays, there is no chance of aliasing errors when
 # returning the result in the input vectors, so just forward to the 5-argument function.
