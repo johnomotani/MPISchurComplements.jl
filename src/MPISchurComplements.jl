@@ -797,7 +797,7 @@ function update_from_sparse_matrix_select_columns!(A::Matrix{Tf}, colinds,
 end
 function update_from_sparse_matrix_select_columns!(A::Matrix{Tf}, colinds,
                                                    new_A::Matrix{Tf}, new_colinds,
-                                                   new_rowinds) where {Tf,Ti}
+                                                   new_rowinds) where {Tf}
     # This is not usually a useful, as we are just copying a dense buffer into another
     # dense buffer, but may turn up occasionally as an edge case.
     @inbounds begin
